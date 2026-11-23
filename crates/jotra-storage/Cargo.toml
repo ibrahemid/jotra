@@ -15,7 +15,7 @@ publish = false
 
 [dependencies]
 jotra-core = { path = "../jotra-core" }
-rusqlite = { version = "0.41" }
+rusqlite = { version = "0.43" }
 toml = "1.1"
 tracing = "0.1"
 thiserror = "2"
@@ -37,7 +37,7 @@ zip = { version = "9.0.3", default-features = false }
 bundled = ["rusqlite/bundled"]
 
 [dev-dependencies]
-rusqlite = { version = "0.41", features = ["bundled"] }
+rusqlite = { version = "0.43", features = ["bundled"] }
 tempfile = "3"
 criterion = { version = "0.8", features = ["html_reports"] }
 jotra-core = { path = "../jotra-core" }
