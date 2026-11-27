@@ -30,6 +30,7 @@ scripts/test_packaging_bump_aur.py :text /\bWRIT_GUI_BIN\b/ -- legacy: old GUI v
 crates/writ-tauri/** -- legacy: launcher crate under the old package name
 Cargo.lock :text /name = "writ-tauri"/ -- legacy: launcher crate under the old package name
 .github/workflows/release.yml :text /writ-tauri/ -- legacy: launcher built, carried and signed under the old program name
+.github/workflows/upgrade-checks.yml :text /writ-tauri/ -- legacy: launcher built under the old program name
 design/tokens/**/*legacy* -- legacy: alias source for the old preview properties
 src-tauri/assets/generated/preview-tokens.css :lines /^\s*--writ-preview-[A-Za-z0-9-]+:\s*var\(--/ -- legacy: generated preview property aliases
 index.html :lines /(?i)legacy/ -- legacy: old theme cache key in the boot script
@@ -41,6 +42,14 @@ src-tauri/tauri.conf.json :text /"binaries\/writ"/ -- legacy: second name the co
 src-tauri/src/linux_rename.rs :from /^#\[cfg\(test\)\]/ -- tests: legacy coverage
 src-tauri/src/windows_rename.rs :from /^#\[cfg\(test\)\]/ -- tests: legacy coverage
 .github/scripts/test_release_workflow.py :text /writ-tauri/ -- tests: legacy launcher wiring
+.github/scripts/test_release_workflow.py :text /from test_aur_writ_bin import/ -- tests: AUR check named for the kept package
+.github/scripts/test_aur_writ_bin.py :path -- tests: AUR check named for the kept package
+.github/scripts/test_aur_writ_bin.py :text /\/usr\/bin\/writ(?:-tauri)?\b|\/opt\/writ\b|\bwrit\.desktop\b|\bwrit-1\.0\.1\.AppImage\b|_pkgname=writ\b|"Writ_"|<Writ AppImage>|\("jotra", "writ"\)/ -- tests: AUR update from the 1.0.1 package, its commands, launcher link and desktop entry
+.github/scripts/test_install_sh_upgrade.py :text /WRIT_GUI_BIN\b|\.local\/share\/writ\b|\bWrit\.AppImage\b|["\/]writ-(?:cli|gui)\b|asset_name\("Writ"|"writ"/ -- tests: install.sh update over the 1.0.1 layout, wrappers, command and assets
+.github/scripts/test_deb_upgrade_desktop.py :lines /(?i)legacy|Name=Writ\\nComment=Writ startup script|\["Name"\], "Writ"\)/ -- tests: deb update from the 1.0.1 package, desktop entry and login item
+.github/scripts/test_check_process.py :text /\("jotra", "writ"\)|protocol='writ'/ -- tests: kept link scheme as a subtest parameter
+.github/workflows/release.yml :text /'C:\\Writ Custom'/ -- tests: custom folder of the 1.0.1 MSI install
+.github/workflows/upgrade-checks.yml :text /'C:\\Writ Custom'/ -- tests: custom folder of the 1.0.1 MSI install
 
 licences/*.txt -- third party: licence texts
 crates/*-lint/dictionaries/** -- third party: spelling dictionaries
@@ -77,3 +86,4 @@ scripts/old-name-allowlist.txt -- rename tooling spells the old name
 scripts/test_rename_product.py -- rename tooling spells the old name
 scripts/test_check_old_name.py -- rename tooling spells the old name
 src/__tests__/editor/fixtures/editor-corpus.ts :lines /(~\/Writ \| head|"name": "writ"|writ\.example)/ -- fixture: benchmark corpus bytes stay fixed so timings compare across versions
+src/__tests__/editor/markdown-line-height-sample.test.ts :text /\["(?:writ\.example|~\/Writ)",|\['"writ"',/ -- fixture: corpus bytes the sample test shifts
