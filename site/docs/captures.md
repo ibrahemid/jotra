@@ -32,7 +32,7 @@ Output: `site/src/assets/captures/<scene>-<theme>.png`, at most 2880 px wide and
 | `text-file` | `To do.txt` in the plain editor, with the status bar a `.txt` file gets | none | 1280x800 |
 | `markdown-inline` | `Sourdough notes.md` in Inline mode: a callout, a table shown as styled source, checkboxes and a code block | none | 1280x800 |
 | `search` | Search everywhere with matches across `.txt` and `.md` files | none | 1280x800 |
-| `apps` | Settings, Apps, with Graph on and the other five off | Graph | 1280x800 |
+| `apps` | Settings, Apps, with Graph on and the other six off | Graph | 1280x800 |
 | `first-run` | No config and an empty folder: the format step, Plain text or Markdown | none written | 1280x800 |
 | `notes-folder` | Finder, list view, on the folder: `.md` and `.txt` files, folders as folders | none | 1280x800 |
 | `connections` | The Connections panel beside a file: the files that link here with their sentences, the outline, the properties | Connections | 1280x800 |
