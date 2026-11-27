@@ -2,7 +2,8 @@
 
 Jotra is a text editor that opens any text file, edits and searches every file in its folder, and
 renders Markdown inline when the file is Markdown. Chat, rewrite, connected programs (the MCP
-server), connections, the graph and tags are apps switched on in Settings (ADR-041, ADR-042).
+server), connections, the graph, tags and dictation are apps switched on in Settings (ADR-041, ADR-042,
+ADR-058).
 
 It is built with Tauri v2, SolidJS and CodeMirror 6. The design keeps the binary small, separates
 business logic from framework code at the compiler level, and types the contract across every

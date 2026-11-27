@@ -4,7 +4,7 @@
 
 # Jotra
 
-Jotra is a text editor for macOS, Windows and Linux that opens any text file and searches every file in its folder. Markdown files render inline as you type, and connections, the graph, tags and chat are apps you switch on in Settings.
+Jotra is a text editor for macOS, Windows and Linux that opens any text file and searches every file in its folder. Markdown files render inline as you type, with images you paste or drop, and connections, the graph, tags, chat and dictation are apps you switch on in Settings.
 
 Jotra was called Writ through version 1.0.1.
 

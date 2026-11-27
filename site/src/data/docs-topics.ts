@@ -29,7 +29,7 @@ export const DOCS_TOPICS: readonly DocsTopic[] = [
   { id: 'hotkey', slug: 'hotkey', title: 'The hotkey and quick capture', description: "The window's hotkey, the quick capture window, and opening at login." },
   { id: 'files', slug: 'files', title: 'Files and the folder', description: "Opening and saving files, Jotra's folder, large files, text encodings, tabs and split panes." },
   { id: 'editing', slug: 'editing', title: 'Editing', description: 'Folding, the text transforms, and copying text as a prompt.' },
-  { id: 'markdown', slug: 'markdown', title: 'Markdown', description: 'Inline and Source, what is drawn in place, and links between files.' },
+  { id: 'markdown', slug: 'markdown', title: 'Markdown', description: 'Inline and Source, what is drawn in place, links between files, and images you paste, drop or load from the web.' },
   { id: 'preview', slug: 'preview', title: 'HTML preview', description: 'Source, Split and Preview for HTML and Mermaid files, and the scripts in a file.' },
   { id: 'search', slug: 'search', title: 'Search', description: 'Search Everywhere and its prefixes, the search field, and what search reads.' },
   { id: 'versions', slug: 'versions', title: 'Versions', description: 'The versions Jotra keeps of a file, and how Revert To puts one back.' },
