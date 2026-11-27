@@ -3045,7 +3045,7 @@ DEALINGS IN THE SOFTWARE.
 
 ### MIT
 
-cookie 0.18.2
+cookie 0.18.3
 
 ```
 Copyright (c) 2017 Sergio Benitez
@@ -4339,7 +4339,7 @@ SOFTWARE.
 
 ### MIT
 
-form_urlencoded 1.2.2
+form_urlencoded 1.2.3
 
 ```
 Copyright (c) 2013-2016 The rust-url developers
@@ -5068,7 +5068,7 @@ SOFTWARE.
 
 ### MIT
 
-idna 1.1.0, percent-encoding 2.3.2, url 2.5.8
+idna 1.1.0, percent-encoding 2.3.2, url 2.5.9
 
 ```
 Copyright (c) 2013-2025 The rust-url developers
