@@ -2823,7 +2823,7 @@ dependencies = [
 
 [[package]]
 name = "jotra-ai"
-version = "1.0.1"
+version = "1.1.0-1"
 dependencies = [
  "futures-util",
  "jotra-core",
@@ -2843,7 +2843,7 @@ dependencies = [
 
 [[package]]
 name = "jotra-audio"
-version = "1.0.1"
+version = "1.1.0-1"
 dependencies = [
  "cpal",
  "jotra-core",
@@ -2856,7 +2856,7 @@ dependencies = [
 
 [[package]]
 name = "jotra-cli"
-version = "1.0.1"
+version = "1.1.0-1"
 dependencies = [
  "chrono",
  "clap",
@@ -2873,7 +2873,7 @@ dependencies = [
 
 [[package]]
 name = "jotra-core"
-version = "1.0.1"
+version = "1.1.0-1"
 dependencies = [
  "base64 0.23.1",
  "chardetng",
@@ -2900,7 +2900,7 @@ dependencies = [
 
 [[package]]
 name = "jotra-lint"
-version = "1.0.1"
+version = "1.1.0-1"
 dependencies = [
  "jotra-core",
  "pulldown-cmark",
@@ -2910,7 +2910,7 @@ dependencies = [
 
 [[package]]
 name = "jotra-mcp"
-version = "1.0.1"
+version = "1.1.0-1"
 dependencies = [
  "chrono",
  "jotra-core",
@@ -2927,7 +2927,7 @@ dependencies = [
 
 [[package]]
 name = "jotra-plugin"
-version = "1.0.1"
+version = "1.1.0-1"
 dependencies = [
  "criterion",
  "jotra-core",
@@ -2938,7 +2938,7 @@ dependencies = [
 
 [[package]]
 name = "jotra-render"
-version = "1.0.1"
+version = "1.1.0-1"
 dependencies = [
  "pulldown-cmark",
  "serde",
@@ -2948,7 +2948,7 @@ dependencies = [
 
 [[package]]
 name = "jotra-storage"
-version = "1.0.1"
+version = "1.1.0-1"
 dependencies = [
  "chrono",
  "criterion",
@@ -2973,7 +2973,7 @@ dependencies = [
 
 [[package]]
 name = "jotra-tauri"
-version = "1.0.1"
+version = "1.1.0-1"
 dependencies = [
  "arboard",
  "block2",
@@ -7538,7 +7538,7 @@ dependencies = [
 
 [[package]]
 name = "writ-tauri"
-version = "1.0.1"
+version = "1.1.0-1"
 
 [[package]]
 name = "writeable"
