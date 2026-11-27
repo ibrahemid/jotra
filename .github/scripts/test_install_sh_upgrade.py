@@ -60,7 +60,7 @@ while [ "$#" -gt 0 ]; do
   shift
 done
 if [ "$head" = 1 ]; then
-  printf 'HTTP/2 302\\r\\nlocation: https://github.com/ibrahemid/writ/releases/tag/%s\\r\\n\\r\\n' "$FAKE_TAG"
+  printf 'HTTP/2 302\\r\\nlocation: https://github.com/ibrahemid/jotra/releases/tag/%s\\r\\n\\r\\n' "$FAKE_TAG"
   exit 0
 fi
 name="${url##*/}"
@@ -218,18 +218,18 @@ class ParseTests(unittest.TestCase):
                 (root / "fixtures" / tag).mkdir(parents=True)
                 (root / "fixtures" / tag / "SHA256SUMS.txt").write_text(body)
             head = subprocess.run(
-                ["curl", "-fsSI", "https://github.com/ibrahemid/writ/releases/latest"],
+                ["curl", "-fsSI", "https://github.com/ibrahemid/jotra/releases/latest"],
                 capture_output=True, text=True, env={**env, "FAKE_TAG": "v1.0.2"},
             )
-            self.assertIn("location: https://github.com/ibrahemid/writ/releases/tag/v1.0.2", head.stdout.splitlines())
+            self.assertIn("location: https://github.com/ibrahemid/jotra/releases/tag/v1.0.2", head.stdout.splitlines())
             out = root / "out"
             for tag, body in (("v1.0.1", "old"), ("v1.0.2", "new")):
-                url = f"https://github.com/ibrahemid/writ/releases/download/{tag}/SHA256SUMS.txt"
+                url = f"https://github.com/ibrahemid/jotra/releases/download/{tag}/SHA256SUMS.txt"
                 got = subprocess.run(["curl", "-fsSL", "-o", str(out), url], env={**env, "FAKE_TAG": tag})
                 self.assertEqual(got.returncode, 0)
                 self.assertEqual(out.read_text(), body)
             missing = subprocess.run(
-                ["curl", "-fsSL", "-o", str(out), "https://github.com/ibrahemid/writ/releases/download/v1.0.2/none"],
+                ["curl", "-fsSL", "-o", str(out), "https://github.com/ibrahemid/jotra/releases/download/v1.0.2/none"],
                 env={**env, "FAKE_TAG": "v1.0.2"},
             )
             self.assertEqual(missing.returncode, 22)

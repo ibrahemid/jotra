@@ -1,16 +1,16 @@
 {
     "name": "jotra",
     "private": true,
-    "version": "1.0.1",
+    "version": "1.1.0-1",
     "description": "Light text editor for any text file, with full-text search and inline Markdown",
     "license": "MIT",
     "packageManager": "pnpm@10.13.1",
     "repository": {
         "type": "git",
-        "url": "git+https://github.com/ibrahemid/writ.git"
+        "url": "git+https://github.com/ibrahemid/jotra.git"
     },
-    "homepage": "https://github.com/ibrahemid/writ",
-    "bugs": "https://github.com/ibrahemid/writ/issues",
+    "homepage": "https://github.com/ibrahemid/jotra",
+    "bugs": "https://github.com/ibrahemid/jotra/issues",
     "type": "module",
     "engines": {
         "node": "^22.22.2 || ^24.15.0 || >=26",

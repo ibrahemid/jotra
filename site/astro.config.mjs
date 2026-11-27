@@ -9,7 +9,7 @@ export default defineConfig({
   // the hero loads.
   integrations: [
     sitemap({ filter: (page) => !/\/(vs\/obsidian|demo)\/$/.test(page) }),
-    llmsTxt({ repository: 'https://github.com/ibrahemid/writ' }),
+    llmsTxt({ repository: 'https://github.com/ibrahemid/jotra' }),
   ],
   build: {
     format: 'directory',

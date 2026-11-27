@@ -12,7 +12,7 @@ describe("Help's links", () => {
 
   it("opens the bug form with the version and the system filled in", () => {
     const url = new URL(reportIssueUrl("0.7.0", "mac"));
-    expect(`${url.origin}${url.pathname}`).toBe("https://github.com/ibrahemid/writ/issues/new");
+    expect(`${url.origin}${url.pathname}`).toBe("https://github.com/ibrahemid/jotra/issues/new");
     expect(url.searchParams.get("template")).toBe("bug_report.yml");
     expect(url.searchParams.get("version")).toBe("0.7.0");
     expect(url.searchParams.get("os")).toBe("macOS");
