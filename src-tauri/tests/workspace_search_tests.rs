@@ -97,6 +97,7 @@ fn make_state(jotra_dir_holder: &TempDir, ws_root: Option<PathBuf>) -> AppState 
         preview_registry: Arc::new(RwLock::new(ContentRendererRegistry::new())),
         preview_render_cache: Arc::new(RenderCache::new()),
         layout_state: LayoutStateStore::new(open_database(&db_path).unwrap()),
+        tab_rows: jotra_storage::tab_rows::TabRowStore::new(open_database(&db_path).unwrap()),
         command_usage: jotra_storage::command_usage::CommandUsageStore::new(
             open_database(&db_path).expect("usage db"),
         ),

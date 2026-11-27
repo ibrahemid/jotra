@@ -1682,15 +1682,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "fsevent-sys"
-version = "4.1.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "76ee7a02da4d231650c7cea31349b889be2f45ddb3ef3032d2ec8185f6313fd2"
-dependencies = [
- "libc",
-]
-
-[[package]]
 name = "futures"
 version = "0.3.34"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2981,7 +2972,6 @@ dependencies = [
  "core-foundation 0.10.1",
  "dirs 7.0.0",
  "dispatch2",
- "fsevent-sys",
  "getrandom 0.4.3",
  "hashbrown 0.17.1",
  "image",
@@ -2998,6 +2988,8 @@ dependencies = [
  "notify-debouncer-mini",
  "objc2",
  "objc2-app-kit",
+ "objc2-core-foundation",
+ "objc2-core-services",
  "objc2-foundation",
  "plist",
  "png 0.18.1",
@@ -3759,6 +3751,7 @@ version = "0.3.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "583300ad934cba24ff5292aee751ecc070f7ca6b39a574cc21b7b5e588e06a0b"
 dependencies = [
+ "dispatch2",
  "libc",
  "objc2-core-foundation",
 ]

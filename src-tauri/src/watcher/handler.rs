@@ -1,15 +1,18 @@
 use crate::poison::recover_poison;
+use crate::watcher::changes_only::ChangesOnly;
 use crate::watcher::moves::FileTracking;
 use crate::watcher::open_files::{answer_held_removals, open_delivery, OpenNotes, VanishedContext};
 use jotra_core::events::bus::{EventBus, JotraEvent};
-use jotra_core::watcher::budget::{Emission, EmissionBudget};
+use jotra_core::watcher::budget::{Emission, EmissionBudget, SweptPaths};
 use jotra_core::watcher::ignore::{IgnoreStamps, SuppressDecision, DEFAULT_IGNORE_TTL};
 use jotra_core::watcher::pending::{hold_window, PendingRemovals};
 use jotra_core::watcher::sighting::{FileSighting, LastSeen, DEFAULT_SIGHTING_TTL};
 use jotra_core::workspace::WorkspaceKind;
 use jotra_storage::paths::file_name_only;
 use notify::{RecommendedWatcher, RecursiveMode};
-use notify_debouncer_mini::{new_debouncer, DebounceEventResult, Debouncer};
+use notify_debouncer_mini::{
+    new_debouncer_opt, Config as DebounceConfig, DebounceEventResult, Debouncer,
+};
 use std::cell::RefCell;
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
@@ -125,13 +128,25 @@ fn is_writs_own_write(
     set.decide(key, bytes.as_deref(), now, ttl) == SuppressDecision::Suppress
 }
 
+/// The backend every watcher here runs on: the platform's own, with reads
+/// dropped before they are debounced ([`ChangesOnly`]).
+type ChangesWatcher = ChangesOnly<RecommendedWatcher>;
+
+/// A debouncer over [`ChangesWatcher`] coalescing into `timeout`.
+fn new_changes_debouncer(
+    timeout: Duration,
+    tx: mpsc::Sender<DebounceEventResult>,
+) -> Result<Debouncer<ChangesWatcher>, notify::Error> {
+    new_debouncer_opt(DebounceConfig::default().with_timeout(timeout), tx)
+}
+
 /// Opaque owner of the file watcher's debouncer.
 ///
 /// Held by `AppState` so the watcher lives as long as the application.
 /// Dropping this handle drops the inner `Debouncer`, which closes the
 /// event channel and causes the watcher thread to exit cleanly.
 pub struct WatcherHandle {
-    _debouncer: Debouncer<RecommendedWatcher>,
+    _debouncer: Debouncer<ChangesWatcher>,
 }
 
 /// Watches the config file, and the list of programs waiting to be approved,
@@ -176,7 +191,7 @@ pub fn start_file_watcher(
     let off_call_path = jotra_storage::off_calls::path(&pending_folder);
     let (tx, rx) = mpsc::channel::<DebounceEventResult>();
 
-    let mut debouncer = new_debouncer(Duration::from_millis(500), tx)?;
+    let mut debouncer = new_changes_debouncer(Duration::from_millis(500), tx)?;
     debouncer
         .watcher()
         .watch(&folder, RecursiveMode::NonRecursive)?;
@@ -251,9 +266,10 @@ fn parent_of(path: &Path) -> Result<PathBuf, std::io::Error> {
 /// the frontend, where each event is an IPC message and a directory reload.
 /// So the watcher has the notes watcher's [`EmissionBudget`]: a `pip install`
 /// or a build writing thousands of files inside one window names nine and then
-/// says once that the folder moved ([`JotraEvent::WorkspaceSwept`]), and the
-/// tree and the index read it again instead (TS-12). A sweep that was owed
-/// when the folder fell quiet is sent then, so the last change is never lost.
+/// says once that the folder moved ([`JotraEvent::WorkspaceSwept`]): the tree
+/// reads its loaded folders again and the index patches the paths the sweep
+/// carries (TS-12). A sweep that was owed when the folder fell quiet is sent
+/// then, so the last change is never lost.
 ///
 /// Saving a buffer writes the file it was opened from, so Jotra's own writes
 /// do land inside a watched workspace. They are not suppressed: the index
@@ -267,20 +283,23 @@ pub fn start_workspace_watcher(
 ) -> Result<WatcherHandle, Box<dyn std::error::Error>> {
     let (tx, rx) = mpsc::channel::<DebounceEventResult>();
 
-    let mut debouncer = new_debouncer(Duration::from_millis(500), tx)?;
+    let mut debouncer = new_changes_debouncer(Duration::from_millis(500), tx)?;
     debouncer.watcher().watch(&root, RecursiveMode::Recursive)?;
 
     info!(root = %file_name_only(&root.to_string_lossy()), "workspace watcher started");
 
     std::thread::spawn(move || {
         let mut budget = EmissionBudget::new();
+        let mut swept = SweptPaths::new();
         loop {
             let result = match budget.owed_sweep_at() {
                 Some(due) => match rx.recv_timeout(due.saturating_duration_since(Instant::now())) {
                     Ok(result) => result,
                     Err(mpsc::RecvTimeoutError::Timeout) => {
-                        if budget.take_owed_sweep(Instant::now()) {
-                            bus.emit(workspace_swept(&root));
+                        if let Some(sweep) =
+                            owed_workspace_sweep(&root, &mut budget, &mut swept, Instant::now())
+                        {
+                            bus.emit(sweep);
                         }
                         continue;
                     }
@@ -294,9 +313,14 @@ pub fn start_workspace_watcher(
             match result {
                 Ok(events) => {
                     let paths: Vec<PathBuf> = events.into_iter().map(|event| event.path).collect();
-                    for domain_event in
-                        report_workspace_batch(&paths, &root, kind, &mut budget, Instant::now())
-                    {
+                    for domain_event in report_workspace_batch(
+                        &paths,
+                        &root,
+                        kind,
+                        &mut budget,
+                        &mut swept,
+                        Instant::now(),
+                    ) {
                         bus.emit(domain_event);
                     }
                 }
@@ -315,15 +339,18 @@ pub fn start_workspace_watcher(
 
 /// What one delivered batch of workspace events is worth saying, within
 /// `budget`: each change the tree shows, by name, until the window's budget is
-/// spent, then one [`JotraEvent::WorkspaceSwept`].
+/// spent, then one [`JotraEvent::WorkspaceSwept`] last, carrying every change
+/// it stands for from `swept`, those later in the batch included.
 pub fn report_workspace_batch(
     paths: &[PathBuf],
     root: &Path,
     kind: WorkspaceKind,
     budget: &mut EmissionBudget,
+    swept: &mut SweptPaths,
     now: Instant,
 ) -> Vec<JotraEvent> {
     let mut said = Vec::new();
+    let mut sweeps = false;
     for path in paths {
         let Some(domain_event) = classify_workspace_event(path, root, kind) else {
             continue;
@@ -331,23 +358,42 @@ pub fn report_workspace_batch(
         match budget.admit(now) {
             Emission::Name => said.push(domain_event),
             Emission::Sweep => {
-                info!(
-                    root = %file_name_only(&root.to_string_lossy()),
-                    "workspace folder changed faster than it can be listed; sweeping"
-                );
-                said.push(workspace_swept(root));
+                sweeps = true;
+                swept.record(path.to_string_lossy().into_owned());
             }
-            Emission::Drop => {}
+            Emission::Drop => swept.record(path.to_string_lossy().into_owned()),
         }
+    }
+    if sweeps {
+        info!(
+            root = %file_name_only(&root.to_string_lossy()),
+            "workspace folder changed faster than it can be listed; sweeping"
+        );
+        said.push(workspace_swept(root, swept.take()));
     }
     said
 }
 
+/// The sweep owed at `now` for changes `budget` dropped after its last sweep,
+/// or `None` when none is due or every dropped change rode that sweep.
+pub fn owed_workspace_sweep(
+    root: &Path,
+    budget: &mut EmissionBudget,
+    swept: &mut SweptPaths,
+    now: Instant,
+) -> Option<JotraEvent> {
+    if !budget.take_owed_sweep(now) || swept.is_empty() {
+        return None;
+    }
+    Some(workspace_swept(root, swept.take()))
+}
+
 /// The event that stands for "more changed in the workspace folder than is
-/// worth listing".
-pub fn workspace_swept(root: &Path) -> JotraEvent {
+/// worth listing", carrying `paths` for the index.
+pub fn workspace_swept(root: &Path, paths: Option<Vec<String>>) -> JotraEvent {
     JotraEvent::WorkspaceSwept {
         root: root.to_string_lossy().into_owned(),
+        paths,
     }
 }
 
@@ -366,7 +412,7 @@ pub fn start_inbox_watcher(
 ) -> Result<WatcherHandle, Box<dyn std::error::Error>> {
     let (tx, rx) = mpsc::channel::<DebounceEventResult>();
 
-    let mut debouncer = new_debouncer(Duration::from_millis(500), tx)?;
+    let mut debouncer = new_changes_debouncer(Duration::from_millis(500), tx)?;
     debouncer.watcher().watch(&root, RecursiveMode::Recursive)?;
 
     // Snapshot AFTER the watch is registered: a file landing during the scan
@@ -571,16 +617,16 @@ pub fn start_notes_watcher(
 ) -> Result<WatcherHandle, Box<dyn std::error::Error>> {
     let (tx, rx) = mpsc::channel::<DebounceEventResult>();
 
-    let mut debouncer = new_debouncer(NOTES_DEBOUNCE_WINDOW, tx)?;
+    let mut debouncer = new_changes_debouncer(NOTES_DEBOUNCE_WINDOW, tx)?;
     debouncer.watcher().watch(&root, RecursiveMode::Recursive)?;
 
     info!(root = %file_name_only(&root.to_string_lossy()), "notes watcher started");
 
     std::thread::spawn(move || {
         let mut budget = EmissionBudget::new();
-        // Outside the batch loop: the event a read of this watcher's own
-        // raises on Linux arrives in a later batch than the change that
-        // caused it, so a record scoped to one batch would never see it.
+        // Outside the batch loop: a change delivered twice arrives in a later
+        // batch the second time, so a record scoped to one batch would never
+        // see it.
         let mut seen = LastSeen::new();
         // A removal waits for the delivery that might answer it, so the wait
         // ends at its deadline as well as at the sweep's.
@@ -2232,6 +2278,7 @@ mod tests {
             root,
             WorkspaceKind::Code,
             &mut budget,
+            &mut SweptPaths::new(),
             Instant::now(),
         );
 
@@ -2246,8 +2293,129 @@ mod tests {
             1
         );
         assert!(
-            matches!(said.last(), Some(JotraEvent::WorkspaceSwept { root: named }) if named == "/repo")
+            matches!(
+                said.last(),
+                Some(JotraEvent::WorkspaceSwept { root: named, paths: None }) if named == "/repo"
+            ),
+            "more changes than a sweep carries leave the index to walk"
         );
+    }
+
+    /// The paths of `said`'s sweep, which has to be its last event.
+    fn swept_paths(said: &[JotraEvent]) -> Option<Vec<String>> {
+        match said.last() {
+            Some(JotraEvent::WorkspaceSwept { paths, .. }) => paths.clone(),
+            _ => panic!("the batch ends without a sweep"),
+        }
+    }
+
+    fn workspace_paths(root: &Path, range: std::ops::Range<usize>) -> Vec<PathBuf> {
+        range
+            .map(|i| root.join(format!("gen/out{i:03}.rs")))
+            .collect()
+    }
+
+    fn as_strings(paths: &[PathBuf]) -> Vec<String> {
+        paths
+            .iter()
+            .map(|path| path.to_string_lossy().into_owned())
+            .collect()
+    }
+
+    #[test]
+    fn a_workspace_sweep_carries_every_change_it_stands_for() {
+        // A build writing thirty files in one window: nine are named, and the
+        // sweep carries the other twenty-one, so the index patches them rather
+        // than walking the tree.
+        let root = Path::new("/repo");
+        let paths = workspace_paths(root, 0..30);
+        let mut budget = EmissionBudget::new();
+        let mut swept = SweptPaths::new();
+
+        let said = report_workspace_batch(
+            &paths,
+            root,
+            WorkspaceKind::Code,
+            &mut budget,
+            &mut swept,
+            Instant::now(),
+        );
+
+        assert_eq!(said.len(), 10, "nine named changes and one sweep");
+        assert_eq!(swept_paths(&said), Some(as_strings(&paths[9..])));
+        assert!(swept.is_empty());
+    }
+
+    #[test]
+    fn a_change_dropped_inside_the_cooldown_rides_the_owed_sweep() {
+        let root = Path::new("/repo");
+        let start = Instant::now();
+        let mut budget = EmissionBudget::new();
+        let mut swept = SweptPaths::new();
+        let first = workspace_paths(root, 0..10);
+        let late = workspace_paths(root, 10..11);
+
+        let said = report_workspace_batch(
+            &first,
+            root,
+            WorkspaceKind::Code,
+            &mut budget,
+            &mut swept,
+            start,
+        );
+        assert_eq!(swept_paths(&said), Some(as_strings(&first[9..])));
+
+        let later = start + Duration::from_millis(100);
+        let said = report_workspace_batch(
+            &late,
+            root,
+            WorkspaceKind::Code,
+            &mut budget,
+            &mut swept,
+            later,
+        );
+        assert!(said.is_empty(), "a change inside the cooldown says nothing");
+        assert!(owed_workspace_sweep(root, &mut budget, &mut swept, later).is_none());
+
+        let due = budget
+            .owed_sweep_at()
+            .expect("the dropped change owes a sweep");
+        let owed = owed_workspace_sweep(root, &mut budget, &mut swept, due);
+        assert!(
+            matches!(
+                &owed,
+                Some(JotraEvent::WorkspaceSwept { paths: Some(paths), .. }) if *paths == as_strings(&late)
+            ),
+            "the owed sweep does not carry the dropped change"
+        );
+        assert!(owed_workspace_sweep(root, &mut budget, &mut swept, due).is_none());
+    }
+
+    #[test]
+    fn an_owed_sweep_with_nothing_left_to_carry_is_not_sent() {
+        // The changes dropped after the sweep in its own batch ride that
+        // sweep, so the silence after it has nothing to add.
+        let root = Path::new("/repo");
+        let start = Instant::now();
+        let mut budget = EmissionBudget::new();
+        let mut swept = SweptPaths::new();
+        let paths = workspace_paths(root, 0..12);
+
+        let said = report_workspace_batch(
+            &paths,
+            root,
+            WorkspaceKind::Code,
+            &mut budget,
+            &mut swept,
+            start,
+        );
+        assert_eq!(swept_paths(&said), Some(as_strings(&paths[9..])));
+
+        let due = budget
+            .owed_sweep_at()
+            .expect("the budget dropped two changes");
+        assert!(owed_workspace_sweep(root, &mut budget, &mut swept, due).is_none());
+        assert_eq!(budget.owed_sweep_at(), None);
     }
 
     #[test]
@@ -2263,6 +2431,7 @@ mod tests {
             root,
             WorkspaceKind::Code,
             &mut budget,
+            &mut SweptPaths::new(),
             Instant::now(),
         );
 

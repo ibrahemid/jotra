@@ -1586,9 +1586,9 @@ fn note_disk_state_in_turn(state: &AppState, turn: &Turn) -> Result<NoteDiskAnsw
 /// network share (ADR-033): such a change moves the size, the modification
 /// time or the file, and the tab then reads the file. No file, no record of
 /// it, a record with no modification time, a file marked deleted or an id
-/// that differs or cannot be read all answer `false`. An edit that keeps the
-/// size and lands inside one tick of the volume's clock is missed, as
-/// [`crate::watcher::open_files::matches_last_look`] says.
+/// that differs or cannot be read all answer `false`, and so does a coarse
+/// modification time, where a same-size edit inside one tick keeps it
+/// ([`crate::watcher::open_files::matches_last_look`]).
 #[tauri::command]
 pub async fn note_file_unchanged<R: Runtime>(
     app: AppHandle<R>,

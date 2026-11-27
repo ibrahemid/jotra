@@ -334,17 +334,16 @@ fn identity_of_note(state: &AppState, note_id: &str) -> Option<FileIdentity> {
 }
 
 /// The text encoding the note's row reads its file in, UTF-8 for a row that
-/// names none or cannot be read. Takes the store lock, so it is never asked
-/// with that lock held.
+/// names none or cannot be read. Read through [`AppState::tab_rows`], never
+/// the store's lock.
 pub(crate) fn encoding_of_note(state: &AppState, note_id: &str) -> TextEncoding {
-    let store =
-        crate::poison::recover_poison(state.store.lock(), "watcher::moves::encoding_of_note");
-    store
-        .find(note_id)
-        .ok()
-        .flatten()
-        .and_then(|doc| doc.encoding)
-        .unwrap_or_else(TextEncoding::utf8)
+    match state.tab_rows.encoding(note_id) {
+        Ok(encoding) => encoding.unwrap_or_else(TextEncoding::utf8),
+        Err(error) => {
+            tracing::warn!(note = %note_id, %error, "a tab's encoding could not be read");
+            TextEncoding::utf8()
+        }
+    }
 }
 
 /// What became of a note whose file was found at another path.

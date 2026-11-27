@@ -111,6 +111,8 @@ pub mod recovery;
 pub mod rollback;
 /// Key/value rows recording what a one-time schema pass did.
 pub mod schema_meta;
+/// The buffer-row fields an open tab's watcher reads, off the store's lock.
+pub mod tab_rows;
 /// On-demand content grep over the workspace folder (ADR-026).
 pub mod workspace_grep;
 /// Workspace file-name index walk and the shared search ignore policy.

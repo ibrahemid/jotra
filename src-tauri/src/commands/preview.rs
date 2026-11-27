@@ -212,15 +212,25 @@ pub fn lapse_scripts_opt_in(store: &BufferStore, cache: &RenderCache, buffer_id:
     }
 }
 
-/// [`lapse_scripts_opt_in`] for a caller that does not hold the store: it is
-/// taken for the row's read and write and let go. A caller holding it would wait on
-/// itself, so one that does calls [`lapse_scripts_opt_in`] with its guard.
+/// [`lapse_scripts_opt_in`] for a caller that does not hold the store. The row
+/// is changed through [`AppState::tab_rows`] in one statement, so a watcher
+/// thread reporting the change never waits on the store's lock.
 pub fn lapse_scripts_opt_in_now(state: &AppState, buffer_id: &str) -> bool {
-    let store = recover_poison(
-        state.store.lock(),
-        "commands::preview::lapse_scripts_opt_in_now",
-    );
-    lapse_scripts_opt_in(&store, &state.preview_render_cache, buffer_id)
+    state.preview_render_cache.turn_scripts_off(buffer_id);
+    match state.tab_rows.lapse_preview_scripts(buffer_id) {
+        Ok(true) => {
+            info!(
+                buffer_id,
+                "scripts turned off: the file changed outside the editor"
+            );
+            true
+        }
+        Ok(false) => false,
+        Err(e) => {
+            warn!(buffer_id, error = %e, "could not turn off the scripts of a changed file");
+            false
+        }
+    }
 }
 
 /// A buffer's persisted layout, returned to the frontend on open.
