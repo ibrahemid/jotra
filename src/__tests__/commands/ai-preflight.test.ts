@@ -231,6 +231,23 @@ describe("nothing is sent until every blocker is cleared", () => {
     expect(mocks.start).toHaveBeenCalledTimes(2);
   });
 
+  it("names the key when a stored one goes to an https address on the local network", async () => {
+    const lan = {
+      host: "192.168.1.20",
+      host_port: "192.168.1.20",
+      is_hosted: true,
+      is_private_network: true,
+      key_state: { is_set: true, memory_only: false },
+      sends_key: true,
+    };
+    mocks.endpointState.mockResolvedValue(endpoint({ ...lan, is_consented: false }));
+    mocks.consentHost.mockResolvedValue(endpoint({ ...lan, is_consented: true }));
+    await runRewriteAction("polish");
+    expect(mocks.requestConfirm.mock.calls[0][0].message).toBe(
+      "The text you rewrite is sent to this address on your local network with your API key. Jotra also sends the key on its own to check the address is reachable. The check sends no text.",
+    );
+  });
+
   it("rewrites with the on-device model with no model, key or consent to ask for", async () => {
     mocks.config.mockReturnValue({ ai: { provider: "apple", model: "" } });
     mocks.endpointState.mockResolvedValue(

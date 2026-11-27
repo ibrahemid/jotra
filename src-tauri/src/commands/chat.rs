@@ -20,8 +20,8 @@ use tokio_util::sync::CancellationToken;
 pub use jotra_ai::chat::{
     apply_permissions, begin_request, chat_delete_inner, context_permissions, endpoint_state_from,
     needs_key_lookup, note_file_in, prepare_chat, stop_live_chats, AttachedSize, ChatEndpointState,
-    ChatSendAccepted, ChatState, ConversationDto, LiveGuard, PreparedChat, ProposalDto,
-    ProposalOutcome, TurnDto, CHAT_SHUTDOWN_BUDGET, REPLY_IN_FLIGHT,
+    ChatSendAccepted, ChatState, ConversationDto, EarlierTexts, LiveGuard, PreparedChat,
+    ProposalDto, ProposalOutcome, TurnDto, UndoSources, CHAT_SHUTDOWN_BUDGET, REPLY_IN_FLIGHT,
 };
 
 use super::ai::AiKeyState;
@@ -164,9 +164,19 @@ pub fn discard_proposal_inner(
 fn conversation_dto(
     notes_root: &Path,
     open_notes: &dyn OpenNotes,
+    undo: UndoSources<'_>,
     conversation: jotra_core::chat::Conversation,
 ) -> ConversationDto {
-    chat::conversation_dto(notes_root, &Tabs(open_notes), conversation)
+    chat::conversation_dto(notes_root, &Tabs(open_notes), undo, conversation)
+}
+
+/// Where a card's Undo finds the text it puts back: the folder's versions and
+/// this session's earlier texts of files outside it.
+fn undo_sources<'a>(state: &'a AppState, chat: &'a ChatState) -> UndoSources<'a> {
+    UndoSources {
+        history: Some(&state.note_history),
+        session: Some(chat.earlier_texts()),
+    }
 }
 
 fn chat_config(app: &AppHandle) -> AiConfig {
@@ -213,16 +223,29 @@ pub fn chat_list(app: AppHandle) -> Result<Vec<ConversationSummary>, String> {
 }
 
 /// One conversation, with every pending proposal read against the note as it
-/// stands now.
+/// stands now ([`chat::open_conversation`]).
+///
+/// Off the main thread: the pane opens a conversation again on each save of a
+/// note an open offer names, and each open reads and diffs every such note
+/// (ADR-047).
 #[tauri::command]
-pub fn chat_open(app: AppHandle, id: String) -> Result<ConversationDto, String> {
-    let conversation = chat_store(&app).load(&id).map_err(chat::missing_or)?;
-    let state = app.state::<AppState>();
-    Ok(conversation_dto(
-        &state.notes_root(),
-        &state.open_tabs(),
-        conversation,
-    ))
+pub async fn chat_open(app: AppHandle, id: String) -> Result<ConversationDto, String> {
+    crate::commands::offload::run_detached(
+        crate::commands::offload::ERR_COMMAND_STOPPED,
+        move || {
+            let state = app.state::<AppState>();
+            let chat = app.state::<ChatState>();
+            let open_tabs = state.open_tabs();
+            chat::open_conversation(
+                &chat_store(&app),
+                &state.notes_root(),
+                &Tabs(&open_tabs),
+                undo_sources(&state, &chat),
+                &id,
+            )
+        },
+    )
+    .await
 }
 
 /// An empty conversation, on disk before the pane sees it.
@@ -236,6 +259,7 @@ pub fn chat_new(app: AppHandle) -> Result<ConversationDto, String> {
     Ok(conversation_dto(
         &state.notes_root(),
         &state.open_tabs(),
+        UndoSources::NONE,
         made,
     ))
 }
@@ -250,6 +274,7 @@ pub fn chat_rename(app: AppHandle, id: String, title: String) -> Result<Conversa
     Ok(conversation_dto(
         &state.notes_root(),
         &state.open_tabs(),
+        undo_sources(&state, &app.state::<ChatState>()),
         renamed,
     ))
 }
@@ -478,17 +503,13 @@ fn apply_proposal_blocking(
     let host = chat_host(&app);
     let outcome = apply_proposal_to_state(
         &app.state::<AppState>(),
+        app.state::<ChatState>().earlier_texts(),
         &host,
         &path,
         &new_content,
         &before_hash,
     );
-    let status = if outcome.is_ok() {
-        ProposalStatus::Applied
-    } else {
-        ProposalStatus::Refused
-    };
-    chat::record_status(&chat_store(&app), &conversation_id, turn, &path, status);
+    chat::record_apply(&chat_store(&app), &conversation_id, turn, &path, &outcome);
     announce_activity(&app);
     outcome
 }
@@ -500,9 +521,11 @@ fn apply_proposal_blocking(
 /// tab's turn ([`AppState::buffer_writes`]) is held from the read that checks
 /// the offer to the notice that follows the write. A save of the tab is then
 /// either landed before the check, which refuses the offer, or waits until the
-/// write is told.
+/// write is told. What such a file held before the write is kept in
+/// `earlier` for its card's Undo.
 pub fn apply_proposal_to_state(
     state: &AppState,
+    earlier: &EarlierTexts,
     host: &str,
     path: &str,
     new_content: &str,
@@ -510,79 +533,112 @@ pub fn apply_proposal_to_state(
 ) -> Result<ProposalOutcome, String> {
     let notes_root = state.notes_root();
     let open_tabs = state.open_tabs();
-    let context = chat::resolve_context_file(&notes_root, &Tabs(&open_tabs), path).ok();
-    let tab_turn = match context.as_ref().map(|context| &context.scope) {
-        Some(chat::ContextScope::OpenTab { tab_id }) => Some(state.buffer_writes.turn(tab_id)),
-        _ => None,
-    };
-    let write_file = context.as_ref().map(|context| context.file.clone());
-    let write_name = context
-        .as_ref()
-        .map_or_else(|| file_name_only(path), chat::context_name);
-    let outcome = apply_proposal_inner(
+    let target = CardTarget::resolve(state, &notes_root, &open_tabs, path);
+    let outcome = chat::apply_proposal_in_session(
+        earlier,
         &notes_root,
-        &open_tabs,
+        &Tabs(&open_tabs),
         &state.jotra_dir,
         host,
         path,
         new_content,
         before_hash,
         Some(&state.note_history),
-        |tab_id, content, verified| {
-            let Some(turn) = tab_turn.as_ref().filter(|turn| turn.key() == tab_id) else {
-                return Err(format!("{write_name} was not written."));
-            };
-            // The apply has just read this file and found it holding what the
-            // offer was made against, and those are the bytes handed here.
-            // Recording them as the tab's disk state is what stops the buffer
-            // store's own guard reading the write as one landing over a change
-            // Jotra never saw, which for a file outside the folder would leave a
-            // dated copy beside it.
-            if let Some(file) = write_file.as_ref() {
-                state.record_disk_state_bytes(tab_id, file, verified);
-            }
-            crate::commands::buffer::save_in_turn(state, turn, content)
-                .map(|_| ())
-                .map_err(|error| save_error_sentence(&write_name, &error))
-        },
+        |tab_id, content, verified| target.write_tab(state, tab_id, content, verified),
     );
     // Only a write that moved bytes has something to tell a tab. An apply of
     // the text the note already holds leaves the file exactly as the tab has
     // it, so an event about it would be a notice about nothing.
     if outcome.as_ref().is_ok_and(|applied| applied.changed) {
-        if let Some(context) = context.as_ref() {
-            let bytes = match context.scope {
-                // The buffer store keeps the line ending the file keeps, so
-                // what landed is not always the string that was offered. The
-                // tab is told what the file holds.
-                chat::ContextScope::OpenTab { .. } => {
-                    std::fs::read(&context.file).unwrap_or_else(|_| new_content.as_bytes().to_vec())
-                }
-                chat::ContextScope::Notes => new_content.as_bytes().to_vec(),
-            };
-            match &context.scope {
-                chat::ContextScope::OpenTab { tab_id } => {
-                    announce_note_change(state, tab_id, &context.file, &bytes)
-                }
-                chat::ContextScope::Notes => {
-                    announce_applied_note(state, &context.file, &bytes);
-                }
-            }
-        }
+        target.announce(state, new_content);
     }
-    drop(tab_turn);
+    drop(target);
     outcome
 }
 
-/// Puts back what a note held before the card's Apply, and tells a tab
-/// holding the note what it now holds.
+/// The file a card's Apply or Undo writes, resolved once before the write.
 ///
-/// The conversation keeps its record: the proposal was applied, and Undo is a
-/// second write the activity log records on its own line. Off the main thread,
-/// like the apply it undoes (ADR-047).
+/// A file only an open tab reaches is written through that tab's save, with
+/// the tab's turn held from here to the notice that follows the write.
+struct CardTarget {
+    context: Option<chat::ContextFile>,
+    tab_turn: Option<jotra_core::serial::Turn>,
+    name: String,
+}
+
+impl CardTarget {
+    fn resolve(state: &AppState, notes_root: &Path, open_tabs: &dyn OpenNotes, path: &str) -> Self {
+        let context = chat::resolve_context_file(notes_root, &Tabs(open_tabs), path).ok();
+        let tab_turn = match context.as_ref().map(|context| &context.scope) {
+            Some(chat::ContextScope::OpenTab { tab_id }) => Some(state.buffer_writes.turn(tab_id)),
+            _ => None,
+        };
+        let name = context
+            .as_ref()
+            .map_or_else(|| file_name_only(path), chat::context_name);
+        Self {
+            context,
+            tab_turn,
+            name,
+        }
+    }
+
+    /// Saves `content` through the tab, in the turn taken at [`Self::resolve`].
+    fn write_tab(
+        &self,
+        state: &AppState,
+        tab_id: &str,
+        content: &str,
+        verified: &[u8],
+    ) -> Result<(), String> {
+        let Some(turn) = self.tab_turn.as_ref().filter(|turn| turn.key() == tab_id) else {
+            return Err(format!("{} was not written.", self.name));
+        };
+        // The write has just read this file and found it holding what the card
+        // expected, and those are the bytes handed here. Recording them as the
+        // tab's disk state is what stops the buffer store's own guard reading
+        // the write as one landing over a change Jotra never saw, which for a
+        // file outside the folder would leave a dated copy beside it.
+        if let Some(context) = self.context.as_ref() {
+            state.record_disk_state_bytes(tab_id, &context.file, verified);
+        }
+        crate::commands::buffer::save_in_turn(state, turn, content)
+            .map(|_| ())
+            .map_err(|error| save_error_sentence(&self.name, &error))
+    }
+
+    /// Tells the tab holding the file what it now holds. `written` is the
+    /// text a note in the folder was written with.
+    fn announce(&self, state: &AppState, written: &str) {
+        let Some(context) = self.context.as_ref() else {
+            return;
+        };
+        match &context.scope {
+            // The buffer store keeps the line ending the file keeps, so what
+            // landed is not always the string that was offered. The tab is
+            // told what the file holds.
+            chat::ContextScope::OpenTab { tab_id } => {
+                let bytes =
+                    std::fs::read(&context.file).unwrap_or_else(|_| written.as_bytes().to_vec());
+                announce_note_change(state, tab_id, &context.file, &bytes);
+            }
+            chat::ContextScope::Notes => {
+                announce_applied_note(state, &context.file, written.as_bytes());
+            }
+        }
+    }
+}
+
+/// Puts back what a file held before the card's Apply, records that in the
+/// conversation, and tells a tab holding the file what it now holds.
+///
+/// Undo is a second write the activity log records on its own line. Off the
+/// main thread, like the apply it undoes (ADR-047).
 #[tauri::command]
 pub async fn chat_undo_proposal(
     app: AppHandle,
+    conversation_id: String,
+    turn: usize,
     path: String,
     before_hash: String,
     applied_hash: String,
@@ -591,24 +647,30 @@ pub async fn chat_undo_proposal(
         let host = chat_host(&app);
         let outcome = undo_proposal_to_state(
             &app.state::<AppState>(),
+            app.state::<ChatState>().earlier_texts(),
             &host,
             &path,
             &before_hash,
             &applied_hash,
         );
+        if outcome.is_ok() {
+            chat::record_undo(&chat_store(&app), &conversation_id, turn, &path);
+        }
         announce_activity(&app);
         outcome
     })
     .await
 }
 
-/// [`chat_undo_proposal`] against the app's state.
+/// [`chat_undo_proposal`] against the app's state
+/// ([`chat::undo_proposal_in_session`]).
 ///
-/// Only a note in the folder has versions, so the write goes through the note
-/// host and the tab holding the note hears about it the way it hears about an
-/// applied proposal ([`announce_applied_note`]).
+/// A note goes back through the note host to the version its history kept. A
+/// file outside the folder goes back through its tab's save to the text
+/// `earlier` kept when the card applied.
 pub fn undo_proposal_to_state(
     state: &AppState,
+    earlier: &EarlierTexts,
     host: &str,
     path: &str,
     before_hash: &str,
@@ -616,23 +678,36 @@ pub fn undo_proposal_to_state(
 ) -> Result<ProposalOutcome, String> {
     let notes_root = state.notes_root();
     let open_tabs = state.open_tabs();
-    let outcome = undo_proposal_inner(
+    let target = CardTarget::resolve(state, &notes_root, &open_tabs, path);
+    let mut put_back = String::new();
+    let outcome = chat::undo_proposal_in_session(
+        earlier,
         &notes_root,
-        &open_tabs,
+        &Tabs(&open_tabs),
         &state.jotra_dir,
         host,
         path,
         before_hash,
         applied_hash,
         Some(&state.note_history),
+        |tab_id, content, verified| {
+            put_back = content.to_string();
+            target.write_tab(state, tab_id, content, verified)
+        },
     );
     if outcome.as_ref().is_ok_and(|undone| undone.changed) {
-        if let Ok(context) = chat::resolve_context_file(&notes_root, &Tabs(&open_tabs), path) {
-            if let Ok(bytes) = std::fs::read(&context.file) {
-                announce_applied_note(state, &context.file, &bytes);
+        // A note was written by the note host, not through `put_back`.
+        let written = match target.context.as_ref() {
+            Some(context) if matches!(context.scope, chat::ContextScope::Notes) => {
+                std::fs::read_to_string(&context.file).ok()
             }
+            _ => Some(put_back),
+        };
+        if let Some(written) = written {
+            target.announce(state, &written);
         }
     }
+    drop(target);
     outcome
 }
 

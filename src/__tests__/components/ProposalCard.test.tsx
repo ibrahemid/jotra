@@ -69,6 +69,10 @@ const CONVERSATION = {
   ],
 };
 
+function verdictOf(container: HTMLElement): string | null | undefined {
+  return container.querySelector(".chat-proposal-verdict")?.textContent;
+}
+
 /** The card over the conversation the store actually holds, so the proposal it
  * renders is the one the store rewrites as the write lands. */
 async function openCard(path?: string) {
@@ -131,7 +135,7 @@ describe("a proposal card", () => {
     expect(mocks.chatApplyProposal).toHaveBeenCalledTimes(1);
 
     land({ path: "Launch.md", hash: "def", bytes: 40, changed: true, undoable: true });
-    await waitFor(() => expect(container.textContent).toContain("Applied to Launch.md."));
+    await waitFor(() => expect(verdictOf(container)).toBe("Applied."));
   });
 
   it("a refused apply can be retried and reaches IPC again", async () => {
@@ -149,7 +153,7 @@ describe("a proposal card", () => {
 
     fireEvent.click(apply());
     await waitFor(() => expect(mocks.chatApplyProposal).toHaveBeenCalledTimes(2));
-    await waitFor(() => expect(container.textContent).toContain("Applied to Launch.md."));
+    await waitFor(() => expect(verdictOf(container)).toBe("Applied."));
     expect(container.textContent).not.toContain("changed since the offer was made");
   });
 
@@ -186,14 +190,14 @@ describe("a proposal card", () => {
     const { apply, container, getByRole, queryByRole } = await openCard();
 
     fireEvent.click(apply());
-    await waitFor(() => expect(container.textContent).toContain("Applied to Launch.md."));
+    await waitFor(() => expect(verdictOf(container)).toBe("Applied."));
 
     fireEvent.click(getByRole("button", { name: "Open" }));
     await waitFor(() => expect(mocks.openFile).toHaveBeenCalledWith("/notes/Launch.md"));
 
     fireEvent.click(getByRole("button", { name: "Undo" }));
     await waitFor(() =>
-      expect(mocks.chatUndoProposal).toHaveBeenCalledWith("Launch.md", "abc", "def"),
+      expect(mocks.chatUndoProposal).toHaveBeenCalledWith("c1", 1, "Launch.md", "abc", "def"),
     );
     await waitFor(() => expect(container.textContent).toContain("Launch.md is back as it was."));
     expect(queryByRole("button", { name: "Undo" })).toBeNull();
@@ -205,6 +209,7 @@ describe("a proposal card", () => {
     await waitFor(() => expect(toasts().length).toBe(1));
     const toast = toasts()[0];
     expect(toast.text).toBe("Applied to Launch.md.");
+    expect(verdictOf(container)).toBe("Applied.");
     expect(toast.action?.label).toBe("Undo");
 
     runToastAction(toast.id);
@@ -218,7 +223,7 @@ describe("a proposal card", () => {
     );
     const { apply, container, getByRole } = await openCard();
     fireEvent.click(apply());
-    await waitFor(() => expect(container.textContent).toContain("Applied to Launch.md."));
+    await waitFor(() => expect(verdictOf(container)).toBe("Applied."));
 
     fireEvent.click(getByRole("button", { name: "Undo" }));
     await waitFor(() =>
@@ -236,7 +241,7 @@ describe("a proposal card", () => {
     });
     const { apply, container, queryByRole } = await openCard();
     fireEvent.click(apply());
-    await waitFor(() => expect(container.textContent).toContain("Applied to Launch.md."));
+    await waitFor(() => expect(verdictOf(container)).toBe("Applied."));
     expect(queryByRole("button", { name: "Undo" })).toBeNull();
     expect(toasts()[0]?.action).toBeNull();
   });

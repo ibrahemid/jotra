@@ -151,13 +151,13 @@ const RUST_ALLOWLIST: &[AllowedString] = &[
     },
     AllowedString {
         file: "crates/jotra-core/src/chat/prompt.rs",
-        line: 84,
+        line: 78,
         word: "note",
         note: "model-facing offer instructions, not app copy",
     },
     AllowedString {
         file: "crates/jotra-core/src/chat/prompt.rs",
-        line: 111,
+        line: 105,
         word: "note",
         note: "attachment tag the model reads; renaming it breaks parsing",
     },
@@ -175,7 +175,7 @@ const RUST_ALLOWLIST: &[AllowedString] = &[
     },
     AllowedString {
         file: "crates/jotra-ai/src/chat.rs",
-        line: 987,
+        line: 1185,
         word: "note",
         note: "debug_assert text, never rendered",
     },

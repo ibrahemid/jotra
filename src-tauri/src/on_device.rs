@@ -2,12 +2,15 @@
 //! macOS (`swift/JotraOnDevice`).
 //!
 //! What the bridge's answers mean is [`jotra_core::ai::on_device`]; turning its
-//! events into the rewrite stream is [`jotra_ai::connection::OnDeviceReply`].
+//! events into the rewrite stream is [`jotra_ai::connection::stream_on_device`].
 //! This module is the call and the callback. A build without the bridge, and
 //! every platform other than macOS, reports the model as unsupported.
 
-use jotra_ai::connection::{OnDeviceEvent, OnDeviceReply, OnDeviceRequest, StreamEvent};
-use jotra_core::ai::on_device::{offers_on_device, OnDeviceAvailability, OnDeviceFailure};
+use jotra_ai::connection::{
+    stream_on_device, OnDeviceEvent, OnDeviceEvents, OnDeviceRequest, StreamEvent,
+    ON_DEVICE_IDLE_TIMEOUT,
+};
+use jotra_core::ai::on_device::{offers_on_device, OnDeviceAvailability};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
@@ -22,42 +25,16 @@ pub fn is_offered() -> bool {
 }
 
 /// Streams one rewrite through the bridge, invoking `on_event` for each piece,
-/// the end, or a failure.
+/// the end, or a failure ([`stream_on_device`]).
 ///
 /// `cancel` stops the request wherever it is, and nothing further is emitted.
 pub async fn run_rewrite(
     request: &OnDeviceRequest,
     cancel: &CancellationToken,
-    mut on_event: impl FnMut(StreamEvent),
+    on_event: impl FnMut(StreamEvent),
 ) {
-    let mut stream = bridge::start(request);
-    let mut reply = OnDeviceReply::default();
-    loop {
-        let next = cancel.run_until_cancelled(stream.next()).await;
-        // A stop that lands with an event is a stop: nothing follows it.
-        let Some(next) = next.filter(|_| !cancel.is_cancelled()) else {
-            stream.stop();
-            return;
-        };
-        let Some(event) = next else {
-            // The bridge ended the stream without a reply or a reason, which
-            // only a stop it did not hear about from here can do.
-            on_event(StreamEvent::Error(OnDeviceFailure::Failed.to_string()));
-            return;
-        };
-        let last = !matches!(event, OnDeviceEvent::Snapshot(_));
-        if let Some(stream_event) = reply.event(event) {
-            let failed = matches!(stream_event, StreamEvent::Error(_));
-            on_event(stream_event);
-            if failed {
-                stream.stop();
-                return;
-            }
-        }
-        if last {
-            return;
-        }
-    }
+    let mut events = bridge::start(request);
+    stream_on_device(&mut events, cancel, ON_DEVICE_IDLE_TIMEOUT, on_event).await;
 }
 
 /// The events of one request, as the bridge's callback delivers them.
@@ -66,9 +43,9 @@ struct Events {
     handle: bridge::Handle,
 }
 
-impl Events {
-    async fn next(&mut self) -> Option<OnDeviceEvent> {
-        self.receiver.recv().await
+impl OnDeviceEvents for Events {
+    fn next(&mut self) -> impl std::future::Future<Output = Option<OnDeviceEvent>> + Send {
+        self.receiver.recv()
     }
 
     fn stop(&self) {

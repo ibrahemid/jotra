@@ -22,6 +22,21 @@ export const BASE_URL_RULE =
 export const PRIVATE_CHECK =
   "Jotra also checks the address is reachable. The check sends no text.";
 
+/** The same check for an address the stored key goes to. */
+export const PRIVATE_CHECK_WITH_KEY =
+  "Jotra also sends the key on its own to check the address is reachable. The check sends no text.";
+
+/** The consent sheet's text for an address on a private network. */
+export function privateNetworkNotice(wholeDocument: number | null, sendsKey: boolean): string {
+  const where = sendsKey
+    ? "to this address on your local network with your API key"
+    : "to this address on your local network";
+  const check = sendsKey ? PRIVATE_CHECK_WITH_KEY : PRIVATE_CHECK;
+  return wholeDocument === null
+    ? `The text you rewrite is sent ${where}. ${check}`
+    : `No text is selected, so the whole document (${wholeDocument} characters) is sent ${where}. ${check}`;
+}
+
 /**
  * Resolves everything that would block a rewrite, in one pass, before any text
  * is sent.
@@ -75,9 +90,7 @@ async function clearBlockersBeforeSending(wholeDocument: number | null): Promise
     const confirmed = await requestConfirm({
       title: `Send text to ${host}?`,
       message: endpoint.is_private_network
-        ? wholeDocument === null
-          ? `The text you rewrite is sent to this address on your local network. ${PRIVATE_CHECK}`
-          : `No text is selected, so the whole document (${wholeDocument} characters) is sent to this address on your local network. ${PRIVATE_CHECK}`
+        ? privateNetworkNotice(wholeDocument, endpoint.sends_key === true)
         : wholeDocument === null
           ? "The text you rewrite is sent with your API key. Jotra also sends the key on its own to check the host is reachable. The check sends no text."
           : `No text is selected, so the whole document (${wholeDocument} characters) is sent with your API key. Jotra also sends the key on its own to check the host is reachable. The check sends no text.`,

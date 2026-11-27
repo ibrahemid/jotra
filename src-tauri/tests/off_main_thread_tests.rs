@@ -23,7 +23,7 @@ use jotra_storage::notes_index::NotesIndexStore;
 use jotra_tauri_lib::commands::buffer::{
     close_buffers_inner, save_buffer_content_inner, save_in_turn,
 };
-use jotra_tauri_lib::commands::chat::apply_proposal_to_state;
+use jotra_tauri_lib::commands::chat::{apply_proposal_to_state, EarlierTexts};
 use jotra_tauri_lib::commands::file::open_file_from_path;
 use jotra_tauri_lib::commands::history::search_buffers_inner;
 use jotra_tauri_lib::preview::handler::RenderCache;
@@ -283,6 +283,7 @@ fn a_chat_edit_of_an_open_file_checks_it_after_a_save_still_landing() {
         let applying = scope.spawn(|| {
             apply_proposal_to_state(
                 &state,
+                &EarlierTexts::default(),
                 "test-host",
                 &file.to_string_lossy(),
                 "AI\n",

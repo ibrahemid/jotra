@@ -118,6 +118,15 @@ pub struct StoredProposal {
     pub new_content: String,
     /// What became of it.
     pub status: ProposalStatus,
+    /// What the note held once the proposal was applied, which is what Undo
+    /// is judged against. Absent until then, and on a proposal an earlier
+    /// build applied, which offers no Undo.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub applied_hash: Option<String>,
+    /// Undo put back what the note held before the proposal was applied. The
+    /// status stays `applied`, which a build without this field still reads.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub undone: bool,
 }
 
 /// What became of one proposal.
@@ -264,6 +273,65 @@ impl Conversation {
         self.updated_at = now;
         true
     }
+
+    /// Records that a proposal was applied and left the note holding the text
+    /// `applied_hash` names, returning false when the turn or the path names
+    /// nothing.
+    pub fn record_applied(
+        &mut self,
+        turn: usize,
+        path: &str,
+        applied_hash: String,
+        now: String,
+    ) -> bool {
+        if !self.set_proposal_status(turn, path, ProposalStatus::Applied, now) {
+            return false;
+        }
+        if let Some(proposal) = self.proposal_mut(turn, path) {
+            proposal.applied_hash = Some(applied_hash);
+            proposal.undone = false;
+        }
+        true
+    }
+
+    /// Records that Undo put back what the note held before an applied
+    /// proposal, returning false when the turn or the path names nothing.
+    pub fn record_undone(&mut self, turn: usize, path: &str, now: String) -> bool {
+        let Some(proposal) = self.proposal_mut(turn, path) else {
+            return false;
+        };
+        proposal.undone = true;
+        self.updated_at = now;
+        true
+    }
+
+    /// Drops the proposed text of every proposal already applied or
+    /// discarded, returning whether anything was dropped.
+    ///
+    /// A file written before decided proposals dropped their text still holds
+    /// it (ADR-040 section 8, amended); opening it is when it is cleaned.
+    pub fn drop_decided_text(&mut self) -> bool {
+        let mut dropped = false;
+        for proposal in self.turns.iter_mut().flat_map(|turn| &mut turn.proposals) {
+            if matches!(
+                proposal.status,
+                ProposalStatus::Applied | ProposalStatus::Discarded
+            ) && !proposal.new_content.is_empty()
+            {
+                proposal.new_content = String::new();
+                dropped = true;
+            }
+        }
+        dropped
+    }
+
+    fn proposal_mut(&mut self, turn: usize, path: &str) -> Option<&mut StoredProposal> {
+        self.turns
+            .get_mut(turn)?
+            .proposals
+            .iter_mut()
+            .find(|item| item.path == path)
+    }
 }
 
 /// The line an earlier proposal adds to its turn in a request.
@@ -311,6 +379,8 @@ impl From<&Proposal> for StoredProposal {
             before_hash: proposal.before_hash.clone(),
             new_content: proposal.new_content.clone(),
             status: ProposalStatus::Pending,
+            applied_hash: None,
+            undone: false,
         }
     }
 }
