@@ -1,12 +1,13 @@
 import { afterEach, beforeEach, describe, it, expect, vi } from "vitest";
 import { EditorSelection, EditorState, type Extension } from "@codemirror/state";
-import { Decoration, EditorView, WidgetType, type RectangleMarker } from "@codemirror/view";
+import { BlockType, Decoration, EditorView, WidgetType, type RectangleMarker } from "@codemirror/view";
 import {
   SELECTION_LAYER_CLASS,
   SELECTION_PIECE_CLASS,
   selectionMarkers,
   jotraSelection,
 } from "../../editor/selection-layer";
+import { InlineImageWidget } from "../../editor/markdown-images";
 import { jotraThemeLight } from "../../components/Editor/cm-theme";
 
 // jsdom lays nothing out, so the stubs below give every line a 20px row, every
@@ -22,6 +23,10 @@ const SPACE = 6;
 
 function rect(left: number, top: number, right: number, bottom: number): DOMRect {
   return { left, top, right, bottom, x: left, y: top, width: right - left, height: bottom - top, toJSON: () => ({}) };
+}
+
+function rectList(rects: DOMRect[]): DOMRectList {
+  return Object.assign(rects, { item: (index: number) => rects[index] ?? null }) as unknown as DOMRectList;
 }
 
 function lineOf(node: Node): HTMLElement | null {
@@ -63,7 +68,7 @@ beforeEach(() => {
       const row = rowOf(line);
       if (to > from) rects.push(rect(PAD + from * CHAR, row * ROW + 3, PAD + to * CHAR, row * ROW + 17));
     }
-    return Object.assign(rects, { item: (index: number) => rects[index] ?? null }) as unknown as DOMRectList;
+    return rectList(rects);
   });
 });
 
@@ -165,6 +170,122 @@ describe("the selection layer", () => {
     const view = mount("alpha", 0, 3);
     const ours = view.scrollDOM.querySelector(`.${SELECTION_LAYER_CLASS}`) as HTMLElement;
     expect(getComputedStyle(ours).pointerEvents).toBe("none");
+  });
+});
+
+const FIGURE_NOTE = "alpha\nfigure\nomega";
+const FIGURE_FROM = 6;
+const FIGURE_TO = 12;
+const FIGURE_HEIGHT = 60;
+const FIGURE_LEFT = 40;
+const FIGURE_RIGHT = 280;
+
+class FigureWidget extends WidgetType {
+  override get estimatedHeight(): number {
+    return FIGURE_HEIGHT;
+  }
+
+  toDOM(): HTMLElement {
+    const frame = document.createElement("div");
+    frame.className = "cm-test-figure";
+    return frame;
+  }
+}
+
+function figureExtent(view: EditorView): { top: number; bottom: number } {
+  const block = view.lineBlockAt(FIGURE_FROM);
+  return { top: view.documentTop + block.top, bottom: view.documentTop + block.bottom };
+}
+
+/** A note whose second line is drawn as a block widget, its element `shift` px below the widget's block. */
+function mountFigure(shift: number): EditorView {
+  let view: EditorView | undefined;
+  const measure = vi.mocked(Element.prototype.getBoundingClientRect);
+  const base = measure.getMockImplementation();
+  measure.mockImplementation(function (this: Element) {
+    if (view && this.classList.contains("cm-test-figure")) {
+      const { top, bottom } = figureExtent(view);
+      return rect(FIGURE_LEFT, top + shift, FIGURE_RIGHT, bottom + shift);
+    }
+    return base ? base.call(this) : rect(0, 0, 0, 0);
+  });
+  const figure = Decoration.replace({ widget: new FigureWidget(), block: true }).range(FIGURE_FROM, FIGURE_TO);
+  view = mount(FIGURE_NOTE, FIGURE_FROM, FIGURE_TO, EditorView.decorations.of(Decoration.set(figure)));
+  return view;
+}
+
+describe("the selection over a block widget", () => {
+  it("paints the widget's own box when its element sits where the widget's block is", () => {
+    const view = mountFigure(0);
+    expect(view.lineBlockAt(FIGURE_FROM).type).toBe(BlockType.WidgetRange);
+    const { top, bottom } = figureExtent(view);
+    expect(bottom - top).toBe(FIGURE_HEIGHT);
+
+    expect(boxes(selectionMarkers(view))).toEqual([{ left: FIGURE_LEFT, right: FIGURE_RIGHT, top, bottom }]);
+  });
+
+  it("paints the text column across the widget's block when no element there fits it", () => {
+    const view = mountFigure(10);
+    const { top, bottom } = figureExtent(view);
+
+    expect(boxes(selectionMarkers(view))).toEqual([{ left: 0, right: WIDTH, top, bottom }]);
+  });
+});
+
+const IMAGE_LINE = "![shot](shots/one.png)";
+const IMAGE_WIDTH = 120;
+const IMAGE_HEIGHT = 80;
+const LINE_RIGHT_PAD = 2;
+
+/**
+ * A line with the app's picture under it: the picture's container is a block
+ * box as wide as the line, its image only as wide as the picture.
+ */
+function mountPicture(): EditorView {
+  const widget = new InlineImageWidget("shots/one.png", {
+    status: "ready",
+    src: "jotra-preview://document/_note-asset/b/t/n/shots/one.png",
+    label: "one.png",
+  });
+  const picture = Decoration.widget({ widget, side: 1 }).range(IMAGE_LINE.length);
+  const view = mount(IMAGE_LINE, 0, IMAGE_LINE.length, EditorView.decorations.of(Decoration.set(picture)));
+  const frame = view.contentDOM.querySelector(".cm-md-image") as HTMLElement;
+  const line = frame.parentElement as HTMLElement;
+  const frameBox = rect(PAD, ROW, WIDTH - LINE_RIGHT_PAD, ROW + IMAGE_HEIGHT);
+  const imageBox = rect(PAD, ROW, PAD + IMAGE_WIDTH, ROW + IMAGE_HEIGHT);
+
+  const measure = vi.mocked(Element.prototype.getBoundingClientRect);
+  const baseMeasure = measure.getMockImplementation();
+  measure.mockImplementation(function (this: Element) {
+    if (this === line) return rect(0, 0, WIDTH, ROW + IMAGE_HEIGHT);
+    return baseMeasure ? baseMeasure.call(this) : rect(0, 0, 0, 0);
+  });
+  vi.spyOn(Element.prototype, "getClientRects").mockImplementation(function (this: Element) {
+    return rectList(this === frame ? [frameBox] : []);
+  });
+  const ranges = vi.mocked(Range.prototype.getClientRects);
+  const baseRanges = ranges.getMockImplementation();
+  ranges.mockImplementation(function (this: Range) {
+    const around = baseRanges ? Array.from(baseRanges.call(this)) : [];
+    if (!this.intersectsNode(frame)) return rectList(around);
+    if (this.startContainer === frame) {
+      return rectList(frame.firstElementChild instanceof HTMLImageElement ? [imageBox] : []);
+    }
+    return rectList([...around, frameBox]);
+  });
+  return view;
+}
+
+describe("the selection over a picture drawn under its line", () => {
+  it("paints the picture where the image is, not across its container", () => {
+    const view = mountPicture();
+    const glyphBottom = 17;
+    const between = (glyphBottom + ROW) / 2;
+
+    expect(boxes(selectionMarkers(view))).toEqual([
+      { left: PAD, right: PAD + IMAGE_LINE.length * CHAR, top: 0, bottom: between },
+      { left: PAD, right: PAD + IMAGE_WIDTH, top: between, bottom: ROW + IMAGE_HEIGHT },
+    ]);
   });
 });
 

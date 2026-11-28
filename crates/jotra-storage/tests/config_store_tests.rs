@@ -1,7 +1,7 @@
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use jotra_core::config::{Accent, AppearanceConfig, JotraConfig, Polarity, ProseFace};
@@ -122,10 +122,14 @@ fn a_reader_racing_config_writes_sees_one_whole_file_or_the_other() {
     store.write_serialized(&first).expect("seed the config");
 
     let writing = AtomicBool::new(true);
+    // The writes done, and how many were done before the last whole read began.
+    let written = AtomicUsize::new(0);
+    let read_after = AtomicUsize::new(0);
     std::thread::scope(|scope| {
         let reader = scope.spawn(|| {
             let (mut reads, mut saw_first, mut saw_second) = (0usize, false, false);
             while writing.load(Ordering::Acquire) {
+                let done = written.load(Ordering::Acquire);
                 let started = Instant::now();
                 let bytes =
                     std::fs::read(store.path()).map_err(|e| format!("read {reads} failed: {e}"))?;
@@ -141,6 +145,7 @@ fn a_reader_racing_config_writes_sees_one_whole_file_or_the_other() {
                         first.len()
                     ));
                 }
+                read_after.store(done, Ordering::Release);
                 reads += 1;
                 // The reader holds the file for the whole of each read, and
                 // Windows can refuse a rename over a file another handle holds
@@ -161,9 +166,18 @@ fn a_reader_racing_config_writes_sees_one_whole_file_or_the_other() {
         });
 
         let stop_reader = StopReader(&writing);
-        for round in 0..WRITES {
+        'writes: for round in 0..WRITES {
             let text = if round % 2 == 0 { &second } else { &first };
             store.write_serialized(text).expect("config write");
+            written.store(round + 1, Ordering::Release);
+            // The next write waits for a whole read of this one, so the reader
+            // sees both configs however the threads are scheduled.
+            while read_after.load(Ordering::Acquire) <= round {
+                if reader.is_finished() {
+                    break 'writes;
+                }
+                std::thread::sleep(PAUSE);
+            }
         }
         drop(stop_reader);
 

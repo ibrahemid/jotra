@@ -35,8 +35,10 @@
 //!    without a target, `location.href`) gets a load of its own, so an engine
 //!    that moves the frame still sees every attempt. Each load is held for the
 //!    settle time before the next one replaces it. Asserted: every load
-//!    reports in, every attempt is made, none reaches a sink, every link click
-//!    reaches the app as a request to open, and the app page never navigates.
+//!    reports in and still answers a ping after its attempts unless an
+//!    accepted frame navigation reached its sink, every attempt is made, none
+//!    reaches a sink, every link click reaches the app as a request to open,
+//!    and the app page never navigates.
 //!    The channels ADR-043 accepts for an opted-in file are reported, not
 //!    asserted: STUN, the resource hints the script creates (a preconnect and,
 //!    with the DNS sink on, a DNS prefetch by name), and on WebView2 the
@@ -48,7 +50,9 @@
 //!    something other than the policy keeps this engine from the sinks and
 //!    their silence above proves nothing; the other two report whether the
 //!    engine acts on them. A page with no policy at `about:blank` fires the
-//!    same three, which tells a broken frame apart from unreachable sinks.
+//!    same three; its image has to land too, which tells a broken frame apart
+//!    from unreachable sinks. WebView2 loads that page as a `data:` URL, which
+//!    the probe lets through the guard for that one load.
 //!
 //! The probe prints one block per phase, every vector in it with its verdict,
 //! on a pass as on a failure; a failure lists the verdicts that failed first.
@@ -79,6 +83,7 @@ mod app_csp;
 use std::borrow::Cow;
 use std::collections::BTreeMap;
 use std::net::{SocketAddr, TcpListener, ToSocketAddrs, UdpSocket};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -1006,6 +1011,8 @@ fn run() -> Result<String, String> {
     let ipc_reports = reports.clone();
     let nav_refused = refused.clone();
     let nav_moment = moment.clone();
+    let control_loading = Arc::new(AtomicBool::new(false));
+    let nav_control_loading = control_loading.clone();
     let builder = WebViewBuilder::new()
         .with_custom_protocol("tauri".to_string(), move |_id, request| {
             let (status, content_type, body): (u16, &str, Vec<u8>) = match request.uri().path() {
@@ -1050,6 +1057,12 @@ fn run() -> Result<String, String> {
         })
         .with_ipc_handler(move |request| record_report(&ipc_reports, request.body()))
         .with_navigation_handler(move |url| {
+            // WebView2 shows `load_html` as a data: URL; the control's own load goes through.
+            if url.starts_with("data:text/html")
+                && nav_control_loading.swap(false, Ordering::SeqCst)
+            {
+                return true;
+            }
             let allowed = jotra_tauri_lib::navigation::is_allowed_navigation(&url, None);
             if !allowed {
                 let moment = nav_moment.lock().expect("moment").clone();
@@ -1200,6 +1213,7 @@ fn run() -> Result<String, String> {
             }
             Stage::Report { until } if now >= until => {
                 set_moment("the about:blank control".to_string());
+                control_loading.store(true, Ordering::SeqCst);
                 if let Err(e) = webview.load_html(&control_html) {
                     run_failures.push(format!("the control page did not load: {e}"));
                 }
@@ -1344,10 +1358,19 @@ fn evaluate(
             "did not run"
         },
     );
+    if sinks.hits("control-img") > 0 {
+        controls.row(Mark::Ok, "about:blank image", reached("control-img"));
+    } else {
+        controls.row(
+            Mark::Fail,
+            "about:blank image",
+            "did not reach its sink, so the about:blank control cannot tell a broken frame from \
+             unreachable sinks",
+        );
+    }
     for (vector, what) in [
         ("control-frame-preconnect", "in-frame preconnect"),
         ("control-frame-stun", "in-frame STUN"),
-        ("control-img", "about:blank image"),
         ("control-preconnect", "about:blank preconnect"),
         ("control-stun", "about:blank STUN"),
     ] {
@@ -1465,13 +1488,36 @@ fn evaluate(
     );
     for (load, vectors) in ON_LOADS.iter().enumerate() {
         let what = format!("load {load}");
+        // The frame may leave its document only by a frame navigation this
+        // engine is accepted for that reached its sink; leaving any other way
+        // is a move the sinks did not see.
+        let moved_by = vectors.iter().copied().find(|vector| {
+            webview2 && ON_FRAME_NAVIGATIONS.contains(vector) && sinks.hits(vector) > 0
+        });
         if reports.load_has(load, "load-ready") {
-            let after = if reports.load_has(load, "pong") {
-                "the document answered the ping after its attempts"
+            if reports.load_has(load, "pong") {
+                on.row(
+                    Mark::Ok,
+                    what,
+                    "reported in; the document answered the ping after its attempts",
+                );
+            } else if let Some(vector) = moved_by {
+                on.row(
+                    Mark::Ok,
+                    what,
+                    format!(
+                        "reported in; the frame had left the document by the ping after its \
+                         attempts, moved by {vector}"
+                    ),
+                );
             } else {
-                "the frame had left the document by the ping after its attempts"
-            };
-            on.row(Mark::Ok, what, format!("reported in; {after}"));
+                on.row(
+                    Mark::Fail,
+                    what,
+                    "reported in, but the frame had left the document by the ping after its \
+                     attempts without an accepted frame navigation reaching its sink",
+                );
+            }
         } else if reports.load_has(load, "inline-ran") {
             on.row(
                 Mark::Fail,

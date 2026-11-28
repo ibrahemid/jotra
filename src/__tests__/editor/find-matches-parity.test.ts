@@ -3,16 +3,12 @@ import { EditorState, type ChangeSpec, type Extension } from "@codemirror/state"
 import { SearchQuery } from "@codemirror/search";
 import { MatchIndex, MATCH_COUNT_CAP } from "../../editor/search/match-index";
 import { DEFAULT_SCAN_LIMITS, createQueryScanner } from "../../editor/search/scanner";
-import { generateCorpusText } from "./fixtures/editor-corpus";
+import { generateCorpusText, type CorpusSpec } from "./fixtures/editor-corpus";
+import { expectSameRanges, type Range } from "./fixtures/ranges";
 
 // Find's count must be the count CodeMirror's own cursor gives: the reference
 // here is an uncapped walk of `SearchQuery.getCursor(state)`, the cursor the
 // highlighter and Enter use. Every comparison is of positions, not totals.
-
-interface Range {
-  from: number;
-  to: number;
-}
 
 function reference(state: EditorState, query: SearchQuery): Range[] {
   const out: Range[] = [];
@@ -43,10 +39,10 @@ function expectSameMatches(state: EditorState, query: SearchQuery, context: stri
   })}`;
   if (expected.length >= MATCH_COUNT_CAP) {
     expect(index?.capped, label).toBe(true);
-    expect(got, label).toEqual(expected.slice(0, MATCH_COUNT_CAP));
+    expectSameRanges(got, expected.slice(0, MATCH_COUNT_CAP), label);
   } else {
     expect(index?.capped ?? false, label).toBe(false);
-    expect(got, label).toEqual(expected);
+    expectSameRanges(got, expected, label);
   }
 }
 
@@ -56,6 +52,9 @@ const MODES = [
   { caseSensitive: false, wholeWord: true },
   { caseSensitive: true, wholeWord: true },
 ];
+
+const modeName = (mode: (typeof MODES)[number]): string =>
+  `${mode.caseSensitive ? "matching case" : "ignoring case"}${mode.wholeWord ? ", whole words" : ""}`;
 
 function stateOf(doc: string, extensions: Extension = []): EditorState {
   return EditorState.create({ doc, extensions });
@@ -111,25 +110,28 @@ describe("find counts what CodeMirror's cursor finds", () => {
     }
   });
 
-  it("over the generated documents, for words, rare words, absent words and patterns", () => {
-    const documents = [
-      generateCorpusText({ name: "prose", kind: "prose", size: 256 * 1024 }),
-      generateCorpusText({ name: "notes", kind: "markdown", size: 256 * 1024, sectionBytes: 10_480 }),
-      generateCorpusText({ name: "server", kind: "log", size: 0, lines: 3_000 }),
-      generateCorpusText({ name: "one-line", kind: "single-line-json", size: 64 * 1024 }),
-    ];
-    const strings = ["zebrafish", "the", "THE", "résumé", "resume", "café", "naïve", "qxjzv", "e", "status=500", "\\n\\n"];
-    const patterns = ["zebra\\w+", "status=5\\d\\d", "\\[\\[Note \\d+\\]\\]", "^#+ ", "\\s{2,}", "[^\\n]{200,}", "é"];
-    for (const doc of documents) {
-      const state = stateOf(doc);
-      for (const mode of MODES) {
+  const documents: CorpusSpec[] = [
+    { name: "prose", kind: "prose", size: 256 * 1024 },
+    { name: "notes", kind: "markdown", size: 256 * 1024, sectionBytes: 10_480 },
+    { name: "server", kind: "log", size: 0, lines: 3_000 },
+    { name: "one-line", kind: "single-line-json", size: 64 * 1024 },
+  ];
+  const strings = ["zebrafish", "the", "THE", "résumé", "resume", "café", "naïve", "qxjzv", "e", "status=500", "\\n\\n"];
+  const patterns = ["zebra\\w+", "status=5\\d\\d", "\\[\\[Note \\d+\\]\\]", "^#+ ", "\\s{2,}", "[^\\n]{200,}", "é"];
+  const texts = new Map<CorpusSpec, string>();
+  for (const spec of documents) {
+    for (const mode of MODES) {
+      it(`over the generated ${spec.name} document, ${modeName(mode)}, for words, rare words, absent words and patterns`, () => {
+        let text = texts.get(spec);
+        if (text === undefined) texts.set(spec, (text = generateCorpusText(spec)));
+        const state = stateOf(text);
         for (const search of strings) expectSameMatches(state, new SearchQuery({ search, ...mode }), "corpus string");
         for (const search of patterns) {
           expectSameMatches(state, new SearchQuery({ search, regexp: true, ...mode }), "corpus regexp");
         }
-      }
+      });
     }
-  });
+  }
 
   it("tries the overlapping candidates a whole-word match turns down", () => {
     const state = stateOf(["ba-a-a", "ba-a-a é", "xa-a-a-a", "é ba-a-a-a"].join("\n"));

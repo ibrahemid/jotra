@@ -3,16 +3,12 @@ import { CharCategory, EditorState, codePointAt, codePointSize, findClusterBreak
 import { SearchQuery } from "@codemirror/search";
 import { MatchIndex, MATCH_COUNT_CAP } from "../../editor/search/match-index";
 import { DEFAULT_SCAN_LIMITS, createQueryScanner, unquoteSearch, type ScanLimits } from "../../editor/search/scanner";
+import { expectSameRanges, type Range } from "./fixtures/ranges";
 
 // A literal query's matches over text in many scripts, against the scanner as
 // it stood before ASCII runs were skipped and plain text was read by a native
 // search: the per-line fold below is a copy of that code, kept as the
 // reference. Every comparison is of match starts and ends.
-
-interface Range {
-  from: number;
-  to: number;
-}
 
 const SMALL: ScanLimits = { window: 48, reach: 12, longLine: 40, clusterMargin: 8, editRead: 20 };
 // A window holding whole nodes of the document past the size their own text is listed from.
@@ -28,6 +24,7 @@ const CHANGED = 2;
 class ReferenceFold {
   private readonly bmp = new Uint8Array(0x10000);
   private readonly folded = new Map<number, string>();
+  readonly lines = new Map<string, { folded: string; pieces: Pieces }>();
 
   constructor(private readonly caseInsensitive: boolean) {}
 
@@ -204,7 +201,9 @@ function referenceLine(
       at = found + query.length;
     }
   }
-  const { folded, pieces } = referenceFoldWindow(text, plan);
+  let line = plan.fold.lines.get(text);
+  if (!line) plan.fold.lines.set(text, (line = referenceFoldWindow(text, plan)));
+  const { folded, pieces } = line;
   for (let at = 0; ; ) {
     const found = folded.indexOf(query, at);
     if (found < 0) return;
@@ -252,8 +251,35 @@ function current(state: EditorState, query: SearchQuery, limits: ScanLimits): Ma
   return index;
 }
 
-function expectSameMatches(state: EditorState, query: SearchQuery, limits: ScanLimits, context: string): void {
-  const expected = reference(state, query);
+interface Expected {
+  ranges: Range[];
+  capped: boolean;
+}
+
+function expectedOf(state: EditorState, query: SearchQuery): Expected {
+  const all = reference(state, query);
+  return { ranges: all.slice(0, MATCH_COUNT_CAP), capped: all.length >= MATCH_COUNT_CAP };
+}
+
+/** The reference over one text, folded once for each query and mode however many window sizes read it. */
+function referenceOver(doc: string): (query: SearchQuery) => Expected {
+  const state = EditorState.create({ doc });
+  const known = new Map<string, Expected>();
+  return (query) => {
+    const key = JSON.stringify([query.search, query.caseSensitive, query.wholeWord]);
+    let found = known.get(key);
+    if (!found) known.set(key, (found = expectedOf(state, query)));
+    return found;
+  };
+}
+
+function expectSameMatches(
+  state: EditorState,
+  query: SearchQuery,
+  limits: ScanLimits,
+  context: string,
+  expected: Expected = expectedOf(state, query),
+): void {
   const index = current(state, query, limits);
   const label = `${context} ${JSON.stringify({
     search: query.search,
@@ -261,8 +287,8 @@ function expectSameMatches(state: EditorState, query: SearchQuery, limits: ScanL
     wholeWord: query.wholeWord,
     window: limits.window,
   })}`;
-  expect(index.capped, label).toBe(expected.length >= MATCH_COUNT_CAP);
-  expect(index.ranges(), label).toEqual(expected.slice(0, MATCH_COUNT_CAP));
+  expect(index.capped, label).toBe(expected.capped);
+  expectSameRanges(index.ranges(), expected.ranges, label);
 }
 
 const MODES = [
@@ -271,6 +297,9 @@ const MODES = [
   { caseSensitive: false, wholeWord: true },
   { caseSensitive: true, wholeWord: true },
 ];
+
+const modeName = (mode: (typeof MODES)[number]): string =>
+  `${mode.caseSensitive ? "matching case" : "ignoring case"}${mode.wholeWord ? ", whole words" : ""}`;
 
 const FRAGMENTS = [
   // ASCII
@@ -350,33 +379,39 @@ describe("a literal query over text in many scripts finds what the fold found be
   const rand = prng(20261019);
   const doc = mixedCorpus(rand, 96 * 1024);
   const queries = [...QUERIES, ...randomQueries(rand, doc, 40)];
+  const corpusReference = referenceOver(doc);
 
   for (const limits of [DEFAULT_SCAN_LIMITS, SMALL, WIDE]) {
-    it(`for every query and mode, read in windows of ${limits.window}`, () => {
-      const state = EditorState.create({ doc });
-      for (const search of queries) {
-        for (const mode of MODES) expectSameMatches(state, new SearchQuery({ search, ...mode }), limits, "mixed");
+    for (const mode of MODES) {
+      it(`for every query, ${modeName(mode)}, read in windows of ${limits.window}`, () => {
+        const state = EditorState.create({ doc });
+        for (const search of queries) {
+          const query = new SearchQuery({ search, ...mode });
+          expectSameMatches(state, query, limits, "mixed", corpusReference(query));
+        }
+      });
+    }
+  }
+
+  for (const mode of MODES) {
+    it(`for every query, ${modeName(mode)}, a second time over the same document and after edits to it`, () => {
+      let state = EditorState.create({ doc });
+      const editRand = prng(7);
+      for (let round = 0; round < 3; round++) {
+        for (const search of QUERIES) {
+          const query = new SearchQuery({ search, ...mode });
+          const expected = round === 0 ? corpusReference(query) : expectedOf(state, query);
+          expectSameMatches(state, query, DEFAULT_SCAN_LIMITS, `round ${round}`, expected);
+        }
+        const changes = Array.from({ length: 6 }, () => {
+          const from = Math.floor(editRand() * state.doc.length);
+          return { from, to: Math.min(state.doc.length, from + Math.floor(editRand() * 40)), insert: mixedCorpus(editRand, 30) };
+        }).sort((a, b) => a.from - b.from);
+        const disjoint = changes.filter((change, i) => i === 0 || change.from >= changes[i - 1].to);
+        state = state.update({ changes: disjoint }).state;
       }
     });
   }
-
-  it("for every query and mode, a second time over the same document and after edits to it", () => {
-    let state = EditorState.create({ doc });
-    const editRand = prng(7);
-    for (let round = 0; round < 3; round++) {
-      for (const search of QUERIES) {
-        for (const mode of MODES) {
-          expectSameMatches(state, new SearchQuery({ search, ...mode }), DEFAULT_SCAN_LIMITS, `round ${round}`);
-        }
-      }
-      const changes = Array.from({ length: 6 }, () => {
-        const from = Math.floor(editRand() * state.doc.length);
-        return { from, to: Math.min(state.doc.length, from + Math.floor(editRand() * 40)), insert: mixedCorpus(editRand, 30) };
-      }).sort((a, b) => a.from - b.from);
-      const disjoint = changes.filter((change, i) => i === 0 || change.from >= changes[i - 1].to);
-      state = state.update({ changes: disjoint }).state;
-    }
-  });
 
   it("over lines of plain ASCII with the odd code point that folds to ASCII", () => {
     const lines = Array.from({ length: 3000 }, (_, i) => {
@@ -387,9 +422,9 @@ describe("a literal query over text in many scripts finds what the fold found be
     const searches = ["zebrafish", "zebrafis", "zebrafi", "afis", "ish", "fish", "cafe", "notes cafe", "s cafe", "fe", "qxjzve"];
     for (const search of [...searches, "café", "e", "f", "ﬁ", "ｚ", "z", "s n"]) {
       for (const mode of MODES) {
-        for (const limits of [DEFAULT_SCAN_LIMITS, SMALL]) {
-          expectSameMatches(state, new SearchQuery({ search, ...mode }), limits, "ascii lines");
-        }
+        const query = new SearchQuery({ search, ...mode });
+        const expected = expectedOf(state, query);
+        for (const limits of [DEFAULT_SCAN_LIMITS, SMALL]) expectSameMatches(state, query, limits, "ascii lines", expected);
       }
     }
   });

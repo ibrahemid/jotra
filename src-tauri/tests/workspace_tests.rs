@@ -1,109 +1,22 @@
-use std::sync::atomic::AtomicBool;
-use std::sync::{Arc, Mutex, RwLock};
+#[path = "support/app_state.rs"]
+mod app_state;
 
-use jotra_core::config::JotraConfig;
-use jotra_core::events::bus::EventBus;
-use jotra_core::preview::ContentRendererRegistry;
-use jotra_core::update::UpdatePhase;
-use jotra_core::watcher::reconcile::ReconcileGate;
-use jotra_plugin::transform::TransformRegistry;
-use jotra_storage::buffer_store::BufferStore;
-use jotra_storage::config_store::ConfigStore;
-use jotra_storage::database::connection::open_database;
-use jotra_storage::database::migrations::run_migrations;
-use jotra_storage::layout_state::LayoutStateStore;
-use jotra_storage::notes_index::NotesIndexStore;
+use app_state::AppStateBuilder;
+use std::path::{Path, PathBuf};
+use std::sync::mpsc;
+use std::time::{Duration, Instant};
+
+use jotra_core::events::bus::JotraEvent;
 use jotra_tauri_lib::commands::notes::move_notes_folder_to;
 use jotra_tauri_lib::commands::workspace::{
     clear_workspace_root_inner, list_workspace_dir_inner, set_workspace_root_from_path,
     workspace_reveal_target, ERR_NOT_IN_FOLDER,
 };
-use jotra_tauri_lib::preview::handler::RenderCache;
-use jotra_tauri_lib::quit::QuitState;
-use jotra_tauri_lib::security::AuthorizedPaths;
 use jotra_tauri_lib::state::AppState;
-use jotra_tauri_lib::watcher::handler::create_ignore_set;
 use tempfile::TempDir;
 
 fn make_state(dir: &TempDir) -> AppState {
-    let jotra_dir = dir.path().to_path_buf();
-    let buffers_dir = jotra_dir.join("buffers");
-    std::fs::create_dir_all(&buffers_dir).expect("buffers dir");
-
-    let notes_root = jotra_dir.join("Jotra");
-    std::fs::create_dir_all(&notes_root).expect("notes folder");
-    let notes_root = jotra_tauri_lib::security::canonicalize_root(&notes_root).expect("canonical");
-
-    let db_path = jotra_dir.join("jotra.db");
-    let conn = open_database(&db_path).expect("open db");
-    run_migrations(&conn).expect("migrations");
-    let store = BufferStore::new(conn, buffers_dir.clone());
-
-    let config_path = jotra_dir.join("config.toml");
-    let config_store = ConfigStore::new(config_path);
-
-    let note_history = Arc::new(
-        jotra_storage::note_history::NoteHistoryStore::open(&jotra_dir).expect("version store"),
-    );
-
-    AppState {
-        store: Mutex::new(store),
-        config_store,
-        config: Mutex::new(JotraConfig::default()),
-        jotra_dir,
-        buffers_dir,
-        notes_root: RwLock::new(notes_root),
-        first_run: false,
-        first_run_finished: std::sync::atomic::AtomicBool::new(false),
-        menu_apps: std::sync::Mutex::new(None),
-        retitle_watch: std::sync::Arc::new(jotra_tauri_lib::first_run::RetitleWatch::new()),
-        notes_root_fallback: RwLock::new(None),
-        watcher_ignore: create_ignore_set(),
-        watcher: Mutex::new(None),
-        notes_watcher: Mutex::new(None),
-        open_file_watcher: Mutex::new(None),
-        file_tracking: Mutex::new(None),
-        notes_index: Arc::new(NotesIndexStore::open(&db_path).expect("notes index db")),
-        note_history,
-        notes_index_cancel: Arc::new(AtomicBool::new(false)),
-        notes_reconcile: Arc::new(ReconcileGate::new()),
-        quit: Arc::new(QuitState::new()),
-        removal_holds: Default::default(),
-        pending_opens: Mutex::new(Vec::new()),
-        pending_lines: Mutex::new(Default::default()),
-        cli_waits: Mutex::new(Default::default()),
-        frontend_ready: AtomicBool::new(false),
-        window_revealed: AtomicBool::new(false),
-        window_dismissed: AtomicBool::new(false),
-        transforms: RwLock::new(TransformRegistry::new()),
-        event_bus: Arc::new(EventBus::new()),
-        update_phase: Mutex::new(UpdatePhase::default()),
-        authorized_paths: AuthorizedPaths::new(),
-        preview_registry: Arc::new(RwLock::new(ContentRendererRegistry::new())),
-        preview_render_cache: Arc::new(RenderCache::new()),
-        layout_state: LayoutStateStore::new(open_database(&db_path).expect("layout db")),
-        tab_rows: jotra_storage::tab_rows::TabRowStore::new(
-            open_database(&db_path).expect("tab rows db"),
-        ),
-        command_usage: jotra_storage::command_usage::CommandUsageStore::new(
-            open_database(&db_path).expect("usage db"),
-        ),
-        config_diagnostics: std::sync::Mutex::new(Vec::new()),
-        recovered_buffers: Mutex::new(Vec::new()),
-        was_dirty_shutdown: false,
-        workspace_root: Mutex::new(None),
-        workspace_watcher: Mutex::new(None),
-        inbox_root: Mutex::new(None),
-        inbox_watcher: Mutex::new(None),
-        fts_scheduler: jotra_tauri_lib::fts_scheduler::FtsScheduler::new(),
-        workspace_index: Arc::new(RwLock::new(
-            jotra_tauri_lib::workspace_index::WorkspaceIndex::new(None),
-        )),
-        search_generation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
-        last_disk_hash: Mutex::new(std::collections::HashMap::new()),
-        source_records: Mutex::new(std::collections::HashMap::new()),
-        buffer_writes: Default::default(),
-    }
+    AppStateBuilder::new(dir.path()).build()
 }
 
 #[test]
@@ -275,41 +188,75 @@ fn a_reveal_names_an_entry_of_the_open_folder_and_nothing_else() {
     }
 }
 
+/// Long enough for a loaded machine; only a failing run waits it out.
+const DELIVERY_BOUND: Duration = Duration::from_secs(15);
+
+/// What the workspace watcher says on the bus, in order: each changed path,
+/// and `swept:<root>` for a sweep.
+fn workspace_reports(state: &AppState) -> mpsc::Receiver<String> {
+    let (tx, rx) = mpsc::channel();
+    state.event_bus.subscribe(move |event| match event {
+        JotraEvent::WorkspaceChanged { path, .. } => {
+            let _ = tx.send(path.clone());
+        }
+        JotraEvent::WorkspaceSwept { root, .. } => {
+            let _ = tx.send(format!("swept:{root}"));
+        }
+        _ => {}
+    });
+    rx
+}
+
+/// The reports received up to and including the first one `stop` accepts, or
+/// `None` when none came within [`DELIVERY_BOUND`].
+fn reports_through(
+    rx: &mpsc::Receiver<String>,
+    stop: impl Fn(&str) -> bool,
+) -> Option<Vec<String>> {
+    let deadline = Instant::now() + DELIVERY_BOUND;
+    let mut seen = Vec::new();
+    while let Some(left) = deadline.checked_duration_since(Instant::now()) {
+        let report = rx.recv_timeout(left).ok()?;
+        let done = stop(&report);
+        seen.push(report);
+        if done {
+            return Some(seen);
+        }
+    }
+    None
+}
+
+/// Hands the workspace watcher `paths` as one delivery, as the platform would
+/// after its debounce.
+fn deliver_to_workspace(state: &AppState, paths: &[PathBuf]) {
+    state
+        .workspace_watcher
+        .lock()
+        .unwrap()
+        .as_ref()
+        .expect("the workspace watcher")
+        .deliver(paths)
+        .expect("the workspace watcher takes the delivery");
+}
+
+/// The one test here that runs the platform's watcher. Delivery lags on a
+/// loaded machine, so a file that has not been reported is followed by
+/// another, each under a new name.
 #[test]
-fn workspace_watcher_emits_change_events_on_bus() {
+fn the_platform_watcher_reports_a_new_file_in_the_workspace() {
     let dir = TempDir::new().unwrap();
     let state = make_state(&dir);
     let ws = TempDir::new().unwrap();
-
-    let received: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
-    let received_clone = received.clone();
-    state.event_bus.subscribe(move |event| {
-        if let jotra_core::events::bus::JotraEvent::WorkspaceChanged { path, .. } = event {
-            received_clone.lock().unwrap().push(path.clone());
-        }
-    });
+    let rx = workspace_reports(&state);
 
     set_workspace_root_from_path(&state, ws.path()).expect("set root");
 
-    let file = ws.path().join("fresh.md");
-    std::fs::write(&file, "hello").unwrap();
-
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-    loop {
-        if received
-            .lock()
-            .unwrap()
-            .iter()
-            .any(|p| p.ends_with("fresh.md"))
-        {
-            break;
-        }
-        assert!(
-            std::time::Instant::now() < deadline,
-            "workspace change event never arrived"
-        );
-        std::thread::sleep(std::time::Duration::from_millis(50));
-    }
+    let heard = (0..4).any(|attempt| {
+        let name = format!("fresh-{attempt}.md");
+        std::fs::write(ws.path().join(&name), "hello").unwrap();
+        reports_through(&rx, |report| report.ends_with(&name)).is_some()
+    });
+    assert!(heard, "a file written into the workspace never arrived");
 }
 
 /// The notes folder opened as the workspace lists what the notes walk reads:
@@ -360,6 +307,19 @@ fn a_code_workspace_still_hides_vendor() {
     assert_eq!(names, ["main.rs"]);
 }
 
+/// A change to `vendor/Acme.md` delivered with one to `marker.md` beside it,
+/// and what the watcher said up to the marker, which every kind of folder
+/// reports.
+fn reports_for_a_vendor_note(state: &AppState, root: &Path) -> Vec<String> {
+    let rx = workspace_reports(state);
+    let note = root.join("vendor").join("Acme.md");
+    let marker = root.join("marker.md");
+    std::fs::write(&note, "supplier").unwrap();
+    std::fs::write(&marker, "written last").unwrap();
+    deliver_to_workspace(state, &[note, marker]);
+    reports_through(&rx, |report| report.ends_with("marker.md")).expect("the marker arrived")
+}
+
 /// The tree of the notes folder opened as the workspace hears about a note
 /// written under `vendor/`, so the folder it lists stays current.
 #[test]
@@ -369,34 +329,13 @@ fn the_notes_folder_as_the_workspace_hears_a_note_under_vendor() {
     let notes = state.notes_root();
     std::fs::create_dir_all(notes.join("vendor")).unwrap();
 
-    let received: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
-    let received_clone = received.clone();
-    state.event_bus.subscribe(move |event| {
-        if let jotra_core::events::bus::JotraEvent::WorkspaceChanged { path, .. } = event {
-            received_clone.lock().unwrap().push(path.clone());
-        }
-    });
+    let root = set_workspace_root_from_path(&state, &notes).expect("set root");
 
-    set_workspace_root_from_path(&state, &notes).expect("set root");
-
-    std::fs::write(notes.join("vendor").join("Acme.md"), "supplier").unwrap();
-
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-    loop {
-        if received
-            .lock()
-            .unwrap()
-            .iter()
-            .any(|p| p.ends_with("Acme.md"))
-        {
-            break;
-        }
-        assert!(
-            std::time::Instant::now() < deadline,
-            "the change under vendor/ never reached the tree"
-        );
-        std::thread::sleep(std::time::Duration::from_millis(50));
-    }
+    let seen = reports_for_a_vendor_note(&state, Path::new(&root));
+    assert!(
+        seen.iter().any(|p| p.ends_with("Acme.md")),
+        "the change under vendor/ never reached the tree: {seen:?}"
+    );
 }
 
 /// When the notes folder moves into the folder open as the workspace, that
@@ -419,90 +358,44 @@ fn the_workspace_the_notes_folder_moves_into_lists_and_hears_vendor() {
     };
     assert!(names(&state).is_empty(), "a code workspace hides vendor/");
 
-    let received: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
-    let received_clone = received.clone();
-    state.event_bus.subscribe(move |event| {
-        if let jotra_core::events::bus::JotraEvent::WorkspaceChanged { path, .. } = event {
-            received_clone.lock().unwrap().push(path.clone());
-        }
-    });
-
-    move_notes_folder_to(&state, std::path::Path::new(&root)).expect("move");
+    move_notes_folder_to(&state, Path::new(&root)).expect("move");
     assert_eq!(names(&state), ["vendor"]);
 
-    std::fs::write(ws.path().join("vendor").join("Acme.md"), "supplier").unwrap();
-
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-    loop {
-        if received
-            .lock()
-            .unwrap()
-            .iter()
-            .any(|p| p.ends_with("Acme.md"))
-        {
-            break;
-        }
-        assert!(
-            std::time::Instant::now() < deadline,
-            "the change under vendor/ never reached the tree after the move"
-        );
-        std::thread::sleep(std::time::Duration::from_millis(50));
-    }
+    let seen = reports_for_a_vendor_note(&state, Path::new(&root));
+    assert!(
+        seen.iter().any(|p| p.ends_with("Acme.md")),
+        "the change under vendor/ never reached the tree after the move: {seen:?}"
+    );
 }
 
 /// An install into `.venv` inside an opened code folder reaches nothing: no
-/// event for any of its files, while a file written beside it afterwards still
-/// arrives, which shows the watcher was listening the whole time (TS-12).
+/// event for any of its files, while a file delivered beside it afterwards
+/// still arrives, which shows the watcher was listening the whole time (TS-12).
 #[test]
 fn an_install_into_a_venv_inside_the_workspace_raises_no_event() {
     let dir = TempDir::new().unwrap();
     let state = make_state(&dir);
     let ws = TempDir::new().unwrap();
+    let rx = workspace_reports(&state);
 
-    let received: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
-    let received_clone = received.clone();
-    state.event_bus.subscribe(move |event| match event {
-        jotra_core::events::bus::JotraEvent::WorkspaceChanged { path, .. } => {
-            received_clone.lock().unwrap().push(path.clone());
-        }
-        jotra_core::events::bus::JotraEvent::WorkspaceSwept { root, .. } => {
-            received_clone.lock().unwrap().push(format!("swept:{root}"));
-        }
-        _ => {}
-    });
+    let root = PathBuf::from(set_workspace_root_from_path(&state, ws.path()).expect("set root"));
 
-    set_workspace_root_from_path(&state, ws.path()).expect("set root");
-
-    let site = ws.path().join(".venv/lib/python3.12/site-packages");
-    for package in 0..40 {
-        let folder = site.join(format!("pkg{package}"));
-        std::fs::create_dir_all(&folder).unwrap();
-        for module in 0..10 {
-            std::fs::write(folder.join(format!("m{module}.py")), "x = 1\n").unwrap();
-        }
-    }
-    std::fs::write(ws.path().join("after.md"), "written last").unwrap();
-
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-    loop {
-        if received
-            .lock()
-            .unwrap()
-            .iter()
-            .any(|p| p.ends_with("after.md"))
-        {
-            break;
-        }
-        assert!(
-            std::time::Instant::now() < deadline,
-            "the file written after the install never arrived"
-        );
-        std::thread::sleep(std::time::Duration::from_millis(50));
-    }
-    let received = received.lock().unwrap();
-    let from_the_install: Vec<&String> = received
-        .iter()
-        .filter(|p| p.contains(".venv") || p.starts_with("swept:"))
+    let site = root.join(".venv/lib/python3.12/site-packages");
+    let install: Vec<PathBuf> = (0..40)
+        .flat_map(|package| {
+            let folder = site.join(format!("pkg{package}"));
+            (0..10).map(move |module| folder.join(format!("m{module}.py")))
+        })
         .collect();
+    deliver_to_workspace(&state, &install);
+    std::fs::write(root.join("after.md"), "written last").unwrap();
+    deliver_to_workspace(&state, &[root.join("after.md")]);
+
+    let from_the_install = |report: &str| report.contains(".venv") || report.starts_with("swept:");
+    let seen = reports_through(&rx, |report| {
+        report.ends_with("after.md") || from_the_install(report)
+    })
+    .expect("the file delivered after the install arrived");
+    let from_the_install: Vec<&String> = seen.iter().filter(|p| from_the_install(p)).collect();
     assert!(from_the_install.is_empty(), "{from_the_install:?}");
 }

@@ -9,24 +9,17 @@
 //! another program changed and Today's note on a changed file, which also turn
 //! the file's preview scripts off.
 
+#[path = "support/app_state.rs"]
+mod app_state;
+
+use app_state::AppStateBuilder;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::AtomicBool;
-use std::sync::{mpsc, Arc, Mutex, RwLock};
+use std::sync::{mpsc, Arc};
 use std::time::Duration;
 
-use jotra_core::config::JotraConfig;
-use jotra_core::events::bus::{EventBus, JotraEvent};
-use jotra_core::preview::{ContentRendererRegistry, RenderRequest};
-use jotra_core::update::UpdatePhase;
+use jotra_core::events::bus::JotraEvent;
+use jotra_core::preview::RenderRequest;
 use jotra_core::watcher::change_event::ExternalChange;
-use jotra_core::watcher::reconcile::ReconcileGate;
-use jotra_plugin::transform::TransformRegistry;
-use jotra_storage::buffer_store::BufferStore;
-use jotra_storage::config_store::ConfigStore;
-use jotra_storage::database::connection::open_database;
-use jotra_storage::database::migrations::run_migrations;
-use jotra_storage::layout_state::LayoutStateStore;
-use jotra_storage::notes_index::NotesIndexStore;
 use jotra_tauri_lib::bus_subscribers::{attach_bus_subscribers, BusHost};
 use jotra_tauri_lib::commands::activity::announce_waiting_inner;
 use jotra_tauri_lib::commands::buffer::read_buffer_content_inner;
@@ -36,12 +29,9 @@ use jotra_tauri_lib::commands::preview::{
     preview_set_scripts_inner, render_into_cache, CachedRender,
 };
 use jotra_tauri_lib::events::JotraFrontendEvent;
-use jotra_tauri_lib::preview::handler::RenderCache;
 use jotra_tauri_lib::preview::renderers::HtmlRenderer;
-use jotra_tauri_lib::quit::QuitState;
-use jotra_tauri_lib::security::{canonicalize_for_authorization, AuthorizedPaths};
+use jotra_tauri_lib::security::canonicalize_for_authorization;
 use jotra_tauri_lib::state::AppState;
-use jotra_tauri_lib::watcher::handler::create_ignore_set;
 use tempfile::TempDir;
 
 /// Long enough for an emit or an open on an idle machine many times over, and
@@ -50,80 +40,7 @@ use tempfile::TempDir;
 const DEADLINE: Duration = Duration::from_secs(5);
 
 fn make_state(dir: &TempDir) -> AppState {
-    let jotra_dir = dir.path().to_path_buf();
-    let buffers_dir = jotra_dir.join("buffers");
-    std::fs::create_dir_all(&buffers_dir).expect("buffers dir");
-
-    let notes_root = jotra_dir.join("Jotra");
-    std::fs::create_dir_all(&notes_root).expect("notes folder");
-    let notes_root = jotra_tauri_lib::security::canonicalize_root(&notes_root).expect("canonical");
-
-    let db_path = jotra_dir.join("jotra.db");
-    let conn = open_database(&db_path).expect("open db");
-    run_migrations(&conn).expect("migrations");
-
-    let note_history = Arc::new(
-        jotra_storage::note_history::NoteHistoryStore::open(&jotra_dir).expect("version store"),
-    );
-
-    AppState {
-        store: Mutex::new(BufferStore::new(conn, buffers_dir.clone())),
-        config_store: ConfigStore::new(jotra_dir.join("config.toml")),
-        config: Mutex::new(JotraConfig::default()),
-        jotra_dir,
-        buffers_dir,
-        notes_root: RwLock::new(notes_root),
-        first_run: false,
-        first_run_finished: std::sync::atomic::AtomicBool::new(false),
-        menu_apps: std::sync::Mutex::new(None),
-        retitle_watch: std::sync::Arc::new(jotra_tauri_lib::first_run::RetitleWatch::new()),
-        notes_root_fallback: RwLock::new(None),
-        watcher_ignore: create_ignore_set(),
-        watcher: Mutex::new(None),
-        notes_watcher: Mutex::new(None),
-        open_file_watcher: Mutex::new(None),
-        file_tracking: Mutex::new(None),
-        notes_index: Arc::new(NotesIndexStore::open(&db_path).expect("notes index db")),
-        note_history,
-        notes_index_cancel: Arc::new(AtomicBool::new(false)),
-        notes_reconcile: Arc::new(ReconcileGate::new()),
-        quit: Arc::new(QuitState::new()),
-        removal_holds: Default::default(),
-        pending_opens: Mutex::new(Vec::new()),
-        pending_lines: Mutex::new(Default::default()),
-        cli_waits: Mutex::new(Default::default()),
-        frontend_ready: AtomicBool::new(false),
-        window_revealed: AtomicBool::new(false),
-        window_dismissed: AtomicBool::new(false),
-        transforms: RwLock::new(TransformRegistry::new()),
-        event_bus: Arc::new(EventBus::new()),
-        update_phase: Mutex::new(UpdatePhase::default()),
-        authorized_paths: AuthorizedPaths::new(),
-        preview_registry: Arc::new(RwLock::new(ContentRendererRegistry::new())),
-        preview_render_cache: Arc::new(RenderCache::new()),
-        layout_state: LayoutStateStore::new(open_database(&db_path).expect("layout db")),
-        tab_rows: jotra_storage::tab_rows::TabRowStore::new(
-            open_database(&db_path).expect("tab rows db"),
-        ),
-        command_usage: jotra_storage::command_usage::CommandUsageStore::new(
-            open_database(&db_path).expect("usage db"),
-        ),
-        config_diagnostics: std::sync::Mutex::new(Vec::new()),
-        recovered_buffers: Mutex::new(Vec::new()),
-        was_dirty_shutdown: false,
-        workspace_root: Mutex::new(None),
-        workspace_watcher: Mutex::new(None),
-        inbox_root: Mutex::new(None),
-        inbox_watcher: Mutex::new(None),
-        fts_scheduler: jotra_tauri_lib::fts_scheduler::FtsScheduler::new(),
-        workspace_index: Arc::new(RwLock::new(
-            jotra_tauri_lib::workspace_index::WorkspaceIndex::new(None),
-        )),
-        search_generation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
-        last_disk_hash: Mutex::new(std::collections::HashMap::new()),
-        source_records: Mutex::new(std::collections::HashMap::new()),
-        buffer_writes: Default::default(),
-    }
+    AppStateBuilder::new(dir.path()).build()
 }
 
 /// The application, as its subscribers reach it, with the frontend and the
@@ -356,26 +273,52 @@ fn no_event_waits_on_the_buffer_store() {
     drop(held);
 }
 
-#[test]
-fn the_app_subscribes_to_its_bus_in_one_place() {
+/// Every `.rs` file under the library's `src`, relative to it, with its text
+/// up to its unit-test module.
+fn library_sources() -> Vec<(PathBuf, String)> {
     let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
-    let mut subscribing = Vec::new();
+    let mut sources = Vec::new();
     let mut folders = vec![src.clone()];
     while let Some(folder) = folders.pop() {
         for entry in std::fs::read_dir(&folder).expect("read the source folder") {
             let path = entry.expect("entry").path();
             if path.is_dir() {
                 folders.push(path);
-            } else if path.extension().is_some_and(|ext| ext == "rs")
-                && std::fs::read_to_string(&path)
+            } else if path.extension().is_some_and(|ext| ext == "rs") {
+                let text = std::fs::read_to_string(&path)
                     .expect("read the source")
-                    .contains(".subscribe(")
-            {
-                subscribing.push(path.strip_prefix(&src).expect("inside src").to_path_buf());
+                    .replace("\r\n", "\n");
+                let shipped = match text.find("#[cfg(test)]\nmod ") {
+                    Some(at) => text[..at].to_string(),
+                    None => text,
+                };
+                sources.push((
+                    path.strip_prefix(&src).expect("inside src").to_path_buf(),
+                    shipped,
+                ));
             }
         }
     }
-    subscribing.sort();
+    sources.sort();
+    sources
+}
+
+/// The files whose shipped code holds `needle`, each with how many times.
+fn calls_of(sources: &[(PathBuf, String)], needle: &str) -> Vec<(PathBuf, usize)> {
+    sources
+        .iter()
+        .map(|(path, text)| (path.clone(), text.matches(needle).count()))
+        .filter(|(_, count)| *count > 0)
+        .collect()
+}
+
+#[test]
+fn the_app_subscribes_to_its_bus_in_one_place() {
+    let sources = library_sources();
+    let subscribing: Vec<PathBuf> = calls_of(&sources, ".subscribe(")
+        .into_iter()
+        .map(|(path, _)| path)
+        .collect();
     assert_eq!(
         subscribing,
         vec![
@@ -384,13 +327,47 @@ fn the_app_subscribes_to_its_bus_in_one_place() {
         ],
         "a subscriber outside bus_subscribers.rs is one the store test does not hang"
     );
-    let lib = std::fs::read_to_string(src.join("lib.rs")).expect("read lib.rs");
     assert_eq!(
-        lib.matches("bus_subscribers::attach_bus_subscribers(")
-            .count(),
-        1
+        calls_of(&sources, "bus_subscribers::attach_bus_subscribers("),
+        vec![(PathBuf::from("lib.rs"), 1)]
     );
-    assert!(!lib.contains("attach_bridge"));
+    assert_eq!(
+        calls_of(&sources, "attach_bridge_behind_notes_index("),
+        vec![(PathBuf::from("bus_subscribers.rs"), 1)],
+        "a bridge attached outside attach_bus_subscribers is one the store test does not hang"
+    );
+    assert_eq!(
+        calls_of(&sources, "attach_bridge("),
+        vec![(PathBuf::from("events").join("bus_bridge.rs"), 1)],
+        "a bridge attached outside attach_bus_subscribers is one the store test does not hang"
+    );
+}
+
+/// A Rust listener runs on the thread that emits its event, which may hold the
+/// store; the one the app has listens for an event only the frontend sends.
+#[test]
+fn the_app_listens_to_itself_only_for_what_the_frontend_sends() {
+    let sources = library_sources();
+    let listening: Vec<(PathBuf, usize)> = [".listen(", ".listen_any(", ".once(", ".once_any("]
+        .into_iter()
+        .flat_map(|needle| calls_of(&sources, needle))
+        .collect();
+    assert_eq!(
+        listening,
+        vec![(PathBuf::from("lib.rs"), 1)],
+        "a listener the store test does not see"
+    );
+    assert_eq!(
+        calls_of(&sources, "\"frontend-ready\""),
+        vec![(PathBuf::from("lib.rs"), 1)],
+        "the Rust side sends the event its listener waits for"
+    );
+    let lib = &sources
+        .iter()
+        .find(|(path, _)| path == Path::new("lib.rs"))
+        .expect("lib.rs")
+        .1;
+    assert!(lib.contains(".listen(\"frontend-ready\","));
 }
 
 #[test]

@@ -200,6 +200,16 @@ impl RemovalHolds {
         self.lock().contains_key(note_id)
     }
 
+    /// How many callers are waiting on `note_id`'s answer right now.
+    pub fn waiting_on(&self, note_id: &str) -> usize {
+        self.lock().get(note_id).map_or(0, |hold| hold.waiting)
+    }
+
+    /// When a caller waiting on `note_id`'s answer gives up, while it is held.
+    pub fn answer_by(&self, note_id: &str) -> Option<Instant> {
+        self.lock().get(note_id).map(|hold| hold.answer_by)
+    }
+
     fn lock(&self) -> MutexGuard<'_, HashMap<String, Hold>> {
         self.held.lock().unwrap_or_else(|poisoned| {
             tracing::error!(
@@ -466,6 +476,27 @@ mod tests {
     }
 
     #[test]
+    fn a_caller_counts_as_waiting_from_the_wait_to_the_answer() {
+        let holds = RemovalHolds::new();
+        assert_eq!(holds.waiting_on("note-1"), 0);
+        holds.hold("note-1", Instant::now() + Duration::from_secs(30));
+        assert_eq!(holds.waiting_on("note-1"), 0);
+        let answer = std::thread::scope(|scope| {
+            let waiter = scope.spawn(|| holds.wait_for_answer("note-1"));
+            let deadline = Instant::now() + Duration::from_secs(15);
+            while holds.waiting_on("note-1") == 0 {
+                assert!(Instant::now() < deadline, "the waiter never waited");
+                std::thread::yield_now();
+            }
+            assert_eq!(holds.waiting_on("note-1"), 1);
+            holds.answer("note-1", HoldAnswer::Removed);
+            waiter.join().expect("the waiting thread")
+        });
+        assert_eq!(answer, Some(HoldAnswer::Removed));
+        assert_eq!(holds.waiting_on("note-1"), 0);
+    }
+
+    #[test]
     fn a_wait_gives_up_at_the_deadline_the_hold_was_taken_with() {
         // A watcher that stopped while holding a removal leaves the caller no
         // worse off than it was before holds existed.
@@ -476,6 +507,21 @@ mod tests {
         let waited = asked_at.elapsed();
         assert!(waited >= Duration::from_millis(50), "waited {waited:?}");
         assert!(waited < Duration::from_secs(5), "waited {waited:?}");
+    }
+
+    #[test]
+    fn a_hold_says_when_its_waiters_give_up() {
+        let holds = RemovalHolds::new();
+        assert_eq!(holds.answer_by("note-1"), None);
+        let now = Instant::now();
+        holds.hold("note-1", now + Duration::from_secs(30));
+        holds.hold("note-1", now + Duration::from_millis(50));
+        assert_eq!(
+            holds.answer_by("note-1"),
+            Some(now + Duration::from_secs(30))
+        );
+        holds.answer("note-1", HoldAnswer::Removed);
+        assert_eq!(holds.answer_by("note-1"), None);
     }
 
     #[test]

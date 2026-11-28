@@ -1,18 +1,27 @@
 import { describe, it, expect, vi, afterEach } from "vitest";
-import { readFileSync } from "node:fs";
-import { resolve } from "node:path";
 
-vi.mock("../../services/tauri", () => ({
+const h = vi.hoisted(() => ({
+  getRecoveredBuffers: vi.fn(),
+  showToast: vi.fn(),
+}));
+
+vi.mock(import("../../services/tauri"), async (importOriginal) => ({
+  ...(await importOriginal()),
   saveBufferContent: vi.fn().mockResolvedValue(null),
-  noteDiskState: vi.fn(async () => ({ state: "no_file" })),
+  noteDiskState: vi.fn(async () => ({ state: "no_file" as const })),
   restoreNoteFile: vi.fn().mockResolvedValue(null),
   saveNoteTo: vi.fn().mockResolvedValue("digest"),
   recordUnsavedNotes: vi.fn().mockResolvedValue(undefined),
   discardUnsavedText: vi.fn().mockResolvedValue(undefined),
+  getRecoveredBuffers: h.getRecoveredBuffers,
 }));
+
+vi.mock("../../stores/global/notifications", () => ({ showToast: h.showToast }));
 
 import { createEditorStore } from "../../stores/window/editor-store";
 import { applyRecoveredNotes } from "../../stores/window/recovered-notes";
+import { createBootPlan } from "../../stores/window/boot";
+import type { WindowState } from "../../stores/window/createWindowState";
 import type { RecoveredBuffer } from "../../services/tauri";
 
 let stores: ReturnType<typeof createEditorStore>[] = [];
@@ -26,7 +35,21 @@ function editor() {
 afterEach(() => {
   for (const store of stores) store.stopSaveListener();
   stores = [];
+  h.getRecoveredBuffers.mockReset();
+  h.showToast.mockReset();
 });
+
+function restoreAtLaunch(store: ReturnType<typeof createEditorStore>): Promise<void> {
+  const win = { editor: store, tabs: {} } as unknown as WindowState;
+  const plan = createBootPlan(win, {
+    prepareShell: () => [],
+    registerCommands: () => {},
+    installKeyboard: () => () => {},
+    runMenuAction: () => {},
+    afterReveal: [],
+  });
+  return plan.restoreRecovered();
+}
 
 const unmade = { name: "2026-10-13.txt", folder: "Jotra" };
 
@@ -90,10 +113,27 @@ describe("the notes the launch recovered", () => {
     expect(restored.map((note) => note.id)).toEqual(["restored"]);
   });
 
-  it("is what the window's launch hands the recovered notes to", () => {
-    const boot = readFileSync(resolve(process.cwd(), "src/stores/window/boot.ts"), "utf8");
+  it("is what the window's launch hands the recovered notes to", async () => {
+    const store = editor();
+    h.getRecoveredBuffers.mockResolvedValue([restoredNote, deletedNote, unmadeNote]);
 
-    expect(boot).toContain("const recovered = await api.getRecoveredBuffers().catch(() => []);");
-    expect(boot).toContain("const restored = applyRecoveredNotes(win.editor, recovered);");
+    await restoreAtLaunch(store);
+
+    expect(h.getRecoveredBuffers).toHaveBeenCalledTimes(1);
+    expect(store.isRemovedOnDisk("deleted")).toBe(true);
+    expect(store.isRemovedOnDisk("unmade")).toBe(true);
+    expect(store.unmadeFileOf("unmade")).toEqual(unmade);
+    expect(store.isRemovedOnDisk("restored")).toBe(false);
+    expect(h.showToast.mock.calls).toEqual([["Restored 1 file that could not be saved last time", "info", 6000]]);
+  });
+
+  it("launches with nothing restored when the recovered notes cannot be read", async () => {
+    const store = editor();
+    h.getRecoveredBuffers.mockRejectedValue(new Error("database is locked"));
+
+    await expect(restoreAtLaunch(store)).resolves.toBeUndefined();
+
+    expect(store.isRemovedOnDisk("deleted")).toBe(false);
+    expect(h.showToast).not.toHaveBeenCalled();
   });
 });

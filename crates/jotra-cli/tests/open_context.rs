@@ -183,9 +183,28 @@ fn sockets_of(pid: u32) -> Vec<String> {
         .collect()
 }
 
-#[cfg(not(any(target_os = "macos", target_os = "linux")))]
-fn sockets_of(_pid: u32) -> Vec<String> {
-    Vec::new()
+/// The TCP and UDP endpoints process `pid` holds, as `netstat -ano` lists them
+/// with their owner's process id last.
+#[cfg(windows)]
+fn sockets_of(pid: u32) -> Vec<String> {
+    let output = Command::new("netstat")
+        .arg("-ano")
+        .output()
+        .expect("netstat");
+    assert!(
+        output.status.success(),
+        "netstat answered {}",
+        output.status
+    );
+    let pid = pid.to_string();
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .filter(|line| {
+            let mut fields = line.split_whitespace();
+            matches!(fields.next(), Some("TCP" | "UDP")) && fields.last() == Some(pid.as_str())
+        })
+        .map(str::to_string)
+        .collect()
 }
 
 #[test]

@@ -583,8 +583,8 @@ fn take_back_minted_file(state: &AppState, store: &BufferStore, id: &str, path: 
     }
 }
 
-/// [`write_note_source`]'s write, answering with what became of the text when
-/// it did not land.
+/// [`write_note_source_unannounced`]'s write, answering with what became of the
+/// text when it did not land.
 fn land_note_source(
     state: &AppState,
     id: &str,

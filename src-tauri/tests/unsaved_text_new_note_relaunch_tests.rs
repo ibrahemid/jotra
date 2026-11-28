@@ -11,24 +11,19 @@
 //! `JOTRA_NOTES_DIR` from the process environment and a second test in the same
 //! binary would race it.
 
-#![cfg(unix)]
+#[path = "support/locked_folder.rs"]
+mod locked_folder;
 
-use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 
 use jotra_core::buffer::document::{BufferDocument, BufferStatus};
 use jotra_tauri_lib::commands::buffer::save_buffer_content_inner;
 use jotra_tauri_lib::heartbeat;
 use jotra_tauri_lib::state::AppState;
+use locked_folder::LockedFolder;
 use tempfile::TempDir;
 
 const TYPED: &str = "the first words of a new note\n";
-
-/// Locks a folder against new files (`0o555`) or unlocks it (`0o755`).
-fn set_folder_mode(folder: &Path, mode: u32) {
-    std::fs::set_permissions(folder, std::fs::Permissions::from_mode(mode))
-        .expect("set the folder's mode");
-}
 
 /// What the journal holds for `id`, if anything.
 fn journaled(state: &AppState, id: &str) -> Option<String> {
@@ -82,16 +77,16 @@ fn a_new_note_whose_first_file_was_never_made_gets_one_at_a_later_launch() {
         .expect("store")
         .insert(&new_note())
         .expect("a new tab");
-    set_folder_mode(&notes_root, 0o555);
+    let locked = LockedFolder::new(&notes_root);
     let refused = save_buffer_content_inner(&session, "fresh", TYPED);
-    set_folder_mode(&notes_root, 0o755);
+    drop(locked);
     refused.expect_err("the notes folder took no new file");
     heartbeat::beat(&session);
     drop(session);
 
-    set_folder_mode(&notes_root, 0o555);
+    let locked = LockedFolder::new(&notes_root);
     let second = AppState::initialize();
-    set_folder_mode(&notes_root, 0o755);
+    drop(locked);
     let second = second.expect("the second launch");
     let handed = second
         .recovered_buffers

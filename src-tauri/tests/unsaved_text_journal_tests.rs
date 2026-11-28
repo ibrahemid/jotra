@@ -6,26 +6,23 @@
 //! that can be built on a test machine; the rest are proven on the
 //! classification they share (`recovery_tests` in jotra-storage).
 
+#[path = "support/app_state.rs"]
+mod app_state;
+#[path = "support/locked_folder.rs"]
+mod locked_folder;
+
+use app_state::AppStateBuilder;
+use locked_folder::LockedFolder;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::AtomicBool;
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, Mutex};
 
 use jotra_core::buffer::document::{BufferDocument, BufferStatus};
-use jotra_core::config::JotraConfig;
-use jotra_core::events::bus::{EventBus, JotraEvent};
+use jotra_core::events::bus::JotraEvent;
 use jotra_core::file_ops::{FileOpenMode, ERR_OPEN_TOO_LARGE, THRESHOLD_MAX_BYTES};
 use jotra_core::notes::reload::ChangeChoice;
-use jotra_core::preview::ContentRendererRegistry;
 use jotra_core::recovery::UnmadeFile;
-use jotra_core::update::UpdatePhase;
-use jotra_core::watcher::reconcile::ReconcileGate;
-use jotra_plugin::transform::TransformRegistry;
-use jotra_storage::buffer_store::BufferStore;
-use jotra_storage::config_store::ConfigStore;
 use jotra_storage::database::connection::open_database;
-use jotra_storage::database::migrations::run_migrations;
-use jotra_storage::layout_state::LayoutStateStore;
-use jotra_storage::notes_index::{self, NotesIndexStore};
+use jotra_storage::notes_index::{self};
 use jotra_tauri_lib::commands::buffer::{
     close_buffer_inner, delete_buffer_inner, discard_unsaved_text_inner, list_active_buffers_inner,
     read_buffer_content_inner, record_unsaved_notes_inner, resolve_external_change_inner,
@@ -37,90 +34,12 @@ use jotra_tauri_lib::commands::file::{
     accept_note_save_path, open_file_from_path, suggest_note_save_path,
 };
 use jotra_tauri_lib::commands::history::restore_buffer_inner;
-use jotra_tauri_lib::preview::handler::RenderCache;
-use jotra_tauri_lib::quit::QuitState;
-use jotra_tauri_lib::security::{
-    canonicalize_for_authorization, resolve_for_containment, AuthorizedPaths,
-};
+use jotra_tauri_lib::security::{canonicalize_for_authorization, resolve_for_containment};
 use jotra_tauri_lib::state::{restore_unsaved_text, AppState};
-use jotra_tauri_lib::watcher::handler::create_ignore_set;
 use tempfile::TempDir;
 
 fn make_state(dir: &TempDir) -> AppState {
-    let jotra_dir = dir.path().to_path_buf();
-    let buffers_dir = jotra_dir.join("buffers");
-    std::fs::create_dir_all(&buffers_dir).expect("buffers dir");
-
-    let notes_root = jotra_dir.join("Jotra");
-    std::fs::create_dir_all(&notes_root).expect("notes folder");
-    let notes_root = jotra_tauri_lib::security::canonicalize_root(&notes_root).expect("canonical");
-
-    let db_path = jotra_dir.join("jotra.db");
-    let conn = open_database(&db_path).expect("open db");
-    run_migrations(&conn).expect("migrations");
-
-    let note_history = Arc::new(
-        jotra_storage::note_history::NoteHistoryStore::open(&jotra_dir).expect("version store"),
-    );
-
-    AppState {
-        store: Mutex::new(BufferStore::new(conn, buffers_dir.clone())),
-        config_store: ConfigStore::new(jotra_dir.join("config.toml")),
-        config: Mutex::new(JotraConfig::default()),
-        jotra_dir,
-        buffers_dir,
-        notes_root: RwLock::new(notes_root),
-        first_run: false,
-        first_run_finished: std::sync::atomic::AtomicBool::new(false),
-        menu_apps: std::sync::Mutex::new(None),
-        retitle_watch: std::sync::Arc::new(jotra_tauri_lib::first_run::RetitleWatch::new()),
-        notes_root_fallback: RwLock::new(None),
-        watcher_ignore: create_ignore_set(),
-        watcher: Mutex::new(None),
-        notes_watcher: Mutex::new(None),
-        open_file_watcher: Mutex::new(None),
-        file_tracking: Mutex::new(None),
-        notes_index: Arc::new(NotesIndexStore::open(&db_path).expect("notes index db")),
-        note_history,
-        notes_index_cancel: Arc::new(AtomicBool::new(false)),
-        notes_reconcile: Arc::new(ReconcileGate::new()),
-        quit: Arc::new(QuitState::new()),
-        removal_holds: Default::default(),
-        pending_opens: Mutex::new(Vec::new()),
-        pending_lines: Mutex::new(Default::default()),
-        cli_waits: Mutex::new(Default::default()),
-        frontend_ready: AtomicBool::new(false),
-        window_revealed: AtomicBool::new(false),
-        window_dismissed: AtomicBool::new(false),
-        transforms: RwLock::new(TransformRegistry::new()),
-        event_bus: Arc::new(EventBus::new()),
-        update_phase: Mutex::new(UpdatePhase::default()),
-        authorized_paths: AuthorizedPaths::new(),
-        preview_registry: Arc::new(RwLock::new(ContentRendererRegistry::new())),
-        preview_render_cache: Arc::new(RenderCache::new()),
-        layout_state: LayoutStateStore::new(open_database(&db_path).expect("layout db")),
-        tab_rows: jotra_storage::tab_rows::TabRowStore::new(
-            open_database(&db_path).expect("tab rows db"),
-        ),
-        command_usage: jotra_storage::command_usage::CommandUsageStore::new(
-            open_database(&db_path).expect("usage db"),
-        ),
-        config_diagnostics: std::sync::Mutex::new(Vec::new()),
-        recovered_buffers: Mutex::new(Vec::new()),
-        was_dirty_shutdown: false,
-        workspace_root: Mutex::new(None),
-        workspace_watcher: Mutex::new(None),
-        inbox_root: Mutex::new(None),
-        inbox_watcher: Mutex::new(None),
-        fts_scheduler: jotra_tauri_lib::fts_scheduler::FtsScheduler::new(),
-        workspace_index: Arc::new(RwLock::new(
-            jotra_tauri_lib::workspace_index::WorkspaceIndex::new(None),
-        )),
-        search_generation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
-        last_disk_hash: Mutex::new(std::collections::HashMap::new()),
-        source_records: Mutex::new(std::collections::HashMap::new()),
-        buffer_writes: Default::default(),
-    }
+    AppStateBuilder::new(dir.path()).build()
 }
 
 /// Opens `path` holding `content` through the command layer, the way the
@@ -171,6 +90,15 @@ fn dated_copies(dir: &Path, label: &str) -> Vec<PathBuf> {
     found
 }
 
+/// Runs another program's delete of something just written, waiting while
+/// Windows says a scanner still has it open.
+fn delete_outside_jotra(delete: impl FnMut() -> std::io::Result<()>) {
+    jotra_storage::atomic::retry_while_in_use(delete, |attempt| {
+        std::thread::sleep(jotra_storage::atomic::persist_retry_delay(attempt))
+    })
+    .expect("deleted outside Jotra");
+}
+
 #[test]
 fn a_save_a_read_only_file_refuses_is_journaled_until_a_save_lands() {
     let dir = TempDir::new().unwrap();
@@ -201,7 +129,7 @@ fn a_save_into_a_folder_that_is_gone_is_journaled() {
     let (id, _) = open_note_at(&state, &volume.join("Remote.md"), "on disk\n");
 
     // What an unmounted volume looks like from here: the folder is not there.
-    std::fs::remove_dir_all(&volume).expect("unmount");
+    delete_outside_jotra(|| std::fs::remove_dir_all(&volume));
     save_buffer_content_inner(&state, &id, "typed while it was gone\n")
         .expect_err("there is nowhere to write");
     assert_eq!(
@@ -216,7 +144,7 @@ fn a_save_to_a_file_deleted_outside_jotra_is_journaled_until_it_is_put_back() {
     let state = make_state(&dir);
     let (id, path) = open_note_at(&state, &state.notes_root().join("Gone.md"), "on disk\n");
 
-    std::fs::remove_file(&path).expect("deleted outside Jotra");
+    delete_outside_jotra(|| std::fs::remove_file(&path));
     state.mark_removed_on_disk(&id);
     let refused = save_buffer_content_inner(&state, &id, "typed after it went\n")
         .expect_err("a deleted file is not recreated by a keystroke");
@@ -438,15 +366,6 @@ fn insert_new_note(state: &AppState, id: &str, title: &str) {
     state.store.lock().unwrap().insert(&doc).expect("insert");
 }
 
-/// Locks a folder against new files (`0o555`) or unlocks it (`0o755`).
-#[cfg(unix)]
-fn set_folder_mode(folder: &Path, mode: u32) {
-    use std::os::unix::fs::PermissionsExt;
-
-    std::fs::set_permissions(folder, std::fs::Permissions::from_mode(mode))
-        .expect("set the folder's mode");
-}
-
 /// The file a note titled `title` gets first in this state's notes folder,
 /// as the bar names it when the launch could not make it.
 fn unmade(state: &AppState, title: &str) -> UnmadeFile {
@@ -472,7 +391,6 @@ fn row_path(state: &AppState, id: &str) -> Option<String> {
         .source_path
 }
 
-#[cfg(unix)]
 #[test]
 fn a_new_note_whose_first_file_cannot_be_made_gets_one_at_the_next_launch() {
     let dir = TempDir::new().unwrap();
@@ -480,9 +398,9 @@ fn a_new_note_whose_first_file_cannot_be_made_gets_one_at_the_next_launch() {
     let notes = state.notes_root();
     insert_new_note(&state, "fresh", "Fresh");
 
-    set_folder_mode(&notes, 0o555);
+    let locked = LockedFolder::new(&notes);
     let refused = save_buffer_content_inner(&state, "fresh", "the first words");
-    set_folder_mode(&notes, 0o755);
+    drop(locked);
 
     refused.expect_err("the notes folder took no new file");
     assert_eq!(
@@ -514,7 +432,6 @@ fn a_new_note_whose_first_file_cannot_be_made_gets_one_at_the_next_launch() {
     assert_eq!(journaled(&state, "fresh"), None);
 }
 
-#[cfg(unix)]
 #[test]
 fn a_new_note_whose_first_file_cannot_be_made_gets_one_from_the_next_save() {
     let dir = TempDir::new().unwrap();
@@ -522,9 +439,9 @@ fn a_new_note_whose_first_file_cannot_be_made_gets_one_from_the_next_save() {
     let notes = state.notes_root();
     insert_new_note(&state, "fresh", "Fresh");
 
-    set_folder_mode(&notes, 0o555);
+    let locked = LockedFolder::new(&notes);
     let refused = save_buffer_content_inner(&state, "fresh", "the first words");
-    set_folder_mode(&notes, 0o755);
+    drop(locked);
 
     refused.expect_err("the notes folder took no new file");
     assert_eq!(
@@ -540,7 +457,42 @@ fn a_new_note_whose_first_file_cannot_be_made_gets_one_from_the_next_save() {
     assert_eq!(journaled(&state, "fresh"), None);
 }
 
-#[cfg(unix)]
+#[test]
+fn a_new_notes_first_save_the_write_gate_refuses_gives_back_the_path_it_minted() {
+    let dir = TempDir::new().unwrap();
+    let state = make_state(&dir);
+    let notes = state.notes_root();
+    insert_new_note(&state, "fresh", "Fresh");
+    // A spelling of the folder the gate's containment check does not match.
+    state.set_notes_root(
+        notes
+            .join("..")
+            .join(notes.file_name().expect("the notes folder has a name")),
+    );
+
+    let refused = save_buffer_content_inner(&state, "fresh", "the first words")
+        .expect_err("the write gate refused the minted path");
+
+    assert!(
+        refused.contains("Jotra cannot open that file from here"),
+        "{refused}"
+    );
+    assert_eq!(
+        journaled(&state, "fresh").as_deref(),
+        Some("the first words")
+    );
+    assert_eq!(
+        row_path(&state, "fresh"),
+        None,
+        "the note names a file the gate kept it from making"
+    );
+    assert_eq!(
+        std::fs::read_dir(&notes).expect("read_dir").count(),
+        0,
+        "the refused save made no file"
+    );
+}
+
 #[test]
 fn a_new_note_whose_text_cannot_be_journaled_keeps_the_path_its_save_minted() {
     let dir = TempDir::new().unwrap();
@@ -552,9 +504,9 @@ fn a_new_note_whose_text_cannot_be_journaled_keeps_the_path_its_save_minted() {
         .execute("DROP TABLE unsaved_text", [])
         .expect("the journal can take nothing");
 
-    set_folder_mode(&notes, 0o555);
+    let locked = LockedFolder::new(&notes);
     let refused = save_buffer_content_inner(&state, "fresh", "the first words");
-    set_folder_mode(&notes, 0o755);
+    drop(locked);
 
     refused.expect_err("the notes folder took no new file");
     assert!(
@@ -563,7 +515,6 @@ fn a_new_note_whose_text_cannot_be_journaled_keeps_the_path_its_save_minted() {
     );
 }
 
-#[cfg(unix)]
 #[test]
 fn a_launch_that_cannot_make_a_new_notes_first_file_hands_the_text_to_its_tab() {
     let dir = TempDir::new().unwrap();
@@ -577,12 +528,12 @@ fn a_launch_that_cannot_make_a_new_notes_first_file_hands_the_text_to_its_tab() 
         .record_unsaved_text("fresh", "the first words", chrono::Utc::now())
         .expect("journal");
 
-    set_folder_mode(&notes, 0o555);
+    let locked = LockedFolder::new(&notes);
     let restored = {
         let store = state.store.lock().expect("store");
         restore_unsaved_text(&store, &notes, state.default_extension())
     };
-    set_folder_mode(&notes, 0o755);
+    drop(locked);
 
     let handed = restored
         .recovered
@@ -612,7 +563,6 @@ fn a_launch_that_cannot_make_a_new_notes_first_file_hands_the_text_to_its_tab() 
     assert_eq!(journaled(&state, "fresh"), None);
 }
 
-#[cfg(unix)]
 #[test]
 fn a_new_note_a_launch_could_not_give_a_file_gets_one_at_the_next() {
     let dir = TempDir::new().unwrap();
@@ -626,12 +576,12 @@ fn a_new_note_a_launch_could_not_give_a_file_gets_one_at_the_next() {
         .record_unsaved_text("fresh", "the first words", chrono::Utc::now())
         .expect("journal");
 
-    set_folder_mode(&notes, 0o555);
+    let locked = LockedFolder::new(&notes);
     let first = {
         let store = state.store.lock().expect("store");
         restore_unsaved_text(&store, &notes, state.default_extension())
     };
-    set_folder_mode(&notes, 0o755);
+    drop(locked);
 
     assert!(
         first
@@ -799,11 +749,8 @@ fn the_restore_logs_and_keeps_an_entry_it_cannot_decode() {
     );
 }
 
-#[cfg(unix)]
 #[test]
 fn a_restore_that_cannot_write_keeps_the_entry_and_is_not_counted() {
-    use std::os::unix::fs::PermissionsExt;
-
     let dir = TempDir::new().unwrap();
     let state = make_state(&dir);
     let notes = state.notes_root();
@@ -819,14 +766,12 @@ fn a_restore_that_cannot_write_keeps_the_entry_and_is_not_counted() {
 
     // The file holds other text, so the restore writes beside it, and the
     // folder takes no new file.
-    std::fs::set_permissions(&folder, std::fs::Permissions::from_mode(0o555))
-        .expect("lock the folder");
+    let locked = LockedFolder::new(&folder);
     let restored = {
         let store = state.store.lock().expect("store");
         restore_unsaved_text(&store, &notes, state.default_extension())
     };
-    std::fs::set_permissions(&folder, std::fs::Permissions::from_mode(0o755))
-        .expect("unlock the folder");
+    drop(locked);
 
     assert!(
         restored.recovered.is_empty(),
@@ -982,7 +927,6 @@ fn a_refused_save_after_a_reopen_keeps_the_text_an_earlier_tab_handed_over() {
 
 /// A launch that could not write a note's text leaves the note's tab showing
 /// its file, so none of that tab's saves carries the text either.
-#[cfg(unix)]
 #[test]
 fn text_a_launch_could_not_write_survives_a_save_of_its_note() {
     let dir = TempDir::new().unwrap();
@@ -996,9 +940,9 @@ fn text_a_launch_could_not_write_survives_a_save_of_its_note() {
 
     // The file holds other text, so the launch writes beside it, and the
     // folder takes no new file.
-    set_folder_mode(&folder, 0o555);
+    let locked = LockedFolder::new(&folder);
     let first = relaunch(&state);
-    set_folder_mode(&folder, 0o755);
+    drop(locked);
     assert!(first.recovered.is_empty(), "nothing was restored");
 
     save_buffer_content_inner(&state, &id, "on disk\ntyped after the launch\n")
@@ -1027,7 +971,7 @@ fn text_kept_for_a_deleted_file_survives_its_return_a_reopen_and_a_save() {
     let notes = state.notes_root();
     let (id, path) = open_note_at(&state, &notes.join("Gone.md"), "on disk\n");
 
-    std::fs::remove_file(&path).expect("deleted outside Jotra");
+    delete_outside_jotra(|| std::fs::remove_file(&path));
     state.mark_removed_on_disk(&id);
     save_buffer_content_inner(&state, &id, "typed after it went\n")
         .expect_err("a deleted file is not recreated by a keystroke");
@@ -1105,7 +1049,7 @@ fn a_note_whose_file_is_gone_gets_its_newest_text_and_keeps_the_older() {
     let notes = state.notes_root();
     let (id, path) = open_note_at(&state, &notes.join("Gone.md"), "on disk\n");
 
-    std::fs::remove_file(&path).expect("deleted outside Jotra");
+    delete_outside_jotra(|| std::fs::remove_file(&path));
     state.mark_removed_on_disk(&id);
     save_buffer_content_inner(&state, &id, "typed before the close\n")
         .expect_err("a deleted file is not recreated by a keystroke");
@@ -1705,7 +1649,7 @@ fn removed_text_whose_file_outside_the_notes_folder_is_gone_goes_to_the_notes_fo
     close_tab_handing_over(&state, &id, "typed away\n");
     set_read_only(&path, false);
     delete_buffer_inner(&state, &id).expect("remove the note from history");
-    std::fs::remove_file(&path).expect("the file goes");
+    delete_outside_jotra(|| std::fs::remove_file(&path));
 
     let restored = relaunch(&state);
     assert!(
