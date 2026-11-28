@@ -222,12 +222,19 @@ The index inside `~/.writ` is always `writ.db`, and the index inside `~/.jotra` 
 **Per-user steps.** These are gated by the record and run on the first launch from `Jotra.app` for each user:
 - **Login item.** When `~/Library/LaunchAgents/Writ.plist` exists, remove it. When `general.launch_at_login` is true, register `Jotra.plist` through the login item service.
 - **Command links.** Re-point `/usr/local/bin/writ` at `Jotra.app/Contents/MacOS/writ` when it carries the signature, and add `/usr/local/bin/jotra`. Both happen only when the folder is writable without a prompt; otherwise Settings offers the install action.
+- **Dock.** Runs after the other steps, when `Jotra.app` is a real folder and `Writ.app` beside it is absent or the link. A pure function `plan_dock_tiles` in `jotra-core` decides; `src-tauri` reads and writes only `persistent-apps` and `recent-apps` of this user's `com.apple.dock` domain through CFPreferences, never the whole domain.
+  - Each pinned tile whose URL leads to `Writ.app` gets the file URL of `Jotra.app` and the label `Jotra`, and loses its `GUID` and its bookmark (`book`). It keeps its position, `bundle-identifier` and every other key. A second pin of the app is dropped.
+  - In `recent-apps`, tiles of `Writ.app` are dropped, and the `Jotra.app` tile is dropped once the app is pinned.
+  - Each key written holds exactly its tiles less the ones the plan drops; otherwise nothing is written and the step fails. The step logs the pinned and recent tile counts before and after.
+  - Launchpad: through macOS 15 the Dock keeps it in the SQLite file `com.apple.dock.launchpad/db/db` under this user's `_CS_DARWIN_USER_DIR`, and its row for the app keeps the old title because its bookmark resolves to the link. After the tiles, `jotra-storage` opens that file read-write without creating it and, in one immediate transaction with a one-second busy timeout, sets `title` to `Jotra` and `bookmark` to the bookmark data of `Jotra.app` in the `apps` row whose `bundleid` is `com.writ.editor` and whose `title` is `Writ`. The schema is private, so that one statement is also the shape check: a file it does not prepare against is left alone. The update is best effort: a missing file, an unknown shape, a busy file, an error or no bookmark is logged and never fails the step. macOS 26 has no Launchpad and no such file, so there is nothing to change.
+  - When the tiles or the Launchpad row changed, `killall Dock` runs once. The Dock reads its settings only when it starts and resolves a tile by its bookmark and `GUID` before its URL. The link, a later launch, a restart without the rewrite and `com.apple.dock.prefchanged` all leave the pin on the old tile and the running app on a second tile, so no route avoids the restart.
 - **Third-party client configs** are not edited.
 
 **Failure behaviour.**
 - Every step logs the operation name and its error.
 - No step blocks launch.
 - A failed rename leaves a working app at the old path.
+- The Dock step writes nothing when either key is managed, is not a list, or does not convert back unchanged, and restarts the Dock once when a tile write saved or the Launchpad row changed. A Dock with nothing to change records the step as done with no write and no restart. A failed tile read or write leaves the Launchpad row alone. A failed read, write or restart is recorded as failed, and a later version runs the step again.
 
 **Rejected alternatives**
 - A post-update hook in 1.0.1: that build is shipped.
@@ -238,6 +245,7 @@ The index inside `~/.writ` is always `writ.db`, and the index inside `~/.jotra` 
 **Test**
 - Unit tests of `plan_bundle_rename` cover each row and each guard.
 - An executor test over a temporary folder with fake bundles checks the rename, the link, the hidden flag and the sibling removal through a trash trait.
+- Unit tests of `plan_dock_tiles` cover each spelling of a tile's location and each rule. Executor tests over a fake Dock host check that a Dock with nothing to change is neither written nor restarted, that the write and then the Launchpad update come before the single restart, that a changed Launchpad row alone restarts the Dock, that no Launchpad outcome fails the step, that a plan whose tile count does not add up writes nothing, and that a failed write or restart fails the step. Storage tests over a temporary WAL database shaped like the `apps` table check which rows change, and that a missing file, a missing table or column and a file another connection holds are results, not errors. A conversion test checks that a Dock list with data, date and nested values comes back unchanged apart from the edited tile.
 - Real-Mac tests are listed in decision 16.
 
 ### 9. macOS packages
@@ -343,6 +351,7 @@ The index inside `~/.writ` is always `writ.db`, and the index inside `~/.jotra` 
 - the bundle rename, done or declined with a version;
 - the macOS login item;
 - the command links;
+- the macOS Dock tiles;
 - the Linux autostart entry;
 - the Windows Run value.
 
@@ -486,10 +495,10 @@ Each step runs once and is idempotent. It logs failures with the step name and n
 **Mac**
 
 Each Mac test runs from a 1.0.1 install, on macOS 12, 15 and 27.
-- **mac-1.** In-app update in `/Applications`, admin-owned and user-owned. Expect the rename, the hidden link, the relaunch, one Dock icon and one instance.
+- **mac-1.** In-app update in `/Applications`, admin-owned and user-owned. Expect the rename, the hidden link, the relaunch, one Dock restart from the Dock step, one Dock icon and one instance.
 - **mac-2.** mac-1 with App Management restrictions on macOS 15 and 27.
 - **mac-3.**
-  - A Dock pin.
+  - A Dock pin made on `Writ.app`: after the Dock step it reads Jotra in its old position, opens the app with no second tile, and no `Writ.app` tile is left among the recent apps.
   - Spotlight and Launchpad, with no entry for the link.
   - Finder "Open With" for `.md` and `.rs`.
 - **mac-4.** TCC grants, and a read of a stored API key without a keychain prompt.
@@ -536,7 +545,7 @@ After the repository rename, a 1.0.1 install on each channel is offered the rele
 | Single-instance id | from identifier | kept | none | none | mac-1 |
 | Updater key, manifest, platform keys | minisign key, `latest.json` | kept | baked into 1.0.1 | none | updater test |
 | Updater endpoint | slug `ibrahemid/writ` | slug `ibrahemid/jotra` | URL in 1.0.1 | GitHub redirect; no new `writ` repository | updater test |
-| macOS bundle folder | `Writ.app` | `Jotra.app` | absolute paths, Dock pins | self-rename, hidden link (8) | plan tests, mac-1 to mac-3, mac-6 |
+| macOS bundle folder | `Writ.app` | `Jotra.app` | absolute paths, Dock pins | self-rename, hidden link, Dock step (8) | plan tests, mac-1 to mac-3, mac-6 |
 | Main binary | `writ-tauri` | `jotra-tauri` | Windows pins, Run value, ProgId commands; deb relaunch path; autostart `Exec`; pkg process match | `writ-tauri.exe` launcher; `/usr/bin/writ-tauri` link; pkg matches both | launcher test, deb check, Windows VM |
 | Command | `writ`, `writ.exe` | `jotra`, with `writ` kept | scripts, hooks, MCP command paths, PATH, links | ships under both names (7) | dialect tests, release asset check |
 | CLI link signature | `com.writ.editor/writ-command` | kept | links and copies made by 1.0.1 | none | `cli_install` tests |

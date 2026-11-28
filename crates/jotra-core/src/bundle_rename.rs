@@ -10,6 +10,7 @@ use std::cmp::Ordering;
 use std::ffi::{OsStr, OsString};
 use std::path::{Component, Path, PathBuf};
 
+use percent_encoding::{percent_encode, AsciiSet, CONTROLS};
 use semver::Version;
 
 use crate::cli_install::{is_translocated, may_replace, InstalledEntry};
@@ -597,5 +598,230 @@ pub fn plan_command_links(facts: &CommandLinkFacts) -> CommandLinkPlan {
     }
     CommandLinkPlan::Relink {
         add_current: may_replace(&facts.current),
+    }
+}
+
+/// The label of a Dock tile pointed at the bundle under the new name.
+pub const DOCK_TILE_LABEL: &str = "Jotra";
+
+/// The `_CFURLStringType` of a Dock tile location written as a URL.
+pub const DOCK_URL_STRING: i64 = 15;
+
+/// The `_CFURLStringType` of a Dock tile location written as a POSIX path.
+pub const DOCK_PATH_STRING: i64 = 0;
+
+/// The ASCII a file URL's path percent-encodes, as Core Foundation writes
+/// one. Every byte outside ASCII is encoded as well.
+const FILE_URL_PATH: &AsciiSet = &CONTROLS
+    .add(b' ')
+    .add(b'"')
+    .add(b'#')
+    .add(b'%')
+    .add(b';')
+    .add(b'<')
+    .add(b'>')
+    .add(b'?')
+    .add(b'[')
+    .add(b'\\')
+    .add(b']')
+    .add(b'^')
+    .add(b'`')
+    .add(b'{')
+    .add(b'|')
+    .add(b'}');
+
+const FILE_URL_SCHEME: &str = "file://";
+
+const LOCAL_HOST: &str = "localhost";
+
+/// Where one Dock app tile leads, as the Dock's preferences hold it.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct DockTile {
+    /// The tile's `tile-data.file-data._CFURLString`, when it is a string.
+    pub location: Option<String>,
+    /// The tile's `tile-data.file-data._CFURLStringType`, when it is an
+    /// integer: [`DOCK_URL_STRING`] or [`DOCK_PATH_STRING`].
+    pub location_type: Option<i64>,
+}
+
+/// The Dock's app tiles and the two bundle paths the Dock step works between.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DockFacts {
+    /// The pinned app tiles, in the Dock's order.
+    pub pinned: Vec<DockTile>,
+    /// The recent app tiles, in the Dock's order.
+    pub recent: Vec<DockTile>,
+    /// The bundle's path under the old name.
+    pub legacy_bundle: PathBuf,
+    /// The running bundle, under the new name.
+    pub bundle: PathBuf,
+}
+
+/// What the Dock step does with one tile.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DockTileAction {
+    /// Leave the tile as it is.
+    Keep,
+    /// Point the tile at the bundle under the new name, under
+    /// [`DOCK_TILE_LABEL`].
+    Retarget,
+    /// Remove the tile.
+    Drop,
+}
+
+/// What the Dock step does with each tile, in the order [`DockFacts`] lists
+/// them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DockPlan {
+    /// One action per pinned tile.
+    pub pinned: Vec<DockTileAction>,
+    /// One action per recent tile.
+    pub recent: Vec<DockTileAction>,
+    /// The file URL a retargeted tile leads to.
+    pub bundle_url: String,
+}
+
+impl DockPlan {
+    /// Whether any pinned tile changes.
+    pub fn changes_pinned(&self) -> bool {
+        self.pinned
+            .iter()
+            .any(|action| *action != DockTileAction::Keep)
+    }
+
+    /// Whether any recent tile changes.
+    pub fn changes_recent(&self) -> bool {
+        self.recent
+            .iter()
+            .any(|action| *action != DockTileAction::Keep)
+    }
+
+    /// Whether the Dock's tiles change at all.
+    pub fn changes_anything(&self) -> bool {
+        self.changes_pinned() || self.changes_recent()
+    }
+}
+
+/// The file URL of `bundle` as the Dock writes it for a folder: percent-encoded
+/// the way Core Foundation encodes a path, with a trailing slash.
+pub fn bundle_file_url(bundle: &Path) -> String {
+    let path = bundle.as_os_str().as_encoded_bytes();
+    let mut url = format!("{FILE_URL_SCHEME}{}", percent_encode(path, FILE_URL_PATH));
+    if !url.ends_with('/') {
+        url.push('/');
+    }
+    url
+}
+
+/// The Dock step's plan for the tiles in `facts`.
+///
+/// A tile counts as a bundle's only when its location names that exact path:
+/// a `file` URL on this host or a POSIX path, a trailing slash aside. A tile
+/// without a readable location, another app's tile and a bundle under the old
+/// name in any other folder are kept.
+///
+/// The first pinned tile of the bundle under the old name is retargeted,
+/// unless the bundle under the new name is already pinned; every other pinned
+/// tile of the old bundle is dropped, so one pin remains. Recent tiles of the
+/// old bundle are dropped, and so are recent tiles of the new one once it is
+/// pinned.
+pub fn plan_dock_tiles(facts: &DockFacts) -> DockPlan {
+    let distinct = trim_trailing_slash(facts.legacy_bundle.as_os_str().as_encoded_bytes())
+        != trim_trailing_slash(facts.bundle.as_os_str().as_encoded_bytes());
+    let is_legacy = |tile: &DockTile| distinct && tile_leads_to(tile, &facts.legacy_bundle);
+    let is_current = |tile: &DockTile| tile_leads_to(tile, &facts.bundle);
+
+    let mut current_pinned = facts.pinned.iter().any(is_current);
+    let pinned = facts
+        .pinned
+        .iter()
+        .map(|tile| {
+            if !is_legacy(tile) {
+                DockTileAction::Keep
+            } else if current_pinned {
+                DockTileAction::Drop
+            } else {
+                current_pinned = true;
+                DockTileAction::Retarget
+            }
+        })
+        .collect();
+    let recent = facts
+        .recent
+        .iter()
+        .map(|tile| {
+            if is_legacy(tile) || (current_pinned && is_current(tile)) {
+                DockTileAction::Drop
+            } else {
+                DockTileAction::Keep
+            }
+        })
+        .collect();
+    DockPlan {
+        pinned,
+        recent,
+        bundle_url: bundle_file_url(&facts.bundle),
+    }
+}
+
+fn tile_leads_to(tile: &DockTile, path: &Path) -> bool {
+    tile_location_path(tile).is_some_and(|location| {
+        trim_trailing_slash(&location) == trim_trailing_slash(path.as_os_str().as_encoded_bytes())
+    })
+}
+
+/// The path bytes a tile's location names, or `None` when it names none this
+/// step reads.
+fn tile_location_path(tile: &DockTile) -> Option<Vec<u8>> {
+    let location = tile.location.as_deref()?;
+    match tile.location_type? {
+        DOCK_URL_STRING => file_url_path(location),
+        DOCK_PATH_STRING => Some(location.as_bytes().to_vec()),
+        _ => None,
+    }
+}
+
+/// The decoded path of a `file` URL with no host or `localhost`, or `None`
+/// for any other URL or one with a malformed percent escape.
+fn file_url_path(url: &str) -> Option<Vec<u8>> {
+    let rest = strip_prefix_ignoring_case(url, FILE_URL_SCHEME)?;
+    let rest = strip_prefix_ignoring_case(rest, LOCAL_HOST).unwrap_or(rest);
+    if !rest.starts_with('/') {
+        return None;
+    }
+    percent_decode_strict(rest.as_bytes())
+}
+
+fn strip_prefix_ignoring_case<'a>(text: &'a str, prefix: &str) -> Option<&'a str> {
+    let head = text.get(..prefix.len())?;
+    head.eq_ignore_ascii_case(prefix)
+        .then(|| &text[prefix.len()..])
+}
+
+fn percent_decode_strict(text: &[u8]) -> Option<Vec<u8>> {
+    let mut decoded = Vec::with_capacity(text.len());
+    let mut bytes = text.iter();
+    while let Some(&byte) = bytes.next() {
+        if byte == b'%' {
+            let high = hex_digit(*bytes.next()?)?;
+            let low = hex_digit(*bytes.next()?)?;
+            decoded.push(high << 4 | low);
+        } else {
+            decoded.push(byte);
+        }
+    }
+    Some(decoded)
+}
+
+fn hex_digit(byte: u8) -> Option<u8> {
+    char::from(byte)
+        .to_digit(16)
+        .and_then(|digit| u8::try_from(digit).ok())
+}
+
+fn trim_trailing_slash(path: &[u8]) -> &[u8] {
+    match path {
+        [rest @ .., b'/'] if !rest.is_empty() => rest,
+        _ => path,
     }
 }

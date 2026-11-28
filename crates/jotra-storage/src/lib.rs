@@ -24,6 +24,7 @@
 //! - [`maintenance`]: WAL checkpointing and freelist reclamation.
 //! - [`note_ops`]: creating, renaming, trashing and copying note files.
 //! - [`name_migration`]: the record of the rename's one-time steps.
+//! - [`launchpad`]: the Launchpad's row for the renamed app.
 //! - [`notes_migration`]: the one-time pass that turns every note into a
 //!   file.
 //! - [`recovery`]: session snapshots and dirty-shutdown detection.
@@ -75,6 +76,8 @@ pub mod image_store;
 pub mod inbox_store;
 /// The data-folder lock and the requests a second launch leaves.
 pub mod instance;
+/// The Launchpad's row for the renamed app (ADR-059).
+pub mod launchpad;
 /// Per-buffer preview layout persistence (ADR-009).
 pub mod layout_state;
 /// WAL checkpointing and freelist reclamation.
