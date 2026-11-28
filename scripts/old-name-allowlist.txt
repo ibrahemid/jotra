@@ -84,6 +84,7 @@ site/src/pages/docs/config.astro :text /<code>~\/\.writ<\/code>|\bran Writ\b/ --
 site/src/pages/docs/files.astro :text /<code>~\/Writ<\/code>|\bran Writ\b/ -- kept: notes folder of earlier installs
 site/src/pages/download.astro :text /<code>~\/\.(?:writ|local\/share\/writ|local\/bin\/writ)<\/code>|\bran Writ\b/ -- kept: data folder, install.sh folder and command of earlier installs
 site/src/pages/guides/agent-output.astro :text /<code>(?:writ|open_in_writ)<\/code>/ -- kept: MCP server name, command and tool
+site/src/lib/release-names.ts :text /--cask ibrahemid\/writ\/\$\{names\.cask\}/ -- kept: Homebrew tap name
 
 scripts/rename_product.py -- rename tooling spells the old name
 scripts/check_old_name.py -- rename tooling spells the old name

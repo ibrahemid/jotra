@@ -239,13 +239,23 @@ class ParseTests(unittest.TestCase):
             with self.subTest(version=version), tempfile.TemporaryDirectory() as folder:
                 root = pathlib.Path(folder)
                 env = make_host(root)
+                host_path = "/usr/bin:/bin:/usr/sbin:/sbin"
+                tools = ("sh", "awk", "sed", "tr", "cat", "cp", "rm", "mkdir", "chmod", "install", "mktemp", "head",
+                         "grep", "printf", "env", "sha256sum" if shutil.which("sha256sum", path=host_path) else "shasum")
+                for tool in tools:
+                    found = shutil.which(tool, path=host_path)
+                    self.assertIsNotNone(found, f"{tool} is not on {host_path}")
+                    (root / "tools" / tool).symlink_to(found)  # type: ignore[arg-type]
+                env["PATH"] = str(root / "tools")
                 uname = root / "tools/uname"
                 uname.write_text('#!/bin/sh\ncase "$1" in -m) echo x86_64 ;; *) echo Linux ;; esac\n')
                 uname.chmod(0o755)
-                (root / "fixtures").mkdir()
+                asset = asset_name("Jotra", version)
+                release = root / "fixtures" / f"v{version}"
+                release.mkdir(parents=True)
+                (release / "SHA256SUMS.txt").write_text(f"{'0' * 64}  {asset}\n")
                 env = {**env, "FAKE_TAG": f"v{version}", "JOTRA_INSTALL_SKIP_SIGNATURE": "1"}
                 result = run_bounded(["sh", str(DEFAULT_SCRIPT)], timeout=COMMAND_TIMEOUT, env=env)
-                asset = asset_name("Jotra", version)
                 self.assertIn(f"jotra install: downloading {asset} (v{version})", result.stdout)
                 self.assertNotEqual(result.returncode, 0, result.stdout)
                 self.assertIn(f"no fixture v{version}/{asset}", pathlib.Path(env["CURL_LOG"]).read_text().splitlines())

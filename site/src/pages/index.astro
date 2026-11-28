@@ -4,6 +4,7 @@ import LiveWindow from '../components/LiveWindow.astro';
 import Feature from '../components/Feature.astro';
 import DownloadRows from '../components/DownloadRows.astro';
 import release from '../data/release.json';
+import { getReleaseNames } from '../lib/release-names';
 import tokensCss from '../styles/tokens.css?raw';
 
 class MissingTokenError extends Error {
@@ -22,6 +23,7 @@ const detail = [`v${release.version}`, 'macOS 12+', 'Windows 10+', 'Linux']
   .filter(Boolean)
   .join(' · ');
 const p = release.platforms;
+const names = getReleaseNames(release);
 ---
 <Site
   title="The only text app you need"
@@ -68,7 +70,7 @@ const p = release.platforms;
       </div>
 
       <Feature id="any-file" loop="any-file" title="Any file" capture="text-file" alt="A plain text to-do list open in Jotra">
-        <p>A <code>.txt</code>, a log, a config or a Markdown file opens from your file manager or the <code>jotra</code> command and saves back to its own path.</p>
+        <p>A <code>.txt</code>, a log, a config or a Markdown file opens from your file manager or the <code>{names.command}</code> command and saves back to its own path.</p>
       </Feature>
 
       <Feature id="markdown" loop="markdown" anchor="bottom" title="Markdown, inline" capture="markdown-inline" alt="A Markdown file in Jotra with headings, checkboxes and a code block rendered in place" flip>

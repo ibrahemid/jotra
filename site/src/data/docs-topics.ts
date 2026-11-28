@@ -1,3 +1,8 @@
+import release from './release.json';
+import { getReleaseNames } from '../lib/release-names';
+
+const names = getReleaseNames(release);
+
 export interface DocsTopic {
   /** The anchor the topic had on the one-page /docs/; its row on the index keeps it. */
   id: string;
@@ -44,7 +49,7 @@ export const DOCS_TOPICS: readonly DocsTopic[] = [
   { id: 'search', slug: 'search', title: 'Search', description: 'Search Everywhere and its prefixes, the search field, and what search reads.' },
   { id: 'versions', slug: 'versions', title: 'Versions', description: 'The versions Jotra keeps of a file, and how Revert To puts one back.' },
   { id: 'default-app', slug: 'default-app', title: 'Default app', description: 'Making Jotra the app that opens a file type.' },
-  { id: 'cli', slug: 'cli', title: 'Command line and links', description: 'The jotra command and jotra:// links.' },
+  { id: 'cli', slug: 'cli', title: 'Command line and links', description: `The ${names.command} command and ${names.urlScheme}:// links.` },
   { id: 'inbox', slug: 'watched-folder', title: 'Watched folder', description: 'A folder whose new files open in Jotra as they arrive.' },
   { id: 'spelling', slug: 'spelling', title: 'Spelling', description: 'Spell check and your dictionary.' },
   { id: 'apps', slug: 'apps', title: 'Apps', description: 'Connections, Graph, Tags, Chat, Rewrite, Connected programs and Dictation, and the AI connection Chat and Rewrite share.' },

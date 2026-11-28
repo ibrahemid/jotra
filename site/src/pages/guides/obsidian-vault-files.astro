@@ -1,23 +1,26 @@
 ---
 import Prose from '../../layouts/Prose.astro';
 import Capture from '../../components/Capture.astro';
+import release from '../../data/release.json';
+import { getReleaseNames } from '../../lib/release-names';
 
 const base = import.meta.env.BASE_URL.replace(/\/$/, '');
+const names = getReleaseNames(release);
 ---
 <Prose title="Open your Obsidian folder in Jotra" description="Point Jotra at the folder Obsidian uses. Links, properties and tags read as written, nothing in it is copied or converted, and Obsidian keeps working from the same files." path="/guides/obsidian-vault-files/" lead="There is no import step. Jotra reads the folder where it is, and Obsidian keeps working from it.">
   <h2>1. Point Jotra at the folder</h2>
-  <p>Settings, General, Folder, Move…: choose the folder Obsidian uses. The files already in Jotra's folder move into it; if a name is in both, nothing moves. Jotra reads it once, then follows changes on disk. Nothing in it is copied, converted or rewritten. To try it without changing that setting, start Jotra with <code>JOTRA_NOTES_DIR</code> set to the folder instead.</p>
+  <p>Settings, General, Folder, Move…: choose the folder Obsidian uses. The files already in Jotra's folder move into it; if a name is in both, nothing moves. Jotra reads it once, then follows changes on disk. Nothing in it is copied, converted or rewritten. To try it without changing that setting, start Jotra with <code>{names.notesDirVariable}</code> set to the folder instead.</p>
   <Capture name="obsidian-folder" alt="A folder written in Obsidian open in Jotra: the tree in the sidebar and a Markdown file in Inline mode" />
   <h2>2. Switch on the apps you used</h2>
-  <p>Backlinks, the graph and the tag list are apps in Jotra, off until you switch them on in Settings, Apps: Connections for the files that link here, the outline and the properties; Graph for the map of the folder; Tags for the tag list in the sidebar.</p>
+  <p>Backlinks, the graph and the tag list are apps in Jotra, off in a new install until you switch them on, in the setup screen or in Settings, Apps: Connections for the files that link here, the outline and the properties; Graph for the map of the folder; Tags for the tag list in the sidebar.</p>
   <h2>3. What carries over</h2>
   <ul>
     <li>Folders, file names and the Markdown itself.</li>
-    <li><code>[[File]]</code>, <code>[[Folder/File]]</code>, <code>[[File|a label]]</code> and <code>[[File#Heading]]</code> all open the file. When two files share a name, both are offered; Jotra never picks one for you.</li>
+    <li><code>[[File]]</code>, <code>[[Folder/File]]</code>, <code>[[File|a label]]</code> and <code>[[File#Heading]]</code> all open the file. When two files share a name, the one in the fewest folders opens, then the one nearest the file the link is in; if they still tie, both are offered.</li>
     <li>Frontmatter <code>key: value</code> pairs are properties, listed in the Connections panel. A nested map is kept as written and shown as text.</li>
     <li><code>#tag</code> in the text, and <code>tags:</code> in the frontmatter as a list or one line. <code>#project/alpha</code> is one tag, listed under <code>project</code>. Tags fold to lowercase, so <code>#Project</code> and <code>#project</code> are one. A tag inside a code fence is left alone.</li>
     <li>Headings, lists, checkboxes, links, images and code blocks are formatted in Inline mode, with the markup shown on the line you are editing.</li>
-    <li>Tables, <code>$x^2$</code> math and Mermaid fences are drawn in Inline mode, with the source shown while the cursor is in them.</li>
+    <li>Tables, <code>$x^2$</code> math and Mermaid fences are drawn in Inline mode, with the source shown while the cursor is on them.</li>
   </ul>
   <h2>4. What stays as written</h2>
   <ul>

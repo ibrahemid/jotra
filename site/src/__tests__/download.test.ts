@@ -248,7 +248,7 @@ describe('the download groups', () => {
     }
   });
 
-  it('keep brew trust and brew install in one command', () => {
-    expect(COMPONENT).toContain("command: 'brew trust ibrahemid/writ && brew install --cask ibrahemid/writ/jotra'");
+  it('take the Homebrew command, brew trust and brew install in one, from the release', () => {
+    expect(COMPONENT).toContain('command: commands.brewInstall,');
   });
 });
