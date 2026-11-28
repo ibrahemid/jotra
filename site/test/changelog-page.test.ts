@@ -8,6 +8,7 @@ import { CHANGELOG_PLATFORM_LABELS } from '../src/lib/changelog-text';
 const ROOT = fileURLToPath(new URL('..', import.meta.url));
 const DIST = join(ROOT, 'dist');
 const PAGE = join(DIST, 'changelog', 'index.html');
+const CSS = readFileSync(join(ROOT, 'src', 'styles', 'site.css'), 'utf8');
 
 interface RenderedNote {
   tags: string[];
@@ -46,7 +47,7 @@ function readNotes(article: string): RenderedNote[] {
     tags: [...item.matchAll(/<span\b[^>]*\bclass="[^"]*\brel-tag\b[^"]*"[^>]*>([^<]*)<\/span>/g)].map(([, tag]) =>
       decodeEntities(tag.trim()),
     ),
-    text: decodeEntities(/<span(?:\s+data-astro-cid-[\w-]+)?>([\s\S]*?)<\/span>/.exec(item)?.[1] ?? ''),
+    text: decodeEntities(/<span\b[^>]*\bclass="[^"]*\brel-note\b[^"]*"[^>]*>([\s\S]*?)<\/span>/.exec(item)?.[1] ?? ''),
     figures: [...item.matchAll(/<figure\b[^>]*\bclass="[^"]*\bwindow\b[^"]*"[^>]*>([\s\S]*?)<\/figure>/g)].map(
       ([, figure]) => figure,
     ),
@@ -72,6 +73,15 @@ describe('/changelog/ as built', () => {
   beforeAll(() => {
     if (!existsSync(PAGE)) throw new Error('dist/changelog/index.html is missing; run `pnpm build` first');
     articles = readArticles(readFileSync(PAGE, 'utf8'));
+  });
+
+  it('sets each note text in span.rel-note, which breaks a token wider than the column', () => {
+    expect(CSS).toContain('.rel-note {\n  overflow-wrap: anywhere;\n}');
+    for (const [version, article] of articles) {
+      const items = [...article.matchAll(/<li\b[^>]*>([\s\S]*?)<\/li>/g)];
+      const noted = items.filter(([, item]) => /<span\b[^>]*\bclass="rel-note"/.test(item));
+      expect(noted.length, `v${version}`).toBe(items.length);
+    }
   });
 
   it('has one article per release, in release order, each with every note', () => {

@@ -1,11 +1,9 @@
 import { ChangeSet, Text } from "@codemirror/state";
 import type { BufferDocument, FileOpenResult } from "../../../src/types/buffer";
 import type { RenamePropagation, SkippedFile } from "../../../src/services/tauri";
-import { countUtf8Bytes } from "../history";
 import { classifySize, formatHexDump, onceOpen, sniffsBinary } from "../classify";
 import {
   EncodingLossyError,
-  EncodingUnwritableError,
   NotInEncodingError,
   UTF_8,
   decodeIn,
@@ -27,12 +25,7 @@ import {
 } from "../state";
 import { DemoFileError, HOME, NOTES_ROOT, basename, dirname, extension, stem } from "../vfs";
 import { encodingName } from "../../../src/lib/text-encoding";
-import {
-  ERR_READ_FAILED,
-  ERR_READ_FILE_MISSING,
-  ERR_READ_NOT_IN_ENCODING,
-  ERR_READ_NOT_UTF8,
-} from "../../../src/lib/read-failure";
+import { ERR_READ_FILE_MISSING, ERR_READ_NOT_IN_ENCODING, ERR_READ_NOT_UTF8 } from "../../../src/lib/read-failure";
 
 /** jotra_core::notes::TEXT_EXTENSIONS: what a typed name may switch a note to. */
 const TEXT_EXTENSIONS = ["md", "markdown", "txt", "text"];
@@ -60,6 +53,18 @@ const ERR_NOTE_READ_ONLY = "ERR_NOTE_READ_ONLY";
 /** commands::buffer::ERR_ENCODING_LOSSY. */
 const ERR_ENCODING_LOSSY = "ERR_ENCODING_LOSSY";
 
+/** commands::notes::ERR_NOT_A_NOTE. */
+export const ERR_NOT_A_NOTE = "ERR_NOT_A_NOTE";
+
+/** commands::notes::NOT_YOURS_TO_DELETE. */
+export const NOT_YOURS_TO_DELETE = "Only files in your folder can be moved to the Trash from here.";
+
+/** commands::notes::NOTHING_TO_PUT_BACK. */
+export const NOTHING_TO_PUT_BACK = "There is nothing to put back.";
+
+/** commands::notes::TRASH_UNDO_MAX_BYTES: the largest file a Move to Trash keeps for its Undo. */
+export const TRASH_UNDO_MAX_BYTES = 8 * 1024 * 1024;
+
 /** commands::buffer::read_failure_message for the reads a page can fail. Anything else is a fault, thrown on. */
 function describeReadRefusal(error: unknown): string {
   if (error instanceof NotInEncodingError) {
@@ -67,7 +72,6 @@ function describeReadRefusal(error: unknown): string {
     return `${code}: ${error.message}`;
   }
   if (error instanceof DemoFileError && error.kind === "missing") return `${ERR_READ_FILE_MISSING}: ${error.message}`;
-  if (error instanceof EncodingUnwritableError) return `${ERR_READ_FAILED}: ${error.message}`;
   throw error;
 }
 
@@ -114,7 +118,7 @@ export function createBufferCommands(state: DemoState): CommandTable {
   const readBufferContent = (doc: BufferDocument): Uint8Array => {
     if (!doc.source_path) return new Uint8Array(0);
     if (doc.read_only) {
-      const bytes = state.readBytes(doc.source_path);
+      const bytes = state.readFileBytes(doc.source_path);
       return sniffsBinary(bytes) ? new TextEncoder().encode(formatHexDump(bytes, bytes.length)) : bytes;
     }
     return new TextEncoder().encode(state.readTextIn(doc.source_path, doc.encoding ?? UTF_8));
@@ -142,7 +146,7 @@ export function createBufferCommands(state: DemoState): CommandTable {
   const reopenClosed = (id: unknown, confirmed: boolean): FileOpenResult => {
     const doc = state.getBuffer(id);
     const sizeBytes =
-      doc.source_path && folder.has(doc.source_path) ? state.readBytes(doc.source_path).length : doc.size_bytes;
+      doc.source_path && folder.has(doc.source_path) ? state.readFileBytes(doc.source_path).length : doc.size_bytes;
     const mode = classifySize(sizeBytes, doc.read_only);
     if (mode.kind === "Refused" || (mode.kind === "LargeFileConfirm" && !confirmed)) {
       return { doc: null, mode, size_bytes: sizeBytes };
@@ -228,6 +232,18 @@ export function createBufferCommands(state: DemoState): CommandTable {
   let heldUndo: { token: string; renamed: string; previousName: string; paths: string[] } | null = null;
   let undoSerial = 0;
 
+  /** AuthorizedPaths::hold_trash_undo: the one Move to Trash an undo may put back, by its token. */
+  let heldTrash: { token: string; path: string; content: string; encoding: string } | null = null;
+
+  /** commands::notes::new_note_in_folder_inner: whether `dir` is the notes folder or a folder inside it. */
+  const isNotesFolder = (dir: string): boolean => {
+    if (dir === NOTES_ROOT) return true;
+    if (!dir.startsWith(`${NOTES_ROOT}/`)) return false;
+    const segments = dir.slice(NOTES_ROOT.length + 1).split("/");
+    if (segments.some((segment) => segment === "" || segment === "." || segment === "..")) return false;
+    return folder.listPaths().some((path) => path.startsWith(`${dir}/`));
+  };
+
   const commands: CommandTable = {
     list_active_buffers: () =>
       [...buffers.values()]
@@ -256,16 +272,23 @@ export function createBufferCommands(state: DemoState): CommandTable {
       return { ...doc };
     },
     new_note: () => commands.create_buffer({}),
+    new_note_in_folder: (args): Answer<"newNoteInFolder"> | Promise<never> => {
+      const dir = String(args.folder).replace(/\/+$/, "");
+      if (!isNotesFolder(dir)) return refuse(ERR_NOT_A_NOTE);
+      const doc = createNoteIn(dir, formatMintedStem(new Date()), state.config.files.default_extension);
+      renameable.add(doc.id);
+      return doc;
+    },
     save_buffer_content: (args) => {
       const doc = state.getBuffer(args.id);
       const content = String(args.content);
       const encoding = doc.encoding ?? UTF_8;
-      let sizeBytes = countUtf8Bytes(content);
+      let sizeBytes: number;
       try {
         sizeBytes = encodeIn(content, encoding).length;
       } catch (error) {
         if (error instanceof EncodingLossyError) return refuse(`${ERR_ENCODING_LOSSY}: ${error.message}`);
-        if (!(error instanceof EncodingUnwritableError)) throw error;
+        throw error;
       }
       if (!doc.source_path) {
         if (!content) return null;
@@ -377,17 +400,32 @@ export function createBufferCommands(state: DemoState): CommandTable {
       state.emitNoteChanged(path);
       return path;
     },
-    delete_note: (args) => {
+    delete_note: (args): Answer<"deleteNote"> | Promise<never> => {
       const doc = state.getBuffer(args.id);
-      if (doc.source_path) {
-        if (!doc.source_path.startsWith(`${NOTES_ROOT}/`)) {
-          return refuse("Only files in your folder can be moved to the Trash from here.");
+      let token: string | null = null;
+      const path = doc.source_path;
+      if (path) {
+        if (!path.startsWith(`${NOTES_ROOT}/`)) return refuse(NOT_YOURS_TO_DELETE);
+        if (folder.has(path)) {
+          if (state.readFileBytes(path).length <= TRASH_UNDO_MAX_BYTES) {
+            token = `trash-${++undoSerial}`;
+            heldTrash = { token, path, content: folder.read(path), encoding: folder.encodingOf(path) };
+          }
+          folder.remove(path);
         }
-        if (folder.has(doc.source_path)) folder.remove(doc.source_path);
-        state.emitNoteChanged(doc.source_path, true);
+        state.emitNoteChanged(path, true);
       }
       buffers.delete(doc.id);
-      return null;
+      return token;
+    },
+    undo_delete_note: (args): Answer<"undoDeleteNote"> | Promise<never> => {
+      const held = heldTrash;
+      if (!held || held.token !== String(args.token)) return refuse(NOTHING_TO_PUT_BACK);
+      heldTrash = null;
+      if (folder.has(held.path)) return refuse(formatNameTaken(basename(held.path)));
+      folder.write(held.path, held.content, held.encoding);
+      state.emitNoteChanged(held.path);
+      return held.path;
     },
     open_third_party_notices: async (): Promise<Answer<"openThirdPartyNotices">> => {
       const path = `${HOME}/.jotra/generated/${NOTICES_TITLE}.md`;
@@ -398,6 +436,7 @@ export function createBufferCommands(state: DemoState): CommandTable {
     show_note_in_file_manager: () => null,
     show_notes_file_in_file_manager: () => null,
     show_notes_folder_in_finder: () => null,
+    show_workspace_entry_in_file_manager: () => null,
     rename_buffer: (args): Answer<"renameBuffer"> => {
       state.getBuffer(args.id).title = String(args.title);
     },
@@ -488,14 +527,12 @@ export function createBufferCommands(state: DemoState): CommandTable {
       try {
         text = state.readTextIn(doc.source_path, doc.encoding ?? UTF_8);
       } catch (error) {
-        if (error instanceof NotInEncodingError || error instanceof EncodingUnwritableError) {
-          return { state: "undescribed" };
-        }
+        if (error instanceof NotInEncodingError) return { state: "undescribed" };
         throw error;
       }
       return {
         state: "described",
-        disk: { hash: await digestText(text), size: state.readBytes(doc.source_path).length, mtime_ms: Date.now() },
+        disk: { hash: await digestText(text), size: state.readFileBytes(doc.source_path).length, mtime_ms: Date.now() },
       };
     },
   };

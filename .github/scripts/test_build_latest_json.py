@@ -159,6 +159,40 @@ class BuildLatestJsonTest(unittest.TestCase):
             )
         )
 
+    def test_signed_wrapped_installers_lose_to_the_bare_ones(self) -> None:
+        self.write_assets(*FULL_ASSET_SET)
+        self.write_assets(
+            "Jotra_0.3.0_x64-setup.nsis.zip",
+            f"{WINDOWS_MSI}.zip",
+            f"{LINUX_APPIMAGE}.tar.gz",
+        )
+
+        code, manifest, _ = self.run_script()
+
+        self.assertEqual(code, 0)
+        self.assertTrue(manifest["platforms"]["windows-x86_64"]["url"].endswith(WINDOWS_MSI))
+        self.assertTrue(manifest["platforms"]["linux-x86_64"]["url"].endswith(LINUX_APPIMAGE))
+
+    def test_a_wrapped_installer_alone_fails_the_manifest(self) -> None:
+        self.write_assets(MAC_BUNDLE, f"{WINDOWS_MSI}.zip", f"{LINUX_APPIMAGE}.tar.gz", LINUX_DEB)
+
+        code, manifest, stderr = self.run_script()
+
+        self.assertEqual(code, 1)
+        self.assertNotIn("windows-x86_64", manifest["platforms"])
+        self.assertNotIn("linux-x86_64", manifest["platforms"])
+        self.assertIn("windows-x86_64", stderr)
+
+    def test_the_manifest_fields_the_app_reads_are_unchanged(self) -> None:
+        self.write_assets(*FULL_ASSET_SET)
+
+        _, manifest, _ = self.run_script()
+
+        self.assertEqual(set(manifest), {"version", "notes", "pub_date", "platforms"})
+        for key, entry in manifest["platforms"].items():
+            with self.subTest(platform=key):
+                self.assertEqual(set(entry), {"signature", "url"})
+
     def test_missing_env_var_fails_before_writing_a_manifest(self) -> None:
         self.write_assets(*FULL_ASSET_SET)
 

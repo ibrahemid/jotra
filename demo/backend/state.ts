@@ -4,7 +4,7 @@ import { encodingName } from "../../src/lib/text-encoding";
 import type { IpcBridge } from "../ipc";
 import { classifyFile, classifySize, onceOpen, sniffsBinary } from "./classify";
 import { DEMO_CONFIG } from "./config";
-import { EncodingUnwritableError, UTF_8, decodeIn, encodeIn } from "./encoding";
+import { UTF_8, decodeIn, encodeIn } from "./encoding";
 import { NoteHistory, countUtf8Bytes, type WriteKind } from "./history";
 import { dedupeStem } from "./naming";
 import { NotesIndex } from "./notes-index";
@@ -133,16 +133,6 @@ export class DemoState {
     return encodeIn(this.folder.read(path), this.folder.encodingOf(path));
   }
 
-  /** The bytes a size and a binary sniff are taken from: text the page cannot encode is measured as UTF-8. */
-  readBytes(path: string): Uint8Array {
-    try {
-      return this.readFileBytes(path);
-    } catch (error) {
-      if (error instanceof EncodingUnwritableError) return new TextEncoder().encode(this.folder.read(path));
-      throw error;
-    }
-  }
-
   /** BufferStore::read_text: the file's text read in `encoding`. */
   readTextIn(path: string, encoding: string): string {
     if (encodingName(this.folder.encodingOf(path)) === encodingName(encoding)) return this.folder.read(path);
@@ -157,7 +147,7 @@ export class DemoState {
   openPath(path: string): FileOpenResult {
     const shown = this.findActiveBuffer(path);
     if (shown) return this.shownAnswer(shown);
-    const bytes = this.readBytes(path);
+    const bytes = this.readFileBytes(path);
     const mode = classifySize(bytes.length, sniffsBinary(bytes));
     if (mode.kind === "Refused" || mode.kind === "LargeFileConfirm") {
       return { doc: null, mode, size_bytes: bytes.length };
@@ -169,7 +159,7 @@ export class DemoState {
   openConfirmedPath(path: string): FileOpenResult {
     const shown = this.findActiveBuffer(path);
     if (shown) return this.shownAnswer(shown);
-    const bytes = this.readBytes(path);
+    const bytes = this.readFileBytes(path);
     const mode = classifySize(bytes.length, sniffsBinary(bytes));
     if (mode.kind === "Refused") return { doc: null, mode, size_bytes: bytes.length };
     return this.openClassified(path, onceOpen(mode), bytes.length);

@@ -4,8 +4,8 @@ import { join, resolve, extname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { runInNewContext } from 'node:vm';
 import { TEXT_NODE, parse } from 'ultrahtml';
-import { querySelectorAll } from 'ultrahtml/selector';
-import { DOCS_TOPICS, getDocsTopicHref } from '../src/data/docs-topics';
+import { querySelector, querySelectorAll } from 'ultrahtml/selector';
+import { DOCS_INDEX_TITLE, DOCS_TOPICS, getDocsTopicHref } from '../src/data/docs-topics';
 
 const ROOT = fileURLToPath(new URL('..', import.meta.url));
 const DIST = join(ROOT, 'dist');
@@ -70,15 +70,16 @@ function runForward(script: string, html: string, hash: string): ForwardRun {
       replaced.push(url);
     },
   };
+  const tree = parse(html);
   const document = {
     getElementById: (id: string) => {
-      const count = html.split(`id="${id}"`).length - 1;
-      if (count === 0) return null;
+      const element = querySelectorAll(tree, '[id]').find((node) => node.attributes.id === id);
+      if (element === undefined) return null;
       return {
+        tagName: String(element.name).toUpperCase(),
         querySelector: (selector: string) => {
-          if (selector !== 'a[data-topic]') return null;
-          const href = topicLinkIn(html, id);
-          return href === undefined ? null : { href: new URL(href, `${ORIGIN}/docs/`).href };
+          const link = querySelector(element, selector);
+          return link ? { href: new URL(link.attributes.href, `${ORIGIN}/docs/`).href } : null;
         },
       };
     },
@@ -119,14 +120,26 @@ describe('the docs index as built', () => {
     }
   });
 
-  it('stays on the index for no hash, an unknown one and one that does not decode', () => {
-    for (const hash of ['', '#', '#nothing-here', '#%E0%A4%A']) {
+  it('stays on the index for no hash, an unknown one, one that does not decode and the skip-link target', () => {
+    expect(html).toContain('<main id="content"');
+    for (const hash of ['', '#', '#nothing-here', '#%E0%A4%A', '#content']) {
       expect(runForward(forward, html, hash).replaced, hash).toEqual([]);
     }
   });
 });
 
 describe('the docs topic pages as built', () => {
+  it('link back to the docs index from inside the page, before the title', () => {
+    for (const topic of DOCS_TOPICS) {
+      if (topic.slug === null) continue;
+      const main = querySelector(parse(readFileSync(join(DIST, 'docs', topic.slug, 'index.html'), 'utf8')), 'main#content');
+      const up = querySelector(main, 'nav.up a[href="/docs/"]');
+      expect(up, topic.slug).toBeTruthy();
+      expect(up.children.map((child: { value?: string }) => child.value ?? '').join(''), topic.slug).toBe(DOCS_INDEX_TITLE);
+    }
+    expect(querySelector(parse(html), 'nav.up')).toBeFalsy();
+  });
+
   it('ships a page per topic, under its title', () => {
     for (const topic of DOCS_TOPICS) {
       if (topic.slug === null) continue;

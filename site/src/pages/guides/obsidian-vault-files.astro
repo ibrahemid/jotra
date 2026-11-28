@@ -4,7 +4,7 @@ import Capture from '../../components/Capture.astro';
 
 const base = import.meta.env.BASE_URL.replace(/\/$/, '');
 ---
-<Prose title="Open your Obsidian folder in Jotra" description="Point Jotra at the folder Obsidian uses. Links, properties and tags read as written, nothing is copied or converted, and Obsidian keeps working from the same files." path="/guides/obsidian-vault-files/" lead="There is no import step. Jotra reads the folder where it is, and Obsidian keeps working from it.">
+<Prose title="Open your Obsidian folder in Jotra" description="Point Jotra at the folder Obsidian uses. Links, properties and tags read as written, nothing in it is copied or converted, and Obsidian keeps working from the same files." path="/guides/obsidian-vault-files/" lead="There is no import step. Jotra reads the folder where it is, and Obsidian keeps working from it.">
   <h2>1. Point Jotra at the folder</h2>
   <p>Settings, General, Folder, Move…: choose the folder Obsidian uses. The files already in Jotra's folder move into it; if a name is in both, nothing moves. Jotra reads it once, then follows changes on disk. Nothing in it is copied, converted or rewritten. To try it without changing that setting, start Jotra with <code>JOTRA_NOTES_DIR</code> set to the folder instead.</p>
   <Capture name="obsidian-folder" alt="A folder written in Obsidian open in Jotra: the tree in the sidebar and a Markdown file in Inline mode" />

@@ -289,6 +289,29 @@ jobs:
       - name: Tauri build check
         run: cargo check --lib -p jotra-tauri --locked
 
+  # A matrix job skipped by its job-level `if` reports one unexpanded name, not
+  # one per leg, so on a doc-only change this reports each required name.
+  no-code:
+    needs: changes
+    if: needs.changes.outputs.code == 'false'
+    strategy:
+      matrix:
+        check:
+          - Linux
+          - macOS
+          - Windows
+          - Preview exfil probe (Linux)
+          - Preview exfil probe (macOS)
+          - Preview exfil probe (Windows)
+
+    name: ${{ matrix.check }}
+    runs-on: ubuntu-latest
+    permissions: {}
+
+    steps:
+      - name: No code changed
+        run: echo "only documentation changed; the build, test and probe legs did not run"
+
   # The preview exfil probe (ADR-043): the preview as it ships, in a real
   # webview, with every vector aimed at a local sink. Unlike the cross-OS unit
   # tests, this runs on every PR on all three engines (Windows regressions must
