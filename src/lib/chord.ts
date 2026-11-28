@@ -15,9 +15,9 @@ const ASCII_LETTER_OR_DIGIT = /^[A-Za-z0-9]$/;
 
 /**
  * The mark a punctuation key's position carries unshifted, by its code, for
- * a chord that holds Shift: Shift turns `\` into `|`, and the chord is still
- * written with the key, as `CmdOrCtrl+Shift+\` is. The same reading the
- * shifted digit gets.
+ * a chord that holds Shift or Option: Shift turns `\` into `|` and Option
+ * turns `[` into `“` on a Mac, and the chord is still written with the key,
+ * as `CmdOrCtrl+Shift+\` is. The same reading the shifted digit gets.
  */
 const PUNCTUATION_AT: Readonly<Record<string, string>> = {
   Backslash: "\\",
@@ -74,7 +74,7 @@ function positionName(event: ChordEvent): string | null {
   if (letter) return letter[1];
   const digit = /^Digit([0-9])$/.exec(code);
   if (digit) return digit[1];
-  return event.shiftKey ? (PUNCTUATION_AT[code] ?? null) : null;
+  return event.shiftKey || event.altKey ? (PUNCTUATION_AT[code] ?? null) : null;
 }
 
 /** The chord spelled from the character the key produced. */

@@ -62,6 +62,7 @@ import {
   toggleTaskList,
 } from "../../commands/markdown-format";
 import type { BufferDocument, FileOpenMode } from "../../types/buffer";
+import type { JotraConfig } from "../../types/config";
 import type { ViewPosition } from "../../stores/window/editor-store";
 import { configStore } from "../../stores/global/config";
 import { clipboardStore } from "../../stores/global/clipboard";
@@ -497,8 +498,14 @@ export default function EditorInstance(props: Props) {
 
   // Reading width is for text being read: a large or binary file is being
   // inspected, and keeps the width of the pane like a source file does.
-  function measureExtension(enabled: boolean, lang: string | null, mode: FileOpenMode): Extension {
-    return surfaceFollowsLanguage(mode) ? readingWidthFor(enabled, isCodeBuffer(lang)) : [];
+  function measureExtension(
+    reading: Pick<JotraConfig["editor"], "reading_width" | "reading_measure">,
+    lang: string | null,
+    mode: FileOpenMode,
+  ): Extension {
+    return surfaceFollowsLanguage(mode)
+      ? readingWidthFor(reading.reading_width, isCodeBuffer(lang), reading.reading_measure)
+      : [];
   }
 
   // Prose sans is the writing face; a source buffer is code all the way down,
@@ -671,7 +678,7 @@ export default function EditorInstance(props: Props) {
       themeCompartment.of(editorThemeFor(themeStore.polarity())),
       wrapCompartment.of(lineWrappingFor(configStore.config().editor.word_wrap, features.wrap)),
       indentationCompartment.of(indentationFor(configStore.config().editor.tab_size)),
-      measureCompartment.of(measureExtension(configStore.config().editor.reading_width, langId, mode)),
+      measureCompartment.of(measureExtension(configStore.config().editor, langId, mode)),
       directionCompartment.of(features.direction ? autoTextDirection : []),
       placeholderCompartment.of(placeholderFor(markdown, mode)),
       EditorView.updateListener.of((update) => {
@@ -929,7 +936,7 @@ export default function EditorInstance(props: Props) {
         linkCompartment.reconfigure(features.links ? linkExtensions(markdown) : []),
         wrapCompartment.reconfigure(lineWrappingFor(editor.word_wrap, features.wrap)),
         indentationCompartment.reconfigure(indentationFor(editor.tab_size)),
-        measureCompartment.reconfigure(measureExtension(editor.reading_width, lang, mode)),
+        measureCompartment.reconfigure(measureExtension(editor, lang, mode)),
         directionCompartment.reconfigure(features.direction ? autoTextDirection : []),
         placeholderCompartment.reconfigure(placeholderFor(markdown, mode)),
         themeCompartment.reconfigure(editorThemeFor(themeStore.polarity())),
@@ -1449,11 +1456,14 @@ export default function EditorInstance(props: Props) {
   // Reading width follows the setting and whether the file in front is code,
   // in every tier.
   const readingWidth = createMemo(() => configStore.config().editor.reading_width);
+  const readingMeasure = createMemo(() => configStore.config().editor.reading_measure);
   createEffect(on(
-    [readingWidth, () => ed.language()],
-    ([measured, lang]) => {
+    [readingWidth, readingMeasure, () => ed.language()],
+    ([enabled, measure, lang]) => {
       view?.dispatch({
-        effects: measureCompartment.reconfigure(measureExtension(measured, lang, currentMode())),
+        effects: measureCompartment.reconfigure(
+          measureExtension({ reading_width: enabled, reading_measure: measure }, lang, currentMode()),
+        ),
       });
     },
     { defer: true },

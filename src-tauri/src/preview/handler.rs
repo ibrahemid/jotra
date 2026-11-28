@@ -9,7 +9,7 @@
 //! assets.
 //!
 //! The preview renders the **live** buffer text, not on-disk content: the
-//! frontend debounces keystrokes into `preview_render`, which runs the
+//! frontend debounces keystrokes into `preview_force_render`, which runs the
 //! renderer and stores the HTML in the [`RenderCache`]; the document-scope
 //! response serves from that cache, and the webview reloads to pick up new
 //! HTML (reload is the push mechanism that works with or without scripts).
@@ -83,7 +83,7 @@ pub struct RenderedDoc {
 /// The scopes are kept apart from the documents because the editor draws a
 /// note's images from the same route with no preview open (ADR-035): a scope
 /// is recorded by a render or by the editor's image command, and outlives the
-/// eviction of the document.
+/// eviction of the document until the buffer's tab closes.
 ///
 /// Remote images the editor fetched on request are held here too (ADR-057),
 /// served from the same scheme under the scope of each tab that asked.
@@ -195,6 +195,25 @@ impl RenderCache {
             "preview::render_cache::release_remote_images",
         )
         .release_buffer(buffer_id);
+    }
+
+    /// Forget what is held for `buffer_id` once its tab has closed: its
+    /// document, its asset scope and the remote images it was granted. A
+    /// request carrying its old token is refused from then on, and a scope
+    /// recorded for the id later mints a new token.
+    ///
+    /// It takes its place in the buffer's render queue, so a render asked for
+    /// before the tab closed records its document and scope before they are
+    /// forgotten, never after.
+    pub fn release_buffer(&self, buffer_id: &str) {
+        let _turn = self.renders.turn(buffer_id);
+        recover_poison(self.docs.lock(), "preview::render_cache::release_buffer").remove(buffer_id);
+        recover_poison(
+            self.scopes.lock(),
+            "preview::render_cache::release_buffer_scope",
+        )
+        .remove(buffer_id);
+        self.release_remote_images(buffer_id);
     }
 
     /// Drop the cached document for `buffer_id` (on preview close). Its asset
@@ -2087,6 +2106,114 @@ mod asset_tests {
         assert_eq!(header(&r, "Content-Type"), Some("image/png"));
         assert_eq!(header(&r, "X-Content-Type-Options"), Some("nosniff"));
         assert_eq!(header(&r, "Cache-Control"), Some("no-store"));
+    }
+
+    #[test]
+    fn a_closed_tab_s_token_reads_nothing_back() {
+        let f = Fixture::new();
+        let scope = editor_scope(&f, "buf-9");
+        std::fs::write(f.note_dir.join("shot.png"), PNG).unwrap();
+        let key = "e".repeat(64);
+        f.cache.put_remote_image(&key, "buf-9", held_png());
+        f.cache.put(
+            "buf-9",
+            RenderedDoc {
+                html: "<p>note</p>".to_string(),
+                assets: Some(scope.clone()),
+                scripts_enabled: false,
+            },
+        );
+        let image = format!(
+            "jotra-preview://document/_note-asset/buf-9/{}/d/shot.png",
+            scope.token
+        );
+        assert_eq!(
+            resolve_cached(&image, &f.cache, &never_dataless).status,
+            200
+        );
+
+        f.cache.release_buffer("buf-9");
+
+        let local = resolve_cached(&image, &f.cache, &never_dataless);
+        assert_ne!(local.status, 200);
+        assert!(!local.body.starts_with(PNG));
+        let remote = resolve_cached(
+            &remote_url("buf-9", &scope.token, &key),
+            &f.cache,
+            &never_dataless,
+        );
+        assert_ne!(remote.status, 200);
+        assert!(!remote.body.starts_with(PNG));
+        assert!(f.cache.get("buf-9").is_none());
+        assert!(f.cache.scope("buf-9").is_none());
+        assert!(f.cache.remote_image(&key, "buf-9").is_none());
+        assert_ne!(editor_scope(&f, "buf-9").token, scope.token);
+        assert_ne!(
+            resolve_cached(&image, &f.cache, &never_dataless).status,
+            200
+        );
+    }
+
+    #[test]
+    fn a_render_running_when_its_tab_closes_leaves_no_token_behind() {
+        let f = Fixture::new();
+        std::fs::write(f.note_dir.join("shot.png"), PNG).unwrap();
+        let image = |scope: &AssetScope| {
+            format!(
+                "jotra-preview://document/_note-asset/buf-9/{}/d/shot.png",
+                scope.token
+            )
+        };
+        let finish_render = |scope: &AssetScope| {
+            f.cache.put(
+                "buf-9",
+                RenderedDoc {
+                    html: "<p>note</p>".to_string(),
+                    assets: Some(scope.clone()),
+                    scripts_enabled: false,
+                },
+            );
+        };
+
+        let turn = f.cache.render_ticket("buf-9").wait();
+        let scope = editor_scope(&f, "buf-9");
+        finish_render(&scope);
+        drop(turn);
+        f.cache.release_buffer("buf-9");
+        assert_ne!(
+            resolve_cached(&image(&scope), &f.cache, &never_dataless).status,
+            200
+        );
+
+        let turn = f.cache.render_ticket("buf-9").wait();
+        let scope = editor_scope(&f, "buf-9");
+        std::thread::scope(|threads| {
+            let close = threads.spawn(|| f.cache.release_buffer("buf-9"));
+            while f.cache.renders.outstanding("buf-9") < 2 && !close.is_finished() {
+                std::thread::yield_now();
+            }
+            finish_render(&scope);
+            drop(turn);
+            close.join().unwrap();
+        });
+        assert_ne!(
+            resolve_cached(&image(&scope), &f.cache, &never_dataless).status,
+            200
+        );
+        assert!(f.cache.scope("buf-9").is_none());
+        assert!(f.cache.get("buf-9").is_none());
+    }
+
+    #[test]
+    fn releasing_one_tab_leaves_another_s_scope() {
+        let f = Fixture::new();
+        let kept = editor_scope(&f, "buf-2");
+        editor_scope(&f, "buf-9");
+        f.cache.release_buffer("buf-9");
+        assert_eq!(
+            f.cache.scope("buf-2").map(|scope| scope.token),
+            Some(kept.token)
+        );
     }
 
     #[test]

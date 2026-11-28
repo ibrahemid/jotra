@@ -2216,7 +2216,7 @@ pub fn close_buffer_inner(state: &AppState, id: &str) -> Result<(), String> {
     state.forget_disk_state(id);
     state.forget_source_record(id);
     state.stop_following_note(id);
-    state.preview_render_cache.release_remote_images(id);
+    state.preview_render_cache.release_buffer(id);
     Ok(())
 }
 
@@ -2262,7 +2262,7 @@ pub fn close_buffers_inner(state: &AppState, ids: &[String]) -> Result<(), Strin
         state.forget_disk_state(id);
         state.forget_source_record(id);
         state.stop_following_note(id);
-        state.preview_render_cache.release_remote_images(id);
+        state.preview_render_cache.release_buffer(id);
     }
     Ok(())
 }
@@ -2296,7 +2296,7 @@ pub(crate) fn delete_buffer_in_turn(state: &AppState, turn: &Turn) -> Result<(),
     state.forget_disk_state(id);
     state.forget_source_record(id);
     state.stop_following_note(id);
-    state.preview_render_cache.release_remote_images(id);
+    state.preview_render_cache.release_buffer(id);
     Ok(())
 }
 

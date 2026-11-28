@@ -11,7 +11,7 @@ import {
 import { foldedRanges, syntaxTree } from "@codemirror/language";
 import { mathSource } from "./markdown-math";
 import { TYPING_PAUSE_MS } from "./markdown-images";
-import type { BlockRenderer, BlockTheme } from "./block-renderer";
+import type { BlockFailureReason, BlockRenderer, BlockTheme } from "./block-renderer";
 import { sanitizedFragment } from "./sanitize-markup";
 
 // Minimal structural types matching @lezer/common, mirroring the shape used
@@ -54,7 +54,11 @@ export function mathKey(tex: string, display: boolean): string {
 }
 
 export function diagramKey(source: string, theme: BlockTheme): string {
-  return `diagram-${theme}:${blockHash(source)}`;
+  return diagramKeyOf(blockHash(source), theme);
+}
+
+function diagramKeyOf(hash: string, theme: BlockTheme): string {
+  return `diagram-${theme}:${hash}`;
 }
 
 function tableKey(text: string): string {
@@ -72,7 +76,7 @@ export function blockThemeOf(state: EditorState): BlockTheme {
 export type BlockRender =
   | { status: "pending" }
   | { status: "ready"; markup: string }
-  | { status: "failed"; line: number | null };
+  | { status: "failed"; line: number | null; reason: BlockFailureReason };
 
 const PENDING: BlockRender = { status: "pending" };
 const NO_RENDERS: ReadonlyMap<string, BlockRender> = new Map();
@@ -147,7 +151,11 @@ export interface MarkdownBlock {
   key: string;
   /** The expression or the diagram source; the table's text for a table. */
   source: string;
-  table?: TableModel;
+  /**
+   * The table's model, built the first time it is asked for: a table the
+   * caret is in shows its source and never needs one.
+   */
+  table?: () => TableModel;
 }
 
 // Containers a block can sit inside and still be drawn. A quote is left out:
@@ -326,18 +334,43 @@ function alignmentsOf(delimiterRow: string): CellAlign[] {
 
 // Tables are rebuilt from their text only when it changes, which keeps a
 // keystroke elsewhere from walking every cell on screen. Singleton state:
-// the models are pure functions of the text.
+// the models are pure functions of the text. The least recently drawn go
+// first, past a count or a total of table text, whichever comes first.
 const KEPT_TABLES = 512;
-const tableModels = new Map<string, TableModel>();
+const KEPT_TABLE_TEXT = 1 << 20;
+const tableModels = new Map<string, { model: TableModel; size: number }>();
+let keptTableText = 0;
+let builtTableModels = 0;
+
+/** How many table models have been built since the module loaded. */
+export function tableModelsBuilt(): number {
+  return builtTableModels;
+}
+
+function keepTableModel(key: string, model: TableModel, size: number): void {
+  tableModels.set(key, { model, size });
+  keptTableText += size;
+  while (tableModels.size > 1 && (tableModels.size > KEPT_TABLES || keptTableText > KEPT_TABLE_TEXT)) {
+    const [oldest, entry] = tableModels.entries().next().value as [string, { size: number }];
+    tableModels.delete(oldest);
+    keptTableText -= entry.size;
+  }
+}
 
 function tableModel(
   slice: (from: number, to: number) => string,
   table: SyntaxNodeLike,
   key: string,
   base: number,
+  size: number,
 ): TableModel {
   const held = tableModels.get(key);
-  if (held) return held;
+  if (held) {
+    tableModels.delete(key);
+    tableModels.set(key, held);
+    return held.model;
+  }
+  builtTableModels++;
   let header: SyntaxNodeLike | null = null;
   let delimiter = "";
   const bodyRows: SyntaxNodeLike[] = [];
@@ -383,11 +416,7 @@ function tableModel(
     math,
     signature: JSON.stringify([align, head, rows]),
   };
-  tableModels.set(key, model);
-  if (tableModels.size > KEPT_TABLES) {
-    const oldest = tableModels.keys().next().value;
-    if (oldest !== undefined) tableModels.delete(oldest);
-  }
+  keepTableModel(key, model, size);
   return model;
 }
 
@@ -426,13 +455,15 @@ function blockAt(state: EditorState, node: SyntaxNodeLike): MarkdownBlock | null
     case "Table": {
       const text = slice(first.from, last.to);
       const key = tableKey(text);
+      const base = first.from;
+      let model: TableModel | null = null;
       return {
         kind: "table",
         from: first.from,
         to: last.to,
         key,
         source: text,
-        table: tableModel(slice, node, key, first.from),
+        table: () => (model ??= tableModel(slice, node, key, base, text.length)),
       };
     }
     case "BlockMath": {
@@ -506,7 +537,12 @@ abstract class BlockWidget extends WidgetType {
   }
 
   override get estimatedHeight(): number {
-    return heights.get(this.key) ?? -1;
+    return this.knownHeight() ?? -1;
+  }
+
+  /** The height last measured for what this widget shows. */
+  protected knownHeight(): number | undefined {
+    return heights.get(this.key);
   }
 
   override ignoreEvent(_event: Event): boolean {
@@ -542,16 +578,19 @@ function sourceFallback(frame: HTMLElement, source: string, caption: string): vo
 /** True when two drawings would put the same thing on screen. */
 export function sameRender(a: BlockRender, b: BlockRender): boolean {
   if (a.status === "ready") return b.status === "ready" && a.markup === b.markup;
-  if (a.status === "failed") return b.status === "failed" && a.line === b.line;
+  if (a.status === "failed") return b.status === "failed" && a.line === b.line && a.reason === b.reason;
   return b.status === "pending";
 }
 
 /** What a failed diagram says under its source. */
-export function diagramFailureCaption(line: number | null): string {
+export function diagramFailureCaption(line: number | null, reason: BlockFailureReason = "source"): string {
+  if (reason === "runtime") return DIAGRAM_RUNTIME_CAPTION;
   return line === null
     ? "This diagram has an error."
     : `This diagram has an error on line ${line}.`;
 }
+
+export const DIAGRAM_RUNTIME_CAPTION = "The diagram renderer did not load.";
 
 export const MATH_FAILURE_CAPTION = "This math could not be drawn.";
 
@@ -584,9 +623,14 @@ class MathBlockWidget extends BlockWidget {
   }
 }
 
+// Singleton state — Jotra is single-window
+let diagramCopies = 0;
+
 class DiagramWidget extends BlockWidget {
   constructor(
     key: string,
+    /** The same diagram in the other theme, whose height stands in until this one is measured. */
+    private readonly otherThemeKey: string,
     readonly source: string,
     readonly render: BlockRender,
   ) {
@@ -597,15 +641,20 @@ class DiagramWidget extends BlockWidget {
     return other.key === this.key && sameRender(other.render, this.render);
   }
 
+  protected override knownHeight(): number | undefined {
+    return heights.get(this.key) ?? heights.get(this.otherThemeKey);
+  }
+
   toDOM(view: EditorView): HTMLElement {
     const frame = this.frame(view, "diagram", this.render.status);
     if (this.render.status === "ready") {
-      frame.append(sanitizedFragment(this.render.markup));
+      // Each copy names its ids apart, so two of one drawing share none.
+      frame.append(sanitizedFragment(this.render.markup, `-d${++diagramCopies}`));
     } else if (this.render.status === "failed") {
-      sourceFallback(frame, this.source, diagramFailureCaption(this.render.line));
+      sourceFallback(frame, this.source, diagramFailureCaption(this.render.line, this.render.reason));
     } else {
       // The space the diagram took last time, so its arrival moves nothing.
-      const known = heights.get(this.key);
+      const known = this.knownHeight();
       if (known !== undefined) frame.style.minHeight = `${known}px`;
       frame.setAttribute("aria-busy", "true");
     }
@@ -732,12 +781,15 @@ function widgetFor(block: MarkdownBlock, state: EditorState): WidgetType {
   const renders = state.field(blockRenderField, false) ?? NO_RENDERS;
   switch (block.kind) {
     case "table":
-      return new TableWidget(block.key, block.table!, renders);
+      return new TableWidget(block.key, block.table!(), renders);
     case "math":
       return new MathBlockWidget(block.key, block.source, renders.get(block.key) ?? PENDING);
     case "diagram": {
-      const key = diagramKey(block.source, blockThemeOf(state));
-      return new DiagramWidget(key, block.source, renders.get(key) ?? PENDING);
+      const theme = blockThemeOf(state);
+      const hash = blockHash(block.source);
+      const key = diagramKeyOf(hash, theme);
+      const other = diagramKeyOf(hash, theme === "dark" ? "light" : "dark");
+      return new DiagramWidget(key, other, block.source, renders.get(key) ?? PENDING);
     }
   }
 }
@@ -894,9 +946,16 @@ interface Wanted {
   draw(): Promise<string>;
 }
 
-function failedLine(error: unknown): number | null {
-  const line = (error as { line?: unknown } | null)?.line;
-  return typeof line === "number" ? line : null;
+/** How long a drawing whose renderer did not load waits before it is asked for again. */
+const RUNTIME_RETRY_MS = 5000;
+
+function failureOf(error: unknown): BlockRender {
+  const { line, reason } = (error ?? {}) as { line?: unknown; reason?: unknown };
+  return {
+    status: "failed",
+    line: typeof line === "number" ? line : null,
+    reason: reason === "runtime" ? "runtime" : "source",
+  };
 }
 
 /**
@@ -909,6 +968,8 @@ function failedLine(error: unknown): number | null {
  */
 class BlockRequester implements PluginValue {
   private readonly asked = new Set<string>();
+  /** When each drawing whose renderer did not load may be asked for again. */
+  private readonly retryAt = new Map<string, number>();
   private typingPause: ReturnType<typeof setTimeout> | null = null;
   private settling: ReturnType<typeof setTimeout> | null = null;
   private settled: Array<{ key: string; render: BlockRender }> = [];
@@ -997,16 +1058,29 @@ class BlockRequester implements PluginValue {
       const keep = new Set(wanted.map((item) => item.key));
       this.asked.clear();
       for (const key of keep) if (held.has(key)) this.asked.add(key);
+      for (const key of [...this.retryAt.keys()]) if (!this.asked.has(key)) this.retryAt.delete(key);
       queueMicrotask(() => {
         if (!this.destroyed) this.view.dispatch({ effects: keepBlockRenders.of(keep) });
       });
     }
+    const now = Date.now();
     for (const item of wanted) {
-      if (this.asked.has(item.key)) continue;
+      if (this.asked.has(item.key)) {
+        const retry = this.retryAt.get(item.key);
+        if (retry === undefined || now < retry) continue;
+        this.retryAt.delete(item.key);
+      }
       this.asked.add(item.key);
       item.draw().then(
         (markup) => this.settle(item.key, { status: "ready", markup }),
-        (error: unknown) => this.settle(item.key, { status: "failed", line: failedLine(error) }),
+        (error: unknown) => {
+          const failure = failureOf(error);
+          // A renderer that did not load may load next time; a source error stays until the text changes.
+          if (failure.status === "failed" && failure.reason === "runtime") {
+            this.retryAt.set(item.key, Date.now() + RUNTIME_RETRY_MS);
+          }
+          this.settle(item.key, failure);
+        },
       );
     }
   }
