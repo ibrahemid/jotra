@@ -22,6 +22,8 @@ use jotra_tauri_lib::watcher::open_files::NoOpenNotes;
 
 const LIB_RS: &str = include_str!("../src/lib.rs");
 
+const CHAT_RS: &str = include_str!("../src/commands/chat.rs");
+
 const COMMANDS: &[&str] = &[
     "commands::chat::chat_state",
     "commands::chat::chat_attached_sizes",
@@ -743,4 +745,24 @@ fn a_note_the_folder_does_not_hold_is_refused_without_naming_it_again() {
     let root = root(&notes);
     let error = note_file_in(&root, "Nowhere.md").expect_err("refused");
     assert_eq!(error, "This file is no longer there.");
+}
+
+/// The pane opens a conversation again on each save of a note an open offer
+/// names, and every open reads and diffs those notes: a command that is not
+/// `async` runs that on the main thread (ADR-047).
+#[test]
+fn chat_open_answers_off_the_main_thread() {
+    let start = CHAT_RS
+        .find("fn chat_open(")
+        .expect("chat_open is in commands/chat.rs");
+    assert!(
+        CHAT_RS[..start].ends_with("pub async "),
+        "chat_open is not async"
+    );
+    let rest = &CHAT_RS[start..];
+    let body = &rest[..rest.find("\n}\n").expect("the function ends")];
+    assert!(
+        body.contains("offload::run_detached("),
+        "chat_open does not hand its work to the blocking pool"
+    );
 }

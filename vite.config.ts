@@ -23,6 +23,8 @@ export default defineConfig({
   // baseline target.
   build: {
     target: ["es2020", "edge88", "firefox78", "chrome87", "safari14"],
+    // The polyfill preloads with fetch(), which the app CSP's connect-src refuses.
+    modulePreload: { polyfill: false },
     // The quick capture window loads a page of its own (ADR-055).
     rolldownOptions: {
       input: {

@@ -123,8 +123,8 @@ pub fn attach_bus_subscribers<H: BusHost>(host: &H) {
             JotraEvent::WorkspaceChanged { path, removed } => {
                 crate::workspace_index::on_workspace_changed(&index, path, *removed);
             }
-            JotraEvent::WorkspaceSwept { .. } => {
-                crate::workspace_index::on_workspace_swept(&index);
+            JotraEvent::WorkspaceSwept { paths, .. } => {
+                crate::workspace_index::on_workspace_swept(&index, paths.as_deref());
             }
             _ => {}
         });

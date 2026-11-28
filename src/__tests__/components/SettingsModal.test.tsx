@@ -615,6 +615,35 @@ describe("SettingsModal", () => {
     expect(saved.preview.default_layout_markdown).toBe("source");
   });
 
+  it("offers three line lengths while reading width is on and writes the choice", async () => {
+    mocks.config.mockReturnValue({ ...baseConfig(), editor: { ...baseConfig().editor, reading_width: true } });
+    const { container } = render(() => <SettingsModal />);
+    openSettings("editor");
+    await waitFor(() => expect(container.querySelector("[data-section='editor']")).not.toBeNull());
+    const select = container.querySelector<HTMLSelectElement>("[data-setting='reading_measure']")!;
+    expect(Array.from(select.options).map((o) => [o.value, o.text])).toEqual([
+      ["narrow", "Narrow"],
+      ["medium", "Medium"],
+      ["wide", "Wide"],
+    ]);
+    expect(select.disabled).toBe(false);
+    expect(select.value).toBe("medium");
+    fireEvent.change(select, { target: { value: "wide" } });
+    await waitFor(() => expect(mocks.save).toHaveBeenCalledTimes(1));
+    const saved = mocks.save.mock.calls[0][0] as JotraConfig;
+    expect(saved.editor).toMatchObject({ reading_width: true, reading_measure: "wide" });
+  });
+
+  it("holds the line length row until reading width is on", async () => {
+    const { container } = render(() => <SettingsModal />);
+    openSettings("editor");
+    await waitFor(() => expect(container.querySelector("[data-section='editor']")).not.toBeNull());
+    const row = container.querySelector<HTMLElement>("[data-setting-id='editor.reading_measure']")!;
+    const select = row.querySelector<HTMLSelectElement>("[data-setting='reading_measure']")!;
+    expect(select.disabled).toBe(true);
+    expect(row.textContent).toContain("Turn on Reading width to pick a line length.");
+  });
+
   it("offers no markdown typography row", async () => {
     const { container } = render(() => <SettingsModal />);
     openSettings("editor");
@@ -2350,6 +2379,27 @@ describe("AI section", () => {
     const text = collapse(container.querySelector(".settings-ai-consent-text")!.textContent);
     expect(text).toContain("sent to 192.168.1.20:11434 on your local network");
     expect(text).not.toContain("API key");
+  });
+
+  it("names the key in the consent for an https address on the local network that takes it", async () => {
+    mocks.aiEndpointState.mockResolvedValue(
+      hostedEndpoint({
+        host: "192.168.1.20",
+        host_port: "192.168.1.20",
+        is_private_network: true,
+        provider: "custom",
+        key_state: { is_set: true, memory_only: false },
+        sends_key: true,
+      }),
+    );
+    const { container } = await openAiSection({
+      provider: "custom",
+      base_url: "https://192.168.1.20/v1",
+    });
+    await waitFor(() => expect(container.querySelector(".settings-ai-consent")).not.toBeNull());
+    expect(collapse(container.querySelector(".settings-ai-consent-text")!.textContent)).toBe(
+      "The files you attach and the text you rewrite are sent to 192.168.1.20 on your local network with your API key. Jotra also sends the key on its own to check the address is reachable. The check sends no text.",
+    );
   });
 
   it("shows the on-device row with no model to choose and says chat needs another provider", async () => {

@@ -23,8 +23,9 @@ export default function ProposalCard(props: { turn: number; proposal: ChatPropos
   const status = () => props.proposal.status ?? "pending";
   const refusal = () => chatStore.refusalFor(props.turn, props.proposal.path);
   const rows = createMemo(() => (props.proposal.hunks ?? []).map(hunkRows));
-  // What this session's write did to the note, which the stored turn does not
-  // record: it says the proposal was applied, not what the file now holds.
+  // What this session's write did to the note. A conversation opened again
+  // reads the same from the stored proposal: what the apply left, and whether
+  // Undo can still put the earlier text back.
   const written = () => chatStore.verdictFor(props.turn, props.proposal.path);
   const [discarding, setDiscarding] = createSignal(false);
 
@@ -36,6 +37,9 @@ export default function ProposalCard(props: { turn: number; proposal: ChatPropos
   /** The note moved on since the offer was made, so Apply would be refused
    * and would leave a dated copy beside it. */
   const stale = () => props.proposal.stale === true && !settled();
+  /** A file outside the notes folder is read and written through its tab, so
+   * an offer for one whose tab is closed waits for it to open. */
+  const needsTab = () => props.proposal.needs_tab === true && !settled();
 
   /** A note by the key its folder gives it, a file outside the folder by its
    * own name: the whole path is in the title, which is where it fits. */
@@ -74,6 +78,10 @@ export default function ProposalCard(props: { turn: number; proposal: ChatPropos
         <p class="chat-proposal-stale">The file changed since this was offered.</p>
       </Show>
 
+      <Show when={needsTab()}>
+        <p class="chat-proposal-stale">Open the file to apply this.</p>
+      </Show>
+
       <Show when={rows().length > 0}>
         <div class="chat-diff">
           <For each={rows()}>
@@ -99,7 +107,7 @@ export default function ProposalCard(props: { turn: number; proposal: ChatPropos
 
       <Show when={settled() || status() === "refused"}>
         <p class="chat-proposal-verdict" role="status">
-          {verdict(status(), refusal(), written(), stale(), label())}
+          {verdict(status(), refusal(), written(), stale(), props.proposal.undone === true, label())}
         </p>
       </Show>
 
@@ -109,12 +117,7 @@ export default function ProposalCard(props: { turn: number; proposal: ChatPropos
           <Show when={status() === "applied" || written() !== undefined}>
             <div class="chat-proposal-actions">
               <Button onClick={() => void chatStore.openTarget(props.proposal)}>Open</Button>
-              <Show
-                when={(() => {
-                  const held = written();
-                  return held?.kind === "applied" && held.outcome.undoable;
-                })()}
-              >
+              <Show when={chatStore.canUndo(props.turn, props.proposal)}>
                 <Button
                   disabled={busy()}
                   aria-busy={busy() ? true : undefined}
@@ -134,9 +137,12 @@ export default function ProposalCard(props: { turn: number; proposal: ChatPropos
           <Show when={stale()}>
             <Button onClick={() => void askAgain(props.proposal)}>Ask again</Button>
           </Show>
+          <Show when={needsTab()}>
+            <Button onClick={() => void chatStore.openTarget(props.proposal)}>Open</Button>
+          </Show>
           <Button
             variant="primary"
-            disabled={busy() || discarding() || stale()}
+            disabled={busy() || discarding() || stale() || needsTab()}
             aria-busy={busy() ? true : undefined}
             onClick={() => void chatStore.apply(props.turn, props.proposal)}
           >
@@ -153,14 +159,15 @@ function verdict(
   refusal: string | undefined,
   written: ProposalVerdict | undefined,
   stale: boolean,
+  undone: boolean,
   label: string,
 ): string {
   if (written?.kind === "undone") return `${label} is back as it was.`;
   // An Undo that was refused says why, under the write it could not undo.
-  if (written && refusal) return refusal;
+  if (refusal && (written || status === "applied")) return refusal;
   if (written && !written.outcome.changed) return "The file already held this text.";
-  if (written) return `Applied to ${label}.`;
-  if (status === "applied") return "Applied.";
+  if (status === "applied" && undone) return `${label} is back as it was.`;
+  if (written || status === "applied") return "Applied.";
   if (status === "discarded") return "Discarded.";
   if (refusal) return refusal;
   return stale ? "Nothing was written." : "Not applied.";

@@ -36,14 +36,19 @@ export function noteCount(count: number): string {
  *
  * One file is named, because a person agreeing to send a file wants to know
  * which one. A set is counted, and a message with no file says only that the
- * message goes. A host on a private network is named as one, since no key
- * has to go with it. */
+ * message goes. A host on a private network is named as one, and the key is
+ * named only when one goes with the send. */
 export function sendNotice(
   host: string,
   attachments: readonly Attachment[],
   privateNetwork = false,
+  sendsKey = false,
 ) {
-  const how = privateNetwork ? "on your local network" : "with your API key";
+  const how = !privateNetwork
+    ? "with your API key"
+    : sendsKey
+      ? "on your local network with your API key"
+      : "on your local network";
   if (attachments.length === 0) {
     return {
       title: `Send this message to ${host}?`,
@@ -155,7 +160,7 @@ export async function clearBlockersBeforeSending(
   if (endpoint.is_hosted && !endpoint.is_consented) {
     const host = endpoint.host_port ?? endpoint.host;
     const confirmed = await requestConfirm({
-      ...sendNotice(host, attachments, endpoint.is_private_network),
+      ...sendNotice(host, attachments, endpoint.is_private_network, endpoint.sends_key === true),
       confirmLabel: "Send",
       defaultAction: "cancel",
     });

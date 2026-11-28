@@ -2011,9 +2011,9 @@ fn tool_error(root: &Path, client: &ClientId, tool: &str, error: HostError) -> T
         HostError::NameEmpty => ToolError::NameEmpty,
         HostError::NameTaken { name } => ToolError::NameTaken { name },
         HostError::NotDownloaded { path } => ToolError::NotDownloaded { path },
-        HostError::Unwritable { path } | HostError::EncodingLossy { path, .. } => {
-            ToolError::Unwritable { path }
-        }
+        HostError::Unwritable { path }
+        | HostError::EncodingLossy { path, .. }
+        | HostError::NotInEncoding { path, .. } => ToolError::Unwritable { path },
         HostError::PassageEmpty { path } => ToolError::PassageEmpty { path },
         HostError::PassageAbsent { path } => ToolError::PassageAbsent { path },
         HostError::PassageRepeated { path, count } => ToolError::PassageRepeated { path, count },

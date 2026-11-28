@@ -113,6 +113,19 @@ pub struct AiKeyState {
     pub memory_only: bool,
 }
 
+/// A key lookup that declined to read the store, because nothing this session
+/// has read it yet and a read can raise a system password prompt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct KeyStoreUnread;
+
+impl std::fmt::Display for KeyStoreUnread {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("the key store has not been read this session")
+    }
+}
+
+impl std::error::Error for KeyStoreUnread {}
+
 /// Platform store access. Returns `Ok(None)` when no credential exists; `Err`
 /// when the store is unavailable or access was denied, which steers callers to
 /// the in-memory fallback.
@@ -181,6 +194,24 @@ pub(crate) fn resolve_key_from(
     account: &str,
 ) -> Option<String> {
     keychain_value.or_else(|| memory.get(account).cloned())
+}
+
+/// The key for `provider` from what this session already holds: the store's
+/// cached answer, or a key kept in memory. A local row holds none. Anything
+/// else would read the store, so it is declined.
+pub(crate) fn resolve_held_key(
+    cache: &HashMap<String, Option<String>>,
+    memory: &HashMap<String, String>,
+    provider: &str,
+) -> Result<Option<String>, KeyStoreUnread> {
+    if let Some(stored) = cache.get(provider) {
+        return Ok(resolve_key_from(stored.clone(), memory, provider));
+    }
+    match memory.get(provider) {
+        Some(key) => Ok(Some(key.clone())),
+        None if !keeps_a_key(provider) => Ok(None),
+        None => Err(KeyStoreUnread),
+    }
 }
 
 /// Whether a provider's key is ever looked up. A local row never had one, so

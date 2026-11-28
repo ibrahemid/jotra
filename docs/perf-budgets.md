@@ -541,7 +541,7 @@ the whole of its work.
 | `save_buffer_content` | the same file, one byte changed | 1,107 ms | 0 ms | 960 ms |
 | `save_buffer_content` (raw body) | the same file, one byte changed | not measured yet | | |
 | `save_buffer_changes` | the same file, one byte changed as a change set | not measured yet | | |
-| `preview_render` | 5 MB note, 54,359 wikilinks to 200 notes | 287 ms | 0 ms | 143 ms |
+| `preview_force_render` | 5 MB note, 54,359 wikilinks to 200 notes | 287 ms | 0 ms | 143 ms |
 | `search_workspace_files` | 200,000 files, slowest of six keystrokes | 104 ms | 0 ms | 104 ms |
 | `install_cli` | administrator password dialog | the whole dialog | 0 ms | the person |
 | `mcp_connect_cards`, `mcp_connect_add`, `mcp_connect_open`, `mcp_server_test` | a client's own command, the login shell, `jotra mcp` | not measured yet | 0 ms | the other program |

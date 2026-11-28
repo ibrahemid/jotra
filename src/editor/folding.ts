@@ -4,9 +4,8 @@ import {
   EditorView,
   ViewPlugin,
   WidgetType,
-  keymap,
+  type Command,
   type DecorationSet,
-  type KeyBinding,
   type PluginValue,
   type ViewUpdate,
 } from "@codemirror/view";
@@ -21,6 +20,8 @@ import {
   unfoldCode,
   unfoldEffect,
 } from "@codemirror/language";
+import { autoDirectionOf } from "./bidi";
+import type { Platform } from "../lib/platform";
 
 const SVG_NS = "http://www.w3.org/2000/svg";
 
@@ -41,22 +42,53 @@ function chevron(): SVGSVGElement {
   return svg;
 }
 
+/** A fold command: a palette entry with a chord of its own on macOS and elsewhere. */
+export interface FoldCommand {
+  id: string;
+  label: string;
+  keywords: string[];
+  mac: string;
+  other: string;
+  run: Command;
+}
+
 /**
  * Fold and unfold at the cursor. Command-Option-[ and ] on macOS; elsewhere
  * Control-Shift-[ and ], because Control-Alt is AltGr on Windows and types
- * the bracket itself on several European layouts.
+ * the bracket itself on several European layouts. Registered commands, so the
+ * palette lists them and Settings, Shortcuts rebinds them.
  */
-export const FOLD_KEYS: readonly KeyBinding[] = [
-  { key: "Ctrl-Shift-[", mac: "Cmd-Alt-[", run: foldCode },
-  { key: "Ctrl-Shift-]", mac: "Cmd-Alt-]", run: unfoldCode },
+export const FOLD_COMMANDS: readonly FoldCommand[] = [
+  {
+    id: "editor.fold",
+    label: "Fold at the cursor",
+    keywords: ["collapse"],
+    mac: "CmdOrCtrl+Alt+[",
+    other: "CmdOrCtrl+Shift+[",
+    run: foldCode,
+  },
+  {
+    id: "editor.unfold",
+    label: "Unfold at the cursor",
+    keywords: ["expand"],
+    mac: "CmdOrCtrl+Alt+]",
+    other: "CmdOrCtrl+Shift+]",
+    run: unfoldCode,
+  },
 ];
 
+/** The chord a fold command registers with on `platform`. */
+export function foldChord(command: FoldCommand, platform: Platform): string {
+  return platform === "mac" ? command.mac : command.other;
+}
+
 /**
- * What folds are: the state field that holds them, the placeholder a folded
- * range shows, and the keys. Outside every compartment, so the folds of a
- * note survive a switch between Inline and Source and a switch of tabs.
+ * What folds are: the state field that holds them and the placeholder a
+ * folded range shows. Outside every compartment, so the folds of a note
+ * survive a switch between Inline and Source and a switch of tabs. The keys
+ * are {@link FOLD_COMMANDS}, which the command registry dispatches.
  */
-export const folding: Extension = [codeFolding(), keymap.of([...FOLD_KEYS])];
+export const folding: Extension = codeFolding();
 
 /** The fold gutter a source file reads with, beside its line numbers. */
 export const codeFoldGutter: Extension = foldGutter({
@@ -128,12 +160,16 @@ export function foldTogglesIn(state: EditorState, from: number, to: number): Fol
 }
 
 class FoldToggleWidget extends WidgetType {
-  constructor(readonly toggle: FoldToggle) {
+  constructor(
+    readonly toggle: FoldToggle,
+    readonly rtl: boolean,
+  ) {
     super();
   }
 
   override eq(other: FoldToggleWidget): boolean {
     return (
+      other.rtl === this.rtl &&
       other.toggle.folded === this.toggle.folded &&
       other.toggle.from === this.toggle.from &&
       other.toggle.to === this.toggle.to
@@ -144,10 +180,11 @@ class FoldToggleWidget extends WidgetType {
     const anchor = document.createElement("span");
     anchor.className = "cm-md-fold";
     if (this.toggle.folded) anchor.dataset.folded = "true";
+    if (this.rtl) anchor.dataset.dir = "rtl";
     anchor.setAttribute("aria-hidden", "true");
     const control = document.createElement("span");
     control.className = "cm-md-fold-control";
-    control.title = view.state.phrase(this.toggle.folded ? "Unfold line" : "Fold line");
+    control.title = view.state.phrase(this.toggle.folded ? "Unfold section" : "Fold section");
     control.appendChild(chevron());
     anchor.appendChild(control);
     const { from, to, folded } = this.toggle;
@@ -173,8 +210,11 @@ function toggleDecorations(view: EditorView): DecorationSet {
   const ranges = [];
   for (const { from, to } of view.visibleRanges) {
     for (const toggle of foldTogglesIn(view.state, from, to)) {
+      const rtl = autoDirectionOf(view.state.doc.lineAt(toggle.line).text) === "rtl";
       ranges.push(
-        Decoration.widget({ widget: new FoldToggleWidget(toggle), side: -1 }).range(toggle.line),
+        Decoration.widget({ widget: new FoldToggleWidget(toggle, rtl), side: -1 }).range(
+          toggle.line,
+        ),
       );
     }
   }
@@ -201,7 +241,7 @@ class ProseFoldToggles implements PluginValue {
 }
 
 /**
- * The prose fold control: a chevron in the left margin of a heading, drawn
+ * The prose fold control: a chevron in the margin before a heading, drawn
  * while the pointer is on its line or while its section is folded.
  * Prose keeps an empty margin and no gutter (ADR-030 decision 3), so the
  * control sits in the margin beside the line instead of in a column of its

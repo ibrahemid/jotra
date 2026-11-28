@@ -20,7 +20,7 @@ use tokio_util::sync::CancellationToken;
 
 pub use jotra_ai::connection::{
     build_client, build_client_for, build_client_with, is_consented, probe_local_at,
-    AiConnectionStatus, AiEndpointState, AiState, LocalProbe, LocalProbeUrls,
+    AiConnectionStatus, AiEndpointState, AiState, KeyStoreUnread, LocalProbe, LocalProbeUrls,
 };
 pub use jotra_ai::keys::{AiKeyState, KeyStore, MemoryKeyStore};
 
@@ -33,6 +33,12 @@ use crate::state::AppState;
 /// reaches another provider's credential.
 pub(crate) fn key_for(app: &AppHandle, account: &str) -> Option<String> {
     app.state::<AiState>().key(account)
+}
+
+/// The key for one account from what this session already read, declining
+/// rather than reading the keychain ([`AiState::held_key`]).
+fn held_key_for(app: &AppHandle, account: &str) -> Result<Option<String>, KeyStoreUnread> {
+    app.state::<AiState>().held_key(account)
 }
 
 /// Whether a key is stored for one account, and whether it is confined to this
@@ -340,13 +346,28 @@ pub fn ai_cancel(ai: State<'_, AiState>, request_id: String) {
 
 /// The provider table, so the settings dropdown, the probe and the model list
 /// read one definition of a row rather than three. The on-device row is in it
-/// only where the system has the model ([`crate::on_device::is_offered`]),
-/// which is asked of the system off the main thread.
+/// where the system has the model ([`crate::on_device::is_offered`]), which is
+/// asked of the system off the main thread, or where the config names it.
 #[tauri::command]
-pub async fn ai_providers() -> Result<Vec<ProviderInfo>, String> {
-    crate::commands::offload::run_detached(crate::commands::offload::ERR_COMMAND_STOPPED, || {
-        Ok(providers::offered_providers(crate::on_device::is_offered()))
-    })
+pub async fn ai_providers(app: AppHandle) -> Result<Vec<ProviderInfo>, String> {
+    let configured = {
+        let state = app.state::<AppState>();
+        let guard = recover_poison(state.config.lock(), "commands::ai::ai_providers");
+        guard.ai.provider.clone()
+    };
+    offered_table(configured).await
+}
+
+async fn offered_table(configured: String) -> Result<Vec<ProviderInfo>, String> {
+    crate::commands::offload::run_detached(
+        crate::commands::offload::ERR_COMMAND_STOPPED,
+        move || {
+            Ok(providers::offered_providers(
+                crate::on_device::is_offered(),
+                &configured,
+            ))
+        },
+    )
     .await
 }
 
@@ -367,6 +388,27 @@ pub async fn ai_list_models(app: AppHandle) -> ModelCatalog {
     app.state::<AiState>().remember_catalog(catalog.clone());
     seed_from_catalog(&app, &catalog);
     catalog
+}
+
+/// [`ai_list_models`] for a surface that opened: `None`, and nothing sent,
+/// when the list needs a key the keychain has not answered this session
+/// ([`connection::read_catalog_unprompted`]).
+#[tauri::command]
+pub async fn ai_list_models_unprompted(app: AppHandle) -> Option<ModelCatalog> {
+    let cfg = {
+        let state = app.state::<AppState>();
+        let guard = recover_poison(
+            state.config.lock(),
+            "commands::ai::ai_list_models_unprompted",
+        );
+        guard.ai.clone()
+    };
+
+    let catalog =
+        connection::read_catalog_unprompted(&cfg, |provider| held_key_for(&app, provider)).await?;
+    app.state::<AiState>().remember_catalog(catalog.clone());
+    seed_from_catalog(&app, &catalog);
+    Some(catalog)
 }
 
 /// Reports which local runtimes are running, so the provider rows can say so
@@ -414,6 +456,30 @@ pub async fn ai_check_connection(app: AppHandle) -> Result<AiConnectionStatus, S
     Ok(connection::check_connection(&cfg, |provider| key_for(&app, provider)).await)
 }
 
+/// [`ai_check_connection`] for a surface that opened: `None`, and nothing
+/// sent, when the check needs a key the keychain has not answered this session
+/// ([`connection::check_connection_unprompted`]).
+#[tauri::command]
+pub async fn ai_check_connection_unprompted(
+    app: AppHandle,
+) -> Result<Option<AiConnectionStatus>, String> {
+    let cfg = {
+        let state = app.state::<AppState>();
+        let guard = recover_poison(
+            state.config.lock(),
+            "commands::ai::ai_check_connection_unprompted",
+        );
+        guard.ai.clone()
+    };
+    if on_device::is_on_device(&cfg.provider) {
+        return ai_check_connection(app).await.map(Some);
+    }
+    Ok(
+        connection::check_connection_unprompted(&cfg, |provider| held_key_for(&app, provider))
+            .await,
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -428,6 +494,8 @@ mod tests {
             "commands::ai::ai_list_models",
             "commands::ai::ai_probe_local",
             "commands::ai::ai_check_connection",
+            "commands::ai::ai_check_connection_unprompted",
+            "commands::ai::ai_list_models_unprompted",
             "commands::ai::ai_word_diff",
             "commands::ai::ai_endpoint_state",
             "commands::ai::ai_consent_host",
@@ -441,10 +509,11 @@ mod tests {
 
     #[test]
     fn the_table_is_answered_whole() {
-        let rows = tauri::async_runtime::block_on(ai_providers()).expect("the table");
+        let rows =
+            tauri::async_runtime::block_on(offered_table("ollama".to_string())).expect("the table");
         assert_eq!(
             rows,
-            providers::offered_providers(crate::on_device::is_offered())
+            providers::offered_providers(crate::on_device::is_offered(), "ollama")
         );
         assert_eq!(
             rows.iter().any(|row| on_device::is_on_device(row.id)),
@@ -454,5 +523,12 @@ mod tests {
         let json = serde_json::to_string(&rows).expect("serialised");
         assert!(json.contains("\"group\":\"local\""), "{json}");
         assert!(json.contains("\"wire\":\"anthropic\""), "{json}");
+    }
+
+    #[test]
+    fn a_configured_on_device_row_is_answered_on_any_machine() {
+        let rows =
+            tauri::async_runtime::block_on(offered_table("apple".to_string())).expect("the table");
+        assert!(rows.iter().any(|row| on_device::is_on_device(row.id)));
     }
 }

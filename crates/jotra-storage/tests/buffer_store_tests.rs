@@ -164,6 +164,32 @@ fn preview_scripts_defaults_off_and_remembers_the_opt_in() {
 }
 
 #[test]
+fn a_store_held_through_a_panic_answers_scripts_off_and_takes_no_opt_in() {
+    let (_dir, mut store) = setup();
+    store
+        .insert(&make_doc("buf-scripts", "Scripts"))
+        .expect("insert failed");
+    let held = Some(sha256_bytes(b""));
+    store
+        .enable_preview_scripts("buf-scripts", held)
+        .expect("opt in failed");
+    assert!(store.check_preview_scripts("buf-scripts", held).unwrap());
+    assert!(!store.was_held_through_a_panic());
+
+    store.mark_held_through_a_panic();
+
+    assert!(store.was_held_through_a_panic());
+    assert!(!store.check_preview_scripts("buf-scripts", held).unwrap());
+    assert!(matches!(
+        store.enable_preview_scripts("buf-scripts", held),
+        Err(jotra_storage::errors::StorageError::HeldThroughAPanic)
+    ));
+    store
+        .disable_preview_scripts("buf-scripts")
+        .expect("turning the scripts off still works");
+}
+
+#[test]
 fn opting_in_a_buffer_the_store_does_not_hold_is_an_error() {
     let (_dir, store) = setup();
 
@@ -812,8 +838,10 @@ fn rename_to_file_re_keys_the_note_in_the_index() {
 
     let renamed = notes_root().join("beta.md");
     std::fs::rename(note_path("ren-fts-a"), &renamed).expect("rename the file");
+    let text =
+        jotra_storage::buffer_store::indexable_text_at(&store.get("ren-fts-a").unwrap(), &renamed);
     store
-        .rename_to_file("ren-fts-a", renamed.to_str().unwrap(), "beta")
+        .rename_to_file("ren-fts-a", renamed.to_str().unwrap(), "beta", &text)
         .expect("rename_to_file");
 
     let key = jotra_storage::notes_index::index_key(&renamed);
@@ -822,6 +850,80 @@ fn rename_to_file_re_keys_the_note_in_the_index() {
         !search(&dir, "body").contains(&indexed_key("ren-fts-a")),
         "the note must not be in the index twice after a rename"
     );
+}
+
+#[test]
+fn rename_to_file_records_the_text_it_is_handed_and_reads_no_file() {
+    let (dir, store) = setup();
+    let doc = make_doc("ren-text-a", "alpha");
+    store.insert(&doc).unwrap();
+    store
+        .save_to_source("ren-text-a", "body text", None, None)
+        .unwrap();
+
+    let renamed = notes_root().join("ren-text-b.md");
+    std::fs::rename(note_path("ren-text-a"), &renamed).expect("rename the file");
+    std::fs::write(&renamed, "words written later").expect("change the file");
+    store
+        .rename_to_file(
+            "ren-text-a",
+            renamed.to_str().unwrap(),
+            "ren-text-b",
+            "body text",
+        )
+        .expect("rename_to_file");
+
+    let key = jotra_storage::notes_index::index_key(&renamed);
+    assert_eq!(search(&dir, "body"), vec![key]);
+    assert!(
+        search(&dir, "later").is_empty(),
+        "the rename read the file under the store"
+    );
+}
+
+#[test]
+fn rename_to_file_under_the_same_path_keeps_what_the_index_holds() {
+    let (dir, store) = setup();
+    let doc = make_doc("ren-same-a", "alpha");
+    store.insert(&doc).unwrap();
+    store
+        .save_to_source("ren-same-a", "body text", None, None)
+        .unwrap();
+    let path = note_path("ren-same-a");
+
+    store
+        .rename_to_file("ren-same-a", path.to_str().unwrap(), "alpha", "")
+        .expect("rename_to_file");
+
+    assert_eq!(search(&dir, "body"), vec![indexed_key("ren-same-a")]);
+    assert_eq!(store.get("ren-same-a").unwrap().title, "alpha");
+}
+
+#[test]
+fn indexable_text_is_empty_for_rows_the_index_holds_no_text_of() {
+    use jotra_storage::buffer_store::{indexable_text_at, indexable_text_of};
+
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("cafe.md");
+    std::fs::write(&file, b"caf\xe9\n").unwrap();
+    let mut doc = make_doc("indexable", "Cafe");
+    doc.encoding = Some(jotra_core::text_encoding::TextEncoding::windows_1252());
+    doc.size_bytes = 5;
+    assert_eq!(indexable_text_of(&doc, b"caf\xe9\n"), "caf\u{e9}\n");
+    assert_eq!(indexable_text_at(&doc, &file), "caf\u{e9}\n");
+
+    let read_only = BufferDocument {
+        read_only: true,
+        ..doc.clone()
+    };
+    assert_eq!(indexable_text_of(&read_only, b"caf\xe9\n"), "");
+    assert_eq!(indexable_text_at(&read_only, &file), "");
+
+    let large = BufferDocument {
+        size_bytes: jotra_core::file_ops::THRESHOLD_NORMAL_BYTES + 1,
+        ..doc
+    };
+    assert_eq!(indexable_text_at(&large, &file), "");
 }
 
 #[test]
@@ -842,7 +944,12 @@ fn rename_to_file_moves_the_note_row_in_the_index() {
     let renamed = notes_root().join("ren-row-b.md");
     std::fs::rename(note_path("ren-row-a"), &renamed).expect("rename the file");
     store
-        .rename_to_file("ren-row-a", renamed.to_str().unwrap(), "ren-row-b")
+        .rename_to_file(
+            "ren-row-a",
+            renamed.to_str().unwrap(),
+            "ren-row-b",
+            "body text",
+        )
         .expect("rename_to_file");
 
     let after = jotra_storage::notes_index::index_key(&renamed);

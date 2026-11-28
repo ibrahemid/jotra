@@ -95,6 +95,8 @@ fn an_assistant_turn_carries_its_proposals_and_no_attachments() {
                 before_hash: "abc".to_string(),
                 new_content: "new text\n".to_string(),
                 status: ProposalStatus::Pending,
+                applied_hash: None,
+                undone: false,
             }],
             ..AssistantReply::default()
         },
@@ -138,6 +140,8 @@ fn the_request_carries_roles_and_text_and_nothing_else() {
                 before_hash: "abc".to_string(),
                 new_content: "new\n".to_string(),
                 status: ProposalStatus::Pending,
+                applied_hash: None,
+                undone: false,
             }],
             ..AssistantReply::default()
         },
@@ -172,6 +176,8 @@ fn offered(path: &str, summary: &str, status: ProposalStatus) -> Conversation {
                 before_hash: "abc".to_string(),
                 new_content: "new\n".to_string(),
                 status,
+                applied_hash: None,
+                undone: false,
             }],
             ..AssistantReply::default()
         },
@@ -255,6 +261,8 @@ fn a_proposal_status_is_set_by_turn_and_path() {
                 before_hash: "abc".to_string(),
                 new_content: "new\n".to_string(),
                 status: ProposalStatus::Pending,
+                applied_hash: None,
+                undone: false,
             }],
             ..AssistantReply::default()
         },
@@ -457,4 +465,59 @@ fn an_assistant_turn_records_what_it_dropped_and_that_it_was_cut_off() {
     let value = serde_json::to_value(turn).expect("a turn serialises");
     assert_eq!(value["dropped"][0]["reason"], "unterminated_block");
     assert_eq!(value["truncated"], true);
+}
+
+#[test]
+fn an_applied_proposal_keeps_what_the_note_was_left_holding() {
+    let mut conversation = offered("Plan.md", "s", ProposalStatus::Pending);
+    assert!(conversation.record_applied(1, "Plan.md", "after".to_string(), "t2".to_string()));
+    let stored = &conversation.turns[1].proposals[0];
+    assert_eq!(stored.status, ProposalStatus::Applied);
+    assert_eq!(stored.applied_hash.as_deref(), Some("after"));
+    assert!(stored.new_content.is_empty());
+    assert!(!stored.undone);
+    assert!(!conversation.record_applied(1, "Other.md", "after".to_string(), "t3".to_string()));
+}
+
+#[test]
+fn an_undone_proposal_stays_applied_for_an_earlier_build() {
+    let mut conversation = offered("Plan.md", "s", ProposalStatus::Pending);
+    conversation.record_applied(1, "Plan.md", "after".to_string(), "t2".to_string());
+    assert!(conversation.record_undone(1, "Plan.md", "t3".to_string()));
+    assert!(!conversation.record_undone(4, "Plan.md", "t3".to_string()));
+
+    let value = serde_json::to_value(&conversation.turns[1].proposals[0]).expect("serialises");
+    assert_eq!(value["status"], "applied");
+    assert_eq!(value["undone"], true);
+    assert_eq!(value["applied_hash"], "after");
+    assert_eq!(conversation.updated_at, "t3");
+}
+
+#[test]
+fn a_proposal_written_before_undo_was_kept_reads_without_it() {
+    let json = r#"{"path":"Plan.md","summary":"s","before_hash":"abc","new_content":"","status":"applied"}"#;
+    let stored: StoredProposal = serde_json::from_str(json).expect("an earlier file still reads");
+    assert_eq!(stored.applied_hash, None);
+    assert!(!stored.undone);
+    let value = serde_json::to_value(&stored).expect("serialises");
+    assert!(value.get("applied_hash").is_none());
+    assert!(value.get("undone").is_none());
+}
+
+#[test]
+fn opening_an_earlier_file_drops_the_text_of_decided_proposals() {
+    for (status, dropped) in [
+        (ProposalStatus::Applied, true),
+        (ProposalStatus::Discarded, true),
+        (ProposalStatus::Pending, false),
+        (ProposalStatus::Refused, false),
+    ] {
+        let mut conversation = offered("Plan.md", "s", status);
+        assert_eq!(conversation.drop_decided_text(), dropped);
+        assert_eq!(
+            conversation.turns[1].proposals[0].new_content.is_empty(),
+            dropped
+        );
+        assert!(!conversation.drop_decided_text());
+    }
 }

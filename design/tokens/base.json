@@ -98,6 +98,20 @@
           "unit": "px"
         }
       },
+      "measure-narrow": {
+        "$description": "Reading width, Narrow: 36rem at a 16px root.",
+        "$value": {
+          "value": 576,
+          "unit": "px"
+        }
+      },
+      "measure-wide": {
+        "$description": "Reading width, Wide: 56rem at a 16px root.",
+        "$value": {
+          "value": 896,
+          "unit": "px"
+        }
+      },
       "pad-x": {
         "$value": {
           "value": 32,

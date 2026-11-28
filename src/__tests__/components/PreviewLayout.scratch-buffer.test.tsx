@@ -33,7 +33,6 @@ vi.mock("../../services/tauri", () => ({
   // Preview IPC.
   previewListRenderers: vi.fn().mockResolvedValue([]),
   previewForceRender: mocks.forceRender,
-  previewRender: mocks.forceRender,
   previewClose: mocks.previewClose,
   previewGetLayout: mocks.previewGetLayout,
   previewSetLayout: mocks.previewSetLayout,

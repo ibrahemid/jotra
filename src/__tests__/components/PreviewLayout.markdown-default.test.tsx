@@ -22,11 +22,6 @@ vi.mock("../../services/tauri", () => ({
     used_fallback_stylesheet: true,
     parser_warnings: [],
   }),
-  previewRender: vi.fn().mockResolvedValue({
-    kind: "rendered" as const,
-    used_fallback_stylesheet: true,
-    parser_warnings: [],
-  }),
   previewClose: vi.fn().mockResolvedValue(undefined),
   previewGetLayout: mocks.previewGetLayout,
   previewSetLayout: mocks.previewSetLayout,

@@ -113,6 +113,9 @@ fn make_state(dir: &TempDir) -> AppState {
         preview_registry: Arc::new(RwLock::new(registry)),
         preview_render_cache: Arc::new(RenderCache::new()),
         layout_state: LayoutStateStore::new(open_database(&db_path).expect("layout db")),
+        tab_rows: jotra_storage::tab_rows::TabRowStore::new(
+            open_database(&db_path).expect("tab rows db"),
+        ),
         command_usage: jotra_storage::command_usage::CommandUsageStore::new(
             open_database(&db_path).expect("usage db"),
         ),
@@ -147,7 +150,7 @@ fn mock_app(state: AppState) -> (tauri::App<MockRuntime>, WebviewWindow<MockRunt
             jotra_tauri_lib::commands::buffer::peek_buffer_content,
             jotra_tauri_lib::commands::buffer::save_buffer_content,
             jotra_tauri_lib::commands::buffer::save_buffer_changes,
-            jotra_tauri_lib::commands::preview::preview_render,
+            jotra_tauri_lib::commands::preview::preview_force_render,
             jotra_tauri_lib::commands::workspace::search_workspace_files,
             jotra_tauri_lib::commands::prompt::prompt_context_pack,
             jotra_tauri_lib::commands::workspace::list_workspace_dir,
@@ -374,7 +377,7 @@ fn save_buffer_changes_returns_its_thread_while_its_work_waits() {
 }
 
 #[test]
-fn preview_render_returns_its_thread_while_its_work_waits() {
+fn preview_force_render_returns_its_thread_while_its_work_waits() {
     let dir = TempDir::new().unwrap();
     let (app, window) = mock_app(make_state(&dir));
 
@@ -385,7 +388,7 @@ fn preview_render_returns_its_thread_while_its_work_waits() {
         .wait();
     let sent = dispatch(
         &window,
-        "preview_render",
+        "preview_force_render",
         json!({
             "bufferId": "b1",
             "contentType": "markdown",
@@ -514,10 +517,10 @@ fn review_answer_returns_its_thread_while_its_work_waits() {
     );
 }
 
-/// Saves of one note sent one after the other land in that order, even when
-/// all of them are waiting on an earlier write of the note when they arrive.
+/// Saves of one note land in the order they took their places, even when all
+/// of them are waiting on an earlier write of the note when they arrive.
 #[test]
-fn saves_to_one_note_land_in_the_order_they_were_sent() {
+fn saves_to_one_note_land_in_the_order_they_took_their_places() {
     let dir = TempDir::new().unwrap();
     let (app, window) = mock_app(make_state(&dir));
     let path = dir.path().join("a.md");
@@ -650,7 +653,7 @@ fn shell_budget_of_preview_render_of_a_long_note() {
     let start = Instant::now();
     let sent = dispatch(
         &window,
-        "preview_render",
+        "preview_force_render",
         json!({
             "bufferId": id,
             "contentType": "markdown",
@@ -663,7 +666,7 @@ fn shell_budget_of_preview_render_of_a_long_note() {
     sent.answer().expect("render");
     let work = start.elapsed();
     eprintln!(
-        "shell budget: preview_render of 5 MB with {links} wikilinks (held / work) {} / {} ms",
+        "shell budget: preview_force_render of 5 MB with {links} wikilinks (held / work) {} / {} ms",
         millis(held),
         millis(work)
     );

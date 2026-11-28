@@ -1,8 +1,10 @@
 import { createSignal, createRoot, createEffect, createMemo, on } from "solid-js";
 import {
   aiCheckConnection,
+  aiCheckConnectionUnprompted,
   aiConsentHost,
   aiListModels,
+  aiListModelsUnprompted,
   aiProbeLocal,
   aiOpenrouterCancel,
   aiOpenrouterConnect,
@@ -42,6 +44,15 @@ function localLabel(): string {
   return aiProvidersStore.byId(id)?.label ?? id;
 }
 
+/** A local runtime set to require its own key refuses every request, since
+ * a server on this computer is sent none. */
+function localKeyRefused(): ConnectionDisplay {
+  return {
+    text: `${localLabel()} asks for an API key. Jotra sends no key to a server on this computer.`,
+    tone: "error",
+  };
+}
+
 /** Why Apple's on-device model cannot answer, by the word the check carries. */
 const ON_DEVICE_UNAVAILABLE: Record<string, ConnectionDisplay> = {
   apple_intelligence_off: {
@@ -73,7 +84,9 @@ export function connectionDisplay(
     case "model_missing":
       return { text: `Connected, but "${status.detail || model}" is not available`, tone: "warn" };
     case "unauthorized":
-      return { text: `${status.detail} rejected the API key. Check it.`, tone: "error" };
+      return providerIsLocal()
+        ? localKeyRefused()
+        : { text: `${status.detail} rejected the API key. Check it.`, tone: "error" };
     case "server_error":
       return { text: `The server returned status ${status.detail}`, tone: "error" };
     case "refused":
@@ -99,7 +112,9 @@ export function modelListDisplay(error: ModelListError, host: string): Connectio
     case "timeout":
       return { text: `No response from ${host} within 5 seconds`, tone: "error" };
     case "unauthorized":
-      return { text: `${host} rejected the API key. Check it.`, tone: "error" };
+      return providerIsLocal()
+        ? localKeyRefused()
+        : { text: `${host} rejected the API key. Check it.`, tone: "error" };
     case "status":
       return { text: `The server returned status ${error.code}`, tone: "error" };
     case "malformed":
@@ -137,11 +152,21 @@ function createAiConnectionStore() {
 
   /** Reads the model list for the connection's provider. */
   async function refreshCatalog(): Promise<void> {
+    await readCatalog((provider) => aiListModels(provider));
+  }
+
+  /** Reads the model list as a surface opens, leaving it unread when the
+   * read would raise a keychain prompt nobody asked for. */
+  async function refreshCatalogUnprompted(): Promise<void> {
+    await readCatalog((provider) => aiListModelsUnprompted(provider));
+  }
+
+  async function readCatalog(read: (provider: string) => Promise<ModelCatalog | null>): Promise<void> {
     const asked = currentProvider();
     setListing(true);
     try {
-      const answered = await aiListModels(asked);
-      if (answered.provider !== currentProvider()) return;
+      const answered = await read(asked);
+      if (!answered || answered.provider !== currentProvider()) return;
       setHeld(answered);
     } catch {
       setHeld(null);
@@ -154,7 +179,9 @@ function createAiConnectionStore() {
    * the typed base URL or the hosts consented to change, rather than when a
    * surface happens to open. A consent counts because a hosted list waits for
    * it. Only those fields are followed (AM-09): a write to any other setting
-   * sends no request. Idempotent, and the root lives as long as the app does. */
+   * sends no request. The first read comes from a surface opening, so it
+   * raises no keychain prompt. Idempotent, and the root lives as long as the
+   * app does. */
   function watch(): void {
     if (watching) return;
     watching = true;
@@ -163,7 +190,11 @@ function createAiConnectionStore() {
         const ai = configStore.config().ai;
         return [ai.provider, ai.base_url, ...ai.consented_hosts].join("\n");
       });
-      createEffect(on(target, () => void refreshCatalog()));
+      createEffect(
+        on(target, (_, previous) =>
+          void (previous === undefined ? refreshCatalogUnprompted() : refreshCatalog()),
+        ),
+      );
     });
   }
 
@@ -227,6 +258,21 @@ function createAiConnectionStore() {
     }
   }
 
+  /** The check a surface runs as it opens. A check that would raise a
+   * keychain prompt nobody asked for is not run, and the status stays
+   * unchecked. */
+  async function checkUnprompted(): Promise<void> {
+    setChecking(true);
+    try {
+      const answered = await aiCheckConnectionUnprompted();
+      if (answered) setStatus(answered);
+    } catch {
+      setStatus({ reachable: false, model_listed: null, kind: "error", detail: "", models: [] });
+    } finally {
+      setChecking(false);
+    }
+  }
+
   function scheduleCheck(delayMs = 400): void {
     if (debounceTimer) clearTimeout(debounceTimer);
     debounceTimer = setTimeout(() => {
@@ -248,6 +294,7 @@ function createAiConnectionStore() {
     status,
     checking,
     check,
+    checkUnprompted,
     /** Whether the connection points at a runtime on this machine, which is
      * what makes a refused port an offline local server rather than an
      * unreachable host. */

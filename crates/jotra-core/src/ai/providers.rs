@@ -360,11 +360,13 @@ pub fn provider(id: &str) -> Option<&'static ProviderInfo> {
 
 /// The rows this machine shows: every row, less the on-device one where the
 /// system has no on-device model to offer
-/// ([`super::on_device::offers_on_device`]).
-pub fn offered_providers(on_device: bool) -> Vec<ProviderInfo> {
+/// ([`super::on_device::offers_on_device`]). The configured row stays either
+/// way, so a config carried over from another machine still names a row the
+/// picker can show and the connection line can explain.
+pub fn offered_providers(on_device: bool, configured: &str) -> Vec<ProviderInfo> {
     PROVIDERS
         .iter()
-        .filter(|row| on_device || row.group != ProviderGroup::OnDevice)
+        .filter(|row| on_device || row.group != ProviderGroup::OnDevice || row.id == configured)
         .copied()
         .collect()
 }
@@ -534,16 +536,28 @@ mod tests {
         assert!(row.base_url.is_empty() && row.models_url.is_empty());
         assert_eq!(models_url_for("apple", "https://typed.example/v1"), None);
 
-        let without = offered_providers(false);
+        let without = offered_providers(false, "ollama");
         assert!(without.iter().all(|row| row.id != "apple"));
         assert_eq!(without.len(), PROVIDERS.len() - 1);
-        let with = offered_providers(true);
+        let with = offered_providers(true, "ollama");
         assert_eq!(with.len(), PROVIDERS.len());
         assert_eq!(with[0].id, "ollama");
         assert_eq!(
             serde_json::to_string(&ProviderGroup::OnDevice).unwrap(),
             "\"on_device\""
         );
+    }
+
+    #[test]
+    fn a_configured_on_device_row_stays_where_the_system_has_no_model() {
+        let carried = offered_providers(false, "apple");
+        assert_eq!(carried, offered_providers(true, "ollama"));
+        assert_eq!(
+            carried.iter().filter(|row| row.id == "apple").count(),
+            1,
+            "the configured row is listed once"
+        );
+        assert_eq!(offered_providers(true, "apple").len(), PROVIDERS.len());
     }
 
     #[test]

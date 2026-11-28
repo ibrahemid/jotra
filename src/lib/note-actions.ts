@@ -206,6 +206,18 @@ export async function saveNoteAs(id: string): Promise<void> {
 }
 
 /**
+ * Saves a note in UTF-8, for a save its file's encoding could not hold. The
+ * note's row comes back so the status bar names the encoding it now has. A
+ * write that does not land reports to the save failure bar like any other.
+ */
+export async function saveNoteAsUtf8(id: string): Promise<void> {
+  const win = windowRegistry.getActive();
+  if (!win) return;
+  const result = await win.editor.saveAsUtf8(id);
+  if (result.ok) await bufferRegistry.refreshBuffer(id).catch(() => undefined);
+}
+
+/**
  * Carries out what the person chose about a file that changed outside Jotra.
  *
  * The text sent is the one on screen, because that is the only place the
