@@ -7,26 +7,19 @@
 //! and listens on the event bus the bridge forwards from, so what is asserted
 //! is the event the frontend receives and the rows a re-read would find.
 
+#[path = "support/app_state.rs"]
+mod app_state;
+
+use app_state::AppStateBuilder;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::AtomicBool;
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, Mutex};
 use std::time::SystemTime;
 
-use jotra_core::config::JotraConfig;
 use jotra_core::events::bus::{EventBus, JotraEvent};
 use jotra_core::notes::line_ending::LineEnding;
 use jotra_core::notes::reload::ChangeChoice;
-use jotra_core::preview::ContentRendererRegistry;
 use jotra_core::text_encoding::TextEncoding;
-use jotra_core::update::UpdatePhase;
-use jotra_core::watcher::reconcile::ReconcileGate;
-use jotra_plugin::transform::TransformRegistry;
-use jotra_storage::buffer_store::BufferStore;
-use jotra_storage::config_store::ConfigStore;
-use jotra_storage::database::connection::open_database;
-use jotra_storage::database::migrations::run_migrations;
-use jotra_storage::layout_state::LayoutStateStore;
-use jotra_storage::notes_index::{self, NotesIndexStore, ReconcileOutcome};
+use jotra_storage::notes_index::{self, ReconcileOutcome};
 use jotra_tauri_lib::commands::buffer::{
     close_debounce_window, reindex_settled_buffer, resolve_external_change_at,
     resolve_external_change_inner, restore_note_file_inner, save_buffer_content_inner,
@@ -41,91 +34,12 @@ use jotra_tauri_lib::commands::notes::{
 };
 use jotra_tauri_lib::events::bus_bridge::attach_bridge_behind_notes_index;
 use jotra_tauri_lib::events::JotraFrontendEvent;
-use jotra_tauri_lib::preview::handler::RenderCache;
-use jotra_tauri_lib::quit::QuitState;
-use jotra_tauri_lib::security::{canonicalize_for_authorization, AuthorizedPaths};
+use jotra_tauri_lib::security::canonicalize_for_authorization;
 use jotra_tauri_lib::state::AppState;
-use jotra_tauri_lib::watcher::handler::create_ignore_set;
 use tempfile::TempDir;
 
 fn make_state(dir: &TempDir) -> AppState {
-    let jotra_dir = dir.path().to_path_buf();
-    let buffers_dir = jotra_dir.join("buffers");
-    std::fs::create_dir_all(&buffers_dir).expect("buffers dir");
-
-    let notes_root = jotra_dir.join("Jotra");
-    std::fs::create_dir_all(&notes_root).expect("notes folder");
-    let notes_root = jotra_tauri_lib::security::canonicalize_root(&notes_root).expect("canonical");
-
-    let db_path = jotra_dir.join("jotra.db");
-    let conn = open_database(&db_path).expect("open db");
-    run_migrations(&conn).expect("migrations");
-
-    let note_history = Arc::new(
-        jotra_storage::note_history::NoteHistoryStore::open(&jotra_dir).expect("version store"),
-    );
-
-    let mut store = BufferStore::new(conn, buffers_dir.clone());
-    store.set_notes_root(notes_root.clone());
-
-    AppState {
-        store: Mutex::new(store),
-        config_store: ConfigStore::new(jotra_dir.join("config.toml")),
-        config: Mutex::new(JotraConfig::default()),
-        jotra_dir,
-        buffers_dir,
-        notes_root: RwLock::new(notes_root),
-        first_run: false,
-        first_run_finished: std::sync::atomic::AtomicBool::new(false),
-        menu_apps: std::sync::Mutex::new(None),
-        retitle_watch: std::sync::Arc::new(jotra_tauri_lib::first_run::RetitleWatch::new()),
-        notes_root_fallback: RwLock::new(None),
-        watcher_ignore: create_ignore_set(),
-        watcher: Mutex::new(None),
-        notes_watcher: Mutex::new(None),
-        open_file_watcher: Mutex::new(None),
-        file_tracking: Mutex::new(None),
-        notes_index: Arc::new(NotesIndexStore::open(&db_path).expect("notes index db")),
-        note_history,
-        notes_index_cancel: Arc::new(AtomicBool::new(false)),
-        notes_reconcile: Arc::new(ReconcileGate::new()),
-        quit: Arc::new(QuitState::new()),
-        removal_holds: Default::default(),
-        pending_opens: Mutex::new(Vec::new()),
-        pending_lines: Mutex::new(Default::default()),
-        cli_waits: Mutex::new(Default::default()),
-        frontend_ready: AtomicBool::new(false),
-        window_revealed: AtomicBool::new(false),
-        window_dismissed: AtomicBool::new(false),
-        transforms: RwLock::new(TransformRegistry::new()),
-        event_bus: Arc::new(EventBus::new()),
-        update_phase: Mutex::new(UpdatePhase::default()),
-        authorized_paths: AuthorizedPaths::new(),
-        preview_registry: Arc::new(RwLock::new(ContentRendererRegistry::new())),
-        preview_render_cache: Arc::new(RenderCache::new()),
-        layout_state: LayoutStateStore::new(open_database(&db_path).expect("layout db")),
-        tab_rows: jotra_storage::tab_rows::TabRowStore::new(
-            open_database(&db_path).expect("tab rows db"),
-        ),
-        command_usage: jotra_storage::command_usage::CommandUsageStore::new(
-            open_database(&db_path).expect("usage db"),
-        ),
-        config_diagnostics: std::sync::Mutex::new(Vec::new()),
-        recovered_buffers: Mutex::new(Vec::new()),
-        was_dirty_shutdown: false,
-        workspace_root: Mutex::new(None),
-        workspace_watcher: Mutex::new(None),
-        inbox_root: Mutex::new(None),
-        inbox_watcher: Mutex::new(None),
-        fts_scheduler: jotra_tauri_lib::fts_scheduler::FtsScheduler::new(),
-        workspace_index: Arc::new(RwLock::new(
-            jotra_tauri_lib::workspace_index::WorkspaceIndex::new(None),
-        )),
-        search_generation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
-        last_disk_hash: Mutex::new(std::collections::HashMap::new()),
-        source_records: Mutex::new(std::collections::HashMap::new()),
-        buffer_writes: Default::default(),
-    }
+    AppStateBuilder::new(dir.path()).store_notes_root().build()
 }
 
 /// One `notes:indexed` as the bus delivered it, with what a reader asking the

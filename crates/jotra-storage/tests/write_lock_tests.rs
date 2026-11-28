@@ -261,6 +261,51 @@ fn a_held_lock_holds_off_a_second_holder_until_it_is_let_go() {
 }
 
 #[test]
+fn a_holder_is_counted_as_waiting_only_while_another_holds_the_lock() {
+    let dir = TempDir::new().expect("temp dir");
+    let lock = WriteLock::in_data_folder(dir.path());
+    let elsewhere = WriteLock::in_data_folder(&dir.path().join("elsewhere"));
+    drop(lock.hold().expect("the lock is free"));
+    assert_eq!(
+        lock.waiting(),
+        0,
+        "a holder that had it at once never waited"
+    );
+
+    let held = lock.hold().expect("the lock is free");
+    let (done, finished) = mpsc::channel();
+    let second = {
+        let lock = lock.clone();
+        std::thread::spawn(move || {
+            let had = lock.hold().is_some();
+            done.send(()).expect("the test is listening");
+            had
+        })
+    };
+    let deadline = std::time::Instant::now() + Duration::from_secs(15);
+    while lock.waiting() == 0 {
+        assert!(
+            finished.try_recv().is_err(),
+            "the second holder came back without waiting"
+        );
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the second holder never waited"
+        );
+        std::thread::yield_now();
+    }
+    assert_eq!(lock.waiting(), 1);
+    assert_eq!(elsewhere.waiting(), 0, "a wait is counted on its own lock");
+    drop(held);
+    assert!(second.join().expect("the second holder"), "it had the lock");
+    assert_eq!(
+        lock.waiting(),
+        0,
+        "a holder that has the lock is not waiting"
+    );
+}
+
+#[test]
 fn a_lock_that_cannot_be_had_does_not_stop_a_save() {
     let fixture = fixture();
     let unopenable = WriteLock::in_data_folder(&fixture.data.join("no such folder"));

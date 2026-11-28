@@ -377,7 +377,10 @@ mod metadata {
     }
 
     /// One extended attribute's value.
-    fn read_xattr(path: &std::ffi::CString, name: &std::ffi::CString) -> Option<Vec<u8>> {
+    pub(super) fn read_xattr(
+        path: &std::ffi::CString,
+        name: &std::ffi::CString,
+    ) -> Option<Vec<u8>> {
         // SAFETY: both strings are valid and NUL-terminated; the size probe passes
         // a null buffer with length 0.
         let size = unsafe { get_xattr(path.as_ptr(), name.as_ptr(), std::ptr::null_mut(), 0) };
@@ -403,7 +406,11 @@ mod metadata {
     }
 
     /// Hangs one extended attribute on an open file. `true` when it landed.
-    fn write_xattr(fd: std::os::unix::io::RawFd, name: &std::ffi::CString, value: &[u8]) -> bool {
+    pub(super) fn write_xattr(
+        fd: std::os::unix::io::RawFd,
+        name: &std::ffi::CString,
+        value: &[u8],
+    ) -> bool {
         // SAFETY: `fd` is the temp file this function was handed, still open;
         // `name` is NUL-terminated and `value` is read for exactly its length.
         unsafe { set_xattr(fd, name.as_ptr(), value.as_ptr().cast(), value.len()) == 0 }
@@ -822,6 +829,16 @@ pub(crate) fn prepare_replacement(
     target: &Path,
     bytes: &[u8],
 ) -> Result<PreparedReplacement, AtomicWriteError> {
+    prepare_replacement_synced_by(target, bytes, std::fs::File::sync_all)
+}
+
+/// [`prepare_replacement`], with the sync that puts the replacement on the
+/// disk handed in.
+fn prepare_replacement_synced_by(
+    target: &Path,
+    bytes: &[u8],
+    sync: impl FnOnce(&std::fs::File) -> io::Result<()>,
+) -> Result<PreparedReplacement, AtomicWriteError> {
     let dir = target.parent().ok_or_else(|| {
         io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -854,7 +871,7 @@ pub(crate) fn prepare_replacement(
     #[cfg(any(target_os = "macos", target_os = "linux"))]
     inherit_xattrs(target, tmp.as_file());
 
-    tmp.as_file_mut().sync_all()?;
+    sync(tmp.as_file())?;
 
     Ok(PreparedReplacement {
         tmp,
@@ -945,5 +962,140 @@ impl PlacedReplacement {
         if let Ok(dir_handle) = std::fs::File::open(&self.dir) {
             let _ = dir_handle.sync_all();
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// What the replacement carried when its sync was called.
+    #[derive(Debug, PartialEq)]
+    struct AtSync {
+        mode: Option<u32>,
+        tag: Option<Vec<u8>>,
+    }
+
+    #[cfg(target_os = "macos")]
+    const TAG: &str = "com.apple.metadata:_kMDItemUserTags";
+    #[cfg(target_os = "linux")]
+    const TAG: &str = "user.jotra.tag";
+
+    /// Gives the destination a mode a new temp file does not have, and answers
+    /// with it.
+    fn give_mode(target: &Path) -> Option<u32> {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+
+            std::fs::set_permissions(target, std::fs::Permissions::from_mode(0o640))
+                .expect("set the destination's mode");
+            Some(0o640)
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = target;
+            None
+        }
+    }
+
+    fn mode_of(file: &std::fs::File) -> Option<u32> {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+
+            Some(file.metadata().expect("stat").permissions().mode() & 0o7777)
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = file;
+            None
+        }
+    }
+
+    /// Tags the destination, and answers with the tag's value.
+    fn give_tag(target: &Path) -> Option<Vec<u8>> {
+        #[cfg(any(target_os = "macos", target_os = "linux"))]
+        {
+            use std::os::unix::io::AsRawFd;
+
+            let name = std::ffi::CString::new(TAG).expect("attribute name");
+            let file = std::fs::File::open(target).expect("open the destination");
+            assert!(
+                metadata::write_xattr(file.as_raw_fd(), &name, b"Red\n"),
+                "tag the destination: {}",
+                io::Error::last_os_error()
+            );
+            Some(b"Red\n".to_vec())
+        }
+        #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+        {
+            let _ = target;
+            None
+        }
+    }
+
+    /// The tag on the replacement being written in `dir`.
+    fn tag_in(dir: &Path) -> Option<Vec<u8>> {
+        #[cfg(any(target_os = "macos", target_os = "linux"))]
+        {
+            use std::os::unix::ffi::OsStrExt;
+
+            let path = std::ffi::CString::new(replacement_in(dir).as_os_str().as_bytes())
+                .expect("replacement path");
+            let name = std::ffi::CString::new(TAG).expect("attribute name");
+            metadata::read_xattr(&path, &name)
+        }
+        #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+        {
+            let _ = dir;
+            None
+        }
+    }
+
+    /// The temp file a save is being written to, the one entry in `dir` named
+    /// with [`TEMP_FILE_PREFIX`].
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    fn replacement_in(dir: &Path) -> std::path::PathBuf {
+        let mut found = std::fs::read_dir(dir)
+            .expect("read the folder")
+            .map(|entry| entry.expect("a folder entry").path())
+            .filter(|path| {
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.starts_with(TEMP_FILE_PREFIX))
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(found.len(), 1, "one replacement in {}", dir.display());
+        found.remove(0)
+    }
+
+    #[test]
+    fn a_replacement_has_the_destinations_mode_and_attributes_before_it_is_synced() {
+        let dir = tempfile::TempDir::new().expect("a temp folder");
+        let target = dir.path().join("note.md");
+        std::fs::write(&target, "the old words").expect("write the destination");
+        let expected = AtSync {
+            mode: give_mode(&target),
+            tag: give_tag(&target),
+        };
+
+        let mut at_sync = None;
+        let prepared = prepare_replacement_synced_by(&target, b"the new words", |file| {
+            at_sync = Some(AtSync {
+                mode: mode_of(file),
+                tag: tag_in(dir.path()),
+            });
+            file.sync_all()
+        })
+        .expect("prepare the replacement");
+        drop(prepared);
+
+        assert_eq!(at_sync, Some(expected));
+        assert_eq!(
+            std::fs::read_to_string(&target).expect("read the destination"),
+            "the old words",
+            "a prepared replacement left the destination alone"
+        );
     }
 }

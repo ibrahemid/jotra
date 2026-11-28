@@ -183,11 +183,18 @@ fn sockets_of(pid: u32) -> Vec<String> {
         .collect()
 }
 
+/// The TCP and UDP endpoints process `pid` holds, as `netstat -ano` lists them
+/// with their owner's process id last.
 #[cfg(windows)]
 fn sockets_of(pid: u32) -> Vec<String> {
     let system = std::env::var_os("SystemRoot").unwrap_or_else(|| "C:\\Windows".into());
     let netstat = Path::new(&system).join("System32").join("netstat.exe");
     let output = Command::new(netstat).arg("-ano").output().expect("netstat");
+    assert!(
+        output.status.success(),
+        "netstat answered {}",
+        output.status
+    );
     let pid = pid.to_string();
     String::from_utf8_lossy(&output.stdout)
         .lines()

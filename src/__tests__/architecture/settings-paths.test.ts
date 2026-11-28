@@ -10,7 +10,7 @@ function repoPath(path: string): string {
   return relative(REPO_ROOT, path).split(sep).join("/");
 }
 
-const ROOTS = ["src", "site/src", "docs", "README.md", "crates", "src-tauri/src"];
+const ROOTS = ["src", "site/src", "demo", "docs", "README.md", "crates", "src-tauri/src"];
 const EXTENSIONS = /\.(ts|tsx|astro|md|rs)$/;
 const SKIPPED_DIRS = new Set(["node_modules", "target", "dist", "generated", "__tests__", "tests"]);
 const SKIPPED_PATHS = ["docs/adr"];
@@ -19,12 +19,13 @@ const SKIPPED_PATHS = ["docs/adr"];
 // copy-spelling.test.ts: each names the panel as it was in that version.
 const ALLOWED = ["site/src/data/changelog.ts"];
 
-const SEP = String.raw`\s*(?:,|&rarr;|→)\s*`;
+const SEP = String.raw`\s*(?:,|&rarr;|→|>|&gt;)\s*`;
 // The OS's own Settings app is skipped.
 const PATH = new RegExp(
-  String.raw`(?<!(?:System|Windows) )\bSettings(?:\s*\([^)]*\))?${SEP}([A-Z][a-z]+)\b(?:${SEP}([^\n]{0,120}))?`,
+  String.raw`(?<!(?:System|Windows) )\bSettings(?:\s*\([^)]*\))?${SEP}([A-Z][A-Za-z]+(?: & [a-z]+)?)\b(?:${SEP}([^\n]{0,120}))?`,
   "g",
 );
+const WINDOWS_SETTINGS_PAGES = new Set(["Bluetooth & devices", "Network & internet", "Time & language", "Privacy & security"]);
 
 const SECTIONS = new Set<string>(Object.values(SECTION_LABELS));
 
@@ -69,6 +70,7 @@ function stalePaths(rel: string, source: string): string[] {
   for (const match of text.matchAll(PATH)) {
     const [whole, section, rest] = match;
     const line = text.slice(0, match.index).split("\n").length;
+    if (WINDOWS_SETTINGS_PAGES.has(section)) continue;
     if (!SECTIONS.has(section)) {
       found.push(`${rel}:${line} names no section "${section}": ${whole.slice(0, 80)}`);
       continue;
@@ -98,6 +100,24 @@ describe("Settings paths in shipped text", () => {
     expect(stalePaths("a.md", "Pick it in Settings, Integrations, Folder to watch for new files.")).toEqual([]);
     expect(stalePaths("a.md", "Turn it on in System Settings, Login Items.")).toEqual([]);
     expect(stalePaths("a.ts", "// Settings, Files moved\nconst x = 1;")).toEqual([]);
+  });
+
+  it("reads a path written with > and a section named in capitals", () => {
+    expect(stalePaths("a.md", "Open Settings > AI > Model.")).toEqual(['a.md:1 names no section "AI": Settings > AI > Model.']);
+    expect(stalePaths("a.astro", "<code>Settings &gt; Files</code>")).toHaveLength(1);
+    expect(stalePaths("a.rs", '"Install it from Settings > Advanced > Terminal command."')).toEqual([
+      'a.rs:1 puts "Terminal command" under Advanced, it is under Integrations',
+    ]);
+    expect(stalePaths("a.rs", '"Enter a model in Settings > Apps > Dictation."')).toEqual([]);
+    expect(stalePaths("a.rs", '"Allow it in Settings > Privacy & security > Microphone."')).toEqual([]);
+    expect(stalePaths("a.md", "Open Settings > Files & folders.")).toEqual([
+      'a.md:1 names no section "Files & folders": Settings > Files & folders',
+    ]);
+  });
+
+  it("reads the demo's text as well as the app's and the site's", () => {
+    expect(ROOTS).toContain("demo");
+    expect(walk(resolve(REPO_ROOT, "demo")).map(repoPath)).toContain("demo/backend/ai.ts");
   });
 
   it("every Settings path names a section the panel has, and a row where it lives", () => {

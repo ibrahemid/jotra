@@ -1,120 +1,22 @@
-use std::sync::atomic::AtomicBool;
-use std::sync::{Arc, Mutex, RwLock};
+#[path = "support/app_state.rs"]
+mod app_state;
 
-use jotra_core::config::JotraConfig;
-use jotra_core::events::bus::EventBus;
-use jotra_core::preview::ContentRendererRegistry;
-use jotra_core::update::UpdatePhase;
-use jotra_core::watcher::reconcile::ReconcileGate;
-use jotra_plugin::transform::TransformRegistry;
-use jotra_storage::buffer_store::BufferStore;
-use jotra_storage::config_store::ConfigStore;
-use jotra_storage::database::connection::open_database;
-use jotra_storage::database::migrations::run_migrations;
-use jotra_storage::layout_state::LayoutStateStore;
-use jotra_storage::notes_index::NotesIndexStore;
+use app_state::AppStateBuilder;
+use std::path::PathBuf;
+use std::sync::mpsc;
+use std::time::{Duration, Instant};
+
+use jotra_core::events::bus::JotraEvent;
 use jotra_tauri_lib::commands::buffer::save_buffer_content_inner;
 use jotra_tauri_lib::commands::file::open_file_from_path;
 use jotra_tauri_lib::commands::inbox::{clear_inbox_inner, set_inbox_path_from_path};
-use jotra_tauri_lib::preview::handler::RenderCache;
-use jotra_tauri_lib::quit::QuitState;
-use jotra_tauri_lib::security::{
-    canonicalize_for_authorization, canonicalize_root, AuthorizedPaths,
-};
+use jotra_tauri_lib::security::{canonicalize_for_authorization, canonicalize_root};
 use jotra_tauri_lib::state::AppState;
-use jotra_tauri_lib::watcher::handler::create_ignore_set;
+use jotra_tauri_lib::watcher::handler::{create_ignore_set, InboxEvents};
 use tempfile::TempDir;
 
 fn make_state(dir: &TempDir) -> AppState {
-    let jotra_dir = dir.path().to_path_buf();
-    let buffers_dir = jotra_dir.join("buffers");
-    std::fs::create_dir_all(&buffers_dir).expect("buffers dir");
-
-    let notes_root = jotra_dir.join("Jotra");
-    std::fs::create_dir_all(&notes_root).expect("notes folder");
-    let notes_root = jotra_tauri_lib::security::canonicalize_root(&notes_root).expect("canonical");
-
-    let db_path = jotra_dir.join("jotra.db");
-    let conn = open_database(&db_path).expect("open db");
-    run_migrations(&conn).expect("migrations");
-    let store = BufferStore::new(conn, buffers_dir.clone());
-
-    let config_path = jotra_dir.join("config.toml");
-    let config_store = ConfigStore::new(config_path);
-
-    let note_history = Arc::new(
-        jotra_storage::note_history::NoteHistoryStore::open(&jotra_dir).expect("version store"),
-    );
-
-    AppState {
-        store: Mutex::new(store),
-        config_store,
-        config: Mutex::new(JotraConfig::default()),
-        jotra_dir,
-        buffers_dir,
-        notes_root: RwLock::new(notes_root),
-        first_run: false,
-        first_run_finished: std::sync::atomic::AtomicBool::new(false),
-        menu_apps: std::sync::Mutex::new(None),
-        retitle_watch: std::sync::Arc::new(jotra_tauri_lib::first_run::RetitleWatch::new()),
-        notes_root_fallback: RwLock::new(None),
-        watcher_ignore: create_ignore_set(),
-        watcher: Mutex::new(None),
-        notes_watcher: Mutex::new(None),
-        open_file_watcher: Mutex::new(None),
-        file_tracking: Mutex::new(None),
-        notes_index: Arc::new(NotesIndexStore::open(&db_path).expect("notes index db")),
-        note_history,
-        notes_index_cancel: Arc::new(AtomicBool::new(false)),
-        notes_reconcile: Arc::new(ReconcileGate::new()),
-        quit: Arc::new(QuitState::new()),
-        removal_holds: Default::default(),
-        pending_opens: Mutex::new(Vec::new()),
-        pending_lines: Mutex::new(Default::default()),
-        cli_waits: Mutex::new(Default::default()),
-        frontend_ready: AtomicBool::new(false),
-        window_revealed: AtomicBool::new(false),
-        window_dismissed: AtomicBool::new(false),
-        transforms: RwLock::new(TransformRegistry::new()),
-        event_bus: Arc::new(EventBus::new()),
-        update_phase: Mutex::new(UpdatePhase::default()),
-        authorized_paths: AuthorizedPaths::new(),
-        preview_registry: Arc::new(RwLock::new(ContentRendererRegistry::new())),
-        preview_render_cache: Arc::new(RenderCache::new()),
-        layout_state: LayoutStateStore::new(open_database(&db_path).expect("layout db")),
-        tab_rows: jotra_storage::tab_rows::TabRowStore::new(
-            open_database(&db_path).expect("tab rows db"),
-        ),
-        command_usage: jotra_storage::command_usage::CommandUsageStore::new(
-            open_database(&db_path).expect("usage db"),
-        ),
-        config_diagnostics: std::sync::Mutex::new(Vec::new()),
-        recovered_buffers: Mutex::new(Vec::new()),
-        was_dirty_shutdown: false,
-        workspace_root: Mutex::new(None),
-        workspace_watcher: Mutex::new(None),
-        inbox_root: Mutex::new(None),
-        inbox_watcher: Mutex::new(None),
-        fts_scheduler: jotra_tauri_lib::fts_scheduler::FtsScheduler::new(),
-        workspace_index: Arc::new(RwLock::new(
-            jotra_tauri_lib::workspace_index::WorkspaceIndex::new(None),
-        )),
-        search_generation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
-        last_disk_hash: Mutex::new(std::collections::HashMap::new()),
-        source_records: Mutex::new(std::collections::HashMap::new()),
-        buffer_writes: Default::default(),
-    }
-}
-
-fn collect_arrivals(state: &AppState) -> Arc<Mutex<Vec<String>>> {
-    let received: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
-    let received_clone = received.clone();
-    state.event_bus.subscribe(move |event| {
-        if let jotra_core::events::bus::JotraEvent::InboxFileArrived { path } = event {
-            received_clone.lock().unwrap().push(path.clone());
-        }
-    });
-    received
+    AppStateBuilder::new(dir.path()).build()
 }
 
 #[test]
@@ -180,34 +82,54 @@ fn clear_inbox_drops_state_watcher_and_config() {
     assert!(persisted.inbox.path.is_none());
 }
 
+/// Long enough for a loaded machine; only a failing run waits it out.
+const DELIVERY_BOUND: Duration = Duration::from_secs(15);
+
+/// Every arrival the bus carries, in the order the watcher's thread said them.
+fn arrivals_on(state: &AppState) -> mpsc::Receiver<String> {
+    let (tx, rx) = mpsc::channel();
+    state.event_bus.subscribe(move |event| {
+        if let JotraEvent::InboxFileArrived { path } = event {
+            let _ = tx.send(path.clone());
+        }
+    });
+    rx
+}
+
+/// The arrivals received up to and including the first one for a path ending
+/// in `name`, or `None` when it did not come within [`DELIVERY_BOUND`].
+fn arrivals_through(rx: &mpsc::Receiver<String>, name: &str) -> Option<Vec<String>> {
+    let deadline = Instant::now() + DELIVERY_BOUND;
+    let mut seen = Vec::new();
+    while let Some(left) = deadline.checked_duration_since(Instant::now()) {
+        let path = rx.recv_timeout(left).ok()?;
+        let done = path.ends_with(name);
+        seen.push(path);
+        if done {
+            return Some(seen);
+        }
+    }
+    None
+}
+
+/// The one test here that runs the platform's watcher. Delivery lags on a
+/// loaded machine, so a file that has not been reported is followed by
+/// another, each under a new name.
 #[test]
-fn inbox_watcher_emits_arrival_on_bus_for_new_file() {
+fn the_platform_watcher_reports_a_new_file_in_the_inbox() {
     let dir = TempDir::new().unwrap();
     let state = make_state(&dir);
     let inbox = TempDir::new().unwrap();
-    let received = collect_arrivals(&state);
+    let rx = arrivals_on(&state);
 
     set_inbox_path_from_path(&state, inbox.path()).expect("set inbox");
 
-    let file = inbox.path().join("report.md");
-    std::fs::write(&file, "# finished").unwrap();
-
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-    loop {
-        if received
-            .lock()
-            .unwrap()
-            .iter()
-            .any(|p| p.ends_with("report.md"))
-        {
-            break;
-        }
-        assert!(
-            std::time::Instant::now() < deadline,
-            "inbox arrival event never arrived"
-        );
-        std::thread::sleep(std::time::Duration::from_millis(50));
-    }
+    let heard = (0..4).any(|attempt| {
+        let name = format!("report-{attempt}.md");
+        std::fs::write(inbox.path().join(&name), "# finished").unwrap();
+        arrivals_through(&rx, &name).is_some()
+    });
+    assert!(heard, "a file written into the inbox never arrived");
 }
 
 #[test]
@@ -219,16 +141,50 @@ fn inbox_watcher_never_emits_for_preexisting_backlog() {
     let backlog = inbox.path().join("old-report.md");
     std::fs::write(&backlog, "stale").unwrap();
 
-    let received = collect_arrivals(&state);
-    set_inbox_path_from_path(&state, inbox.path()).expect("set inbox");
+    let rx = arrivals_on(&state);
+    let root = PathBuf::from(set_inbox_path_from_path(&state, inbox.path()).expect("set inbox"));
+    let watcher = state.inbox_watcher.lock().unwrap();
+    let watcher = watcher.as_ref().expect("the inbox watcher");
 
     std::fs::write(&backlog, "stale but touched").unwrap();
+    watcher
+        .deliver(&[root.join("old-report.md")])
+        .expect("deliver the touch");
+    // Delivered after the touch on the same channel, so the touch has been
+    // judged by the time this arrives.
+    std::fs::write(root.join("fresh.md"), "new").unwrap();
+    watcher
+        .deliver(&[root.join("fresh.md")])
+        .expect("deliver the new file");
 
-    std::thread::sleep(std::time::Duration::from_millis(1500));
-    assert!(
-        received.lock().unwrap().is_empty(),
-        "pre-existing files must never auto-open, even when modified"
+    let seen = arrivals_through(&rx, "fresh.md").expect("the new file arrived");
+    assert_eq!(
+        seen.iter().filter(|p| p.ends_with("old-report.md")).count(),
+        0,
+        "pre-existing files must never auto-open, even when modified: {seen:?}"
     );
+}
+
+#[test]
+fn an_arrival_delivered_again_opens_once() {
+    let inbox = TempDir::new().unwrap();
+    let root = canonicalize_root(inbox.path()).unwrap();
+    let mut events = InboxEvents::new(root.clone(), create_ignore_set());
+    assert_eq!(events.preexisting(), 0);
+
+    let file = root.join("report.md");
+    std::fs::write(&file, "# finished").unwrap();
+    // The second delivery is the echo of the reads that classify the first.
+    let said: Vec<JotraEvent> = [&file, &root, &file]
+        .into_iter()
+        .filter_map(|path| events.report(path, Instant::now()))
+        .collect();
+
+    assert_eq!(said.len(), 1, "{said:?}");
+    assert!(matches!(
+        &said[0],
+        JotraEvent::InboxFileArrived { path } if path.ends_with("report.md")
+    ));
 }
 
 #[test]

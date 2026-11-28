@@ -1,33 +1,35 @@
-//! The open-file watcher against a real filesystem.
+//! The open-file and notes watchers against a real filesystem.
 //!
 //! The unit tests in `watcher::open_files` prove the registry's bookkeeping
-//! and the classifier's decisions with injected backends. These run the
-//! platform's own watcher over a real folder, because the one thing an
-//! injected backend cannot prove is that a temp-plus-rename over a watched
-//! file reaches Jotra at all — which is the write every careful program makes,
-//! and the reason the folder is watched rather than the file.
+//! and the classifier's decisions with injected backends. These write real
+//! files and hand the watchers' delivery state ([`OpenFileDeliveries`],
+//! [`NotesDeliveries`]) the paths the platform reports after such a write, each
+//! delivery twice, so what reaches a tab is decided without waiting on a
+//! watcher. One runs the platform's own watcher, because the one thing an
+//! injected backend cannot prove is that a temp-plus-rename over a watched file
+//! reaches Jotra at all — which is the write every careful program makes, and
+//! the reason the folder is watched rather than the file.
 
 use jotra_core::events::bus::{EventBus, JotraEvent};
 use jotra_core::hash::sha256_bytes;
 use jotra_core::notes::guard::DiskState;
 use jotra_core::notes::identity::FileIdentity;
-use jotra_core::watcher::ignore::DEFAULT_IGNORE_TTL;
+use jotra_core::watcher::budget::DEFAULT_SWEEP_COOLDOWN;
+use jotra_core::watcher::change_event::ExternalChange;
 use jotra_tauri_lib::security::resolve_for_containment;
-use jotra_tauri_lib::watcher::handler::{create_ignore_set, start_notes_watcher};
+use jotra_tauri_lib::watcher::handler::{create_ignore_set, IgnoreSet, NotesDeliveries};
 use jotra_tauri_lib::watcher::moves::{FileTracking, MoveOutcome, NoteFiles};
 use jotra_tauri_lib::watcher::open_files::{
-    start_open_file_watcher, NoOpenNotes, WatchOutcome, WatcherKind,
+    start_open_file_watcher, DirWatcher, NoOpenNotes, OpenFileDeliveries, OpenFileRegistry,
+    WatchOutcome, WatcherKind,
 };
-use std::collections::HashMap;
+use notify_debouncer_mini::{DebouncedEvent, DebouncedEventKind};
+use std::collections::{BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tempfile::TempDir;
-
-/// Long enough for the 500 ms debounce plus the platform's own notification
-/// latency, and for the ignore TTL to be nowhere near expiry.
-const SETTLE: Duration = Duration::from_secs(3);
 
 /// The path both the ignore stamps and the watcher registry key on. The
 /// handler's own `ignore_key_path` is crate-private; this is the same
@@ -40,18 +42,19 @@ fn resolved(path: &Path) -> String {
 /// and the way the platform's watcher reports paths under it. A watcher rooted
 /// at an uncanonical path drops every event, because the containment check
 /// misses.
-fn canonical(dir: &Path) -> std::path::PathBuf {
-    std::path::PathBuf::from(resolved(dir))
+fn canonical(dir: &Path) -> PathBuf {
+    PathBuf::from(resolved(dir))
 }
 
 /// Writes `bytes` to `path` the way a careful program does: into a sibling
 /// temp file, then renamed over the target. The rename gives the file a new
 /// inode, which is what kills a watch bound to the file rather than the
-/// folder.
-fn write_by_temp_and_rename(path: &Path, bytes: &[u8]) {
+/// folder. Returns the temp file's path, which the platform reports too.
+fn write_by_temp_and_rename(path: &Path, bytes: &[u8]) -> PathBuf {
     let temp = path.with_extension("jotra-test-tmp");
     std::fs::write(&temp, bytes).expect("write temp");
     std::fs::rename(&temp, path).expect("rename over target");
+    temp
 }
 
 /// Tracking for tabs that have read their files, which is what having one open
@@ -59,10 +62,7 @@ fn write_by_temp_and_rename(path: &Path, bytes: &[u8]) {
 /// carrying those same bytes is not a change (ADR-033 §13).
 ///
 /// `FileTracking::untracked()` has no such record, so every report is news to
-/// it, including a late delivery of the write that seeded the file before the
-/// watcher started. That delivery is the platform's business and it happens on
-/// a loaded machine; what a tab does with it is Jotra's, and this is the answer
-/// Jotra has in production.
+/// it, including a delivery of the write that seeded the file.
 struct TabsThatHaveRead {
     read: HashMap<String, DiskState>,
 }
@@ -118,27 +118,161 @@ impl NoteFiles for TabsThatHaveRead {
     }
 }
 
-/// Every `BufferExternal` the bus carried within `SETTLE`.
-fn collect_external(rx: &mpsc::Receiver<JotraEvent>) -> Vec<JotraEvent> {
-    let deadline = Instant::now() + SETTLE;
-    let mut seen = Vec::new();
-    while let Some(left) = deadline.checked_duration_since(Instant::now()) {
-        match rx.recv_timeout(left) {
-            Ok(event @ JotraEvent::BufferExternal { .. }) => seen.push(event),
-            Ok(_) => {}
-            Err(_) => break,
-        }
+/// A backend that delivers nothing and keeps the folders it was asked to watch.
+#[derive(Clone, Default)]
+struct RecordingDirs(Arc<Mutex<BTreeSet<PathBuf>>>);
+
+impl RecordingDirs {
+    fn watched(&self) -> BTreeSet<PathBuf> {
+        self.0.lock().expect("watched folders").clone()
     }
-    seen
 }
 
-fn bus_with_channel() -> (Arc<EventBus>, mpsc::Receiver<JotraEvent>) {
-    let bus = Arc::new(EventBus::new());
-    let (tx, rx) = mpsc::channel();
-    bus.subscribe(move |event| {
-        let _ = tx.send(event.clone());
-    });
-    (bus, rx)
+impl DirWatcher for RecordingDirs {
+    fn watch_dir(&mut self, dir: &Path) -> Result<(), String> {
+        self.0
+            .lock()
+            .expect("watched folders")
+            .insert(dir.to_path_buf());
+        Ok(())
+    }
+
+    fn unwatch_dir(&mut self, dir: &Path) -> Result<(), String> {
+        self.0.lock().expect("watched folders").remove(dir);
+        Ok(())
+    }
+}
+
+/// The open-file watcher as the app runs it, over backends that record what
+/// they were asked to watch instead of watching it.
+struct OpenFiles {
+    registry: Arc<Mutex<OpenFileRegistry>>,
+    native: RecordingDirs,
+    deliveries: OpenFileDeliveries,
+}
+
+impl OpenFiles {
+    fn new(notes_root: &Path, ignore: &IgnoreSet, tracking: FileTracking) -> Self {
+        let native = RecordingDirs::default();
+        let registry = Arc::new(Mutex::new(OpenFileRegistry::new(
+            Box::new(native.clone()),
+            Box::new(RecordingDirs::default()),
+            notes_root,
+        )));
+        let deliveries = OpenFileDeliveries::new(registry.clone(), ignore.clone(), tracking);
+        Self {
+            registry,
+            native,
+            deliveries,
+        }
+    }
+
+    fn open(&self, note_id: &str, file: &Path) -> WatchOutcome {
+        self.registry
+            .lock()
+            .expect("registry")
+            .watch_parent_of(note_id, file)
+    }
+
+    /// The notes watcher, routing to the tabs this registry holds.
+    fn notes_watcher(&self, root: PathBuf, ignore: &IgnoreSet, tracking: FileTracking) -> Notes {
+        Notes(NotesDeliveries::new(
+            root,
+            ignore.clone(),
+            Arc::new(self.registry.clone()),
+            tracking,
+        ))
+    }
+
+    /// What reaches the tabs when the platform reports a write in `folder`.
+    fn reported_in(&mut self, folder: &Path, gone: &[PathBuf]) -> Vec<JotraEvent> {
+        let events = platform_report(folder, gone);
+        let mut reported = Vec::new();
+        for _ in 0..2 {
+            reported.extend(self.deliveries.deliver(&events, Instant::now()));
+        }
+        reported
+    }
+}
+
+struct Notes(NotesDeliveries);
+
+impl Notes {
+    /// What the notes watcher emits when the platform reports a write in
+    /// `folder`.
+    fn reported_in(&mut self, folder: &Path, gone: &[PathBuf]) -> Vec<JotraEvent> {
+        let events = platform_report(folder, gone);
+        let mut reported = Vec::new();
+        for _ in 0..2 {
+            self.0
+                .deliver(&events, Instant::now, |event| reported.push(event));
+        }
+        reported
+    }
+}
+
+/// One delivery as the platform makes it after a write in `folder`: every file
+/// there and each path the write renamed away, in the folder's resolved
+/// spelling, with a name that was never Jotra's among them.
+fn platform_report(folder: &Path, gone: &[PathBuf]) -> Vec<DebouncedEvent> {
+    let resolved_folder = canonical(folder);
+    let mut paths = vec![resolved_folder.join(".tmpA1b2C3")];
+    for path in gone {
+        paths.push(resolved_folder.join(path.file_name().expect("a file name")));
+    }
+    for entry in std::fs::read_dir(folder).expect("list the folder") {
+        paths.push(resolved_folder.join(entry.expect("folder entry").file_name()));
+    }
+    paths.sort();
+    paths
+        .into_iter()
+        .map(|path| DebouncedEvent::new(path, DebouncedEventKind::Any))
+        .collect()
+}
+
+fn external(events: &[JotraEvent]) -> Vec<&JotraEvent> {
+    events
+        .iter()
+        .filter(|event| matches!(event, JotraEvent::BufferExternal { .. }))
+        .collect()
+}
+
+/// `seen` is one message telling `note_id` that `file` now holds `bytes`.
+fn assert_one_modified(seen: &[&JotraEvent], note_id: &str, file: &Path, bytes: &[u8]) {
+    assert_eq!(seen.len(), 1, "the tab must be told once, saw {seen:?}");
+    match seen[0] {
+        JotraEvent::BufferExternal {
+            buffer_id,
+            path,
+            change,
+            new_path,
+            disk_hash,
+            ..
+        } => {
+            assert_eq!(buffer_id, note_id);
+            assert_eq!(
+                resolved(Path::new(path)),
+                resolved(file),
+                "the event names the file that changed"
+            );
+            assert_eq!(*change, ExternalChange::Modified);
+            assert_eq!(*new_path, None);
+            assert_eq!(
+                disk_hash.as_deref(),
+                Some(jotra_core::hash::comparison_digest_hex(bytes).as_str()),
+                "the tab compares its document against this digest, so it has to be the file's"
+            );
+        }
+        other => panic!("expected BufferExternal, got {other:?}"),
+    }
+}
+
+fn stamp(ignore: &IgnoreSet, file: &Path, bytes: &[u8]) {
+    ignore.lock().expect("ignore set").record(
+        jotra_core::watcher::ignore::source_key(Path::new(&resolved(file))),
+        bytes,
+        Instant::now(),
+    );
 }
 
 #[test]
@@ -148,61 +282,30 @@ fn a_file_opened_from_anywhere_reports_one_change_when_another_program_rewrites_
     let file = elsewhere.path().join("shared.md");
     std::fs::write(&file, b"as another program left it\n").expect("seed file");
 
-    let (bus, rx) = bus_with_channel();
-    let watcher = start_open_file_watcher(
-        bus,
-        create_ignore_set(),
+    let mut open = OpenFiles::new(
         notes.path(),
+        &create_ignore_set(),
         FileTracking::untracked(),
-    )
-    .expect("start the open file watcher");
-
-    let outcome = watcher
-        .registry()
-        .lock()
-        .expect("registry")
-        .watch_parent_of("note-1", &file);
-    assert_eq!(outcome, WatchOutcome::Watching(WatcherKind::Native));
-
-    write_by_temp_and_rename(&file, b"rewritten by another program\n");
-
-    let seen = collect_external(&rx);
-    assert_eq!(
-        seen.len(),
-        1,
-        "a temp-plus-rename must reach the tab exactly once, saw {seen:?}"
     );
-    match &seen[0] {
-        JotraEvent::BufferExternal {
-            buffer_id,
-            path,
-            change,
-            new_path,
-            disk_hash,
-            ..
-        } => {
-            assert_eq!(buffer_id, "note-1");
-            assert_eq!(
-                resolved(Path::new(path)),
-                resolved(&file),
-                "the event names the file that changed"
-            );
-            assert_eq!(
-                *change,
-                jotra_core::watcher::change_event::ExternalChange::Modified
-            );
-            assert_eq!(*new_path, None);
-            assert_eq!(
-                disk_hash.as_deref(),
-                Some(
-                    jotra_core::hash::comparison_digest_hex(b"rewritten by another program\n")
-                        .as_str()
-                ),
-                "the event carries what the file holds now"
-            );
-        }
-        other => panic!("expected BufferExternal, got {other:?}"),
-    }
+    assert_eq!(
+        open.open("note-1", &file),
+        WatchOutcome::Watching(WatcherKind::Native)
+    );
+    assert_eq!(
+        open.native.watched(),
+        BTreeSet::from([canonical(elsewhere.path())]),
+        "the folder is watched, not the file"
+    );
+
+    let temp = write_by_temp_and_rename(&file, b"rewritten by another program\n");
+
+    let seen = open.reported_in(elsewhere.path(), &[temp]);
+    assert_one_modified(
+        &external(&seen),
+        "note-1",
+        &file,
+        b"rewritten by another program\n",
+    );
 }
 
 #[test]
@@ -217,34 +320,17 @@ fn a_write_jotra_stamped_never_comes_back_as_somebody_elses_edit() {
     std::fs::write(&file, b"before\n").expect("seed file");
 
     let ignore = create_ignore_set();
-    let (bus, rx) = bus_with_channel();
-    let watcher =
-        start_open_file_watcher(bus, ignore.clone(), notes.path(), FileTracking::untracked())
-            .expect("start the open file watcher");
-    watcher
-        .registry()
-        .lock()
-        .expect("registry")
-        .watch_parent_of("note-1", &file);
+    let mut open = OpenFiles::new(notes.path(), &ignore, FileTracking::untracked());
+    open.open("note-1", &file);
 
     let saved = b"saved from jotra\n";
-    {
-        let mut set = ignore.lock().expect("ignore set");
-        set.record(
-            jotra_core::watcher::ignore::source_key(Path::new(&resolved(&file))),
-            saved,
-            Instant::now(),
-        );
-    }
-    write_by_temp_and_rename(&file, saved);
+    stamp(&ignore, &file, saved);
+    let temp = write_by_temp_and_rename(&file, saved);
 
+    let seen = open.reported_in(elsewhere.path(), &[temp]);
     assert!(
-        collect_external(&rx).is_empty(),
-        "a stamped write must not arrive back as an external change"
-    );
-    assert!(
-        DEFAULT_IGNORE_TTL > SETTLE,
-        "this test only means anything while the stamp is still live"
+        external(&seen).is_empty(),
+        "a stamped write must not arrive back as an external change, saw {seen:?}"
     );
 }
 
@@ -255,26 +341,33 @@ fn a_folder_stops_being_watched_when_the_last_tab_in_it_closes() {
     let file = elsewhere.path().join("closing.md");
     std::fs::write(&file, b"before\n").expect("seed file");
 
-    let (bus, rx) = bus_with_channel();
-    let watcher = start_open_file_watcher(
-        bus,
-        create_ignore_set(),
+    let mut open = OpenFiles::new(
         notes.path(),
+        &create_ignore_set(),
         FileTracking::untracked(),
-    )
-    .expect("start the open file watcher");
-    {
-        let mut registry = watcher.registry().lock().expect("registry");
-        registry.watch_parent_of("note-1", &file);
-        registry.unwatch_parent_of("note-1");
-        assert!(registry.watched_dirs().is_empty());
-    }
-
-    write_by_temp_and_rename(&file, b"changed after the tab closed\n");
-
+    );
+    open.open("note-1", &file);
+    open.registry
+        .lock()
+        .expect("registry")
+        .unwatch_parent_of("note-1");
+    assert!(open
+        .registry
+        .lock()
+        .expect("registry")
+        .watched_dirs()
+        .is_empty());
     assert!(
-        collect_external(&rx).is_empty(),
-        "a closed tab's folder must not keep reporting"
+        open.native.watched().is_empty(),
+        "a closed tab's folder must not keep a watch"
+    );
+
+    // A delivery already on its way when the tab closed.
+    let temp = write_by_temp_and_rename(&file, b"changed after the tab closed\n");
+    let seen = open.reported_in(elsewhere.path(), &[temp]);
+    assert!(
+        external(&seen).is_empty(),
+        "a closed tab must not be told, saw {seen:?}"
     );
 }
 
@@ -291,19 +384,13 @@ fn a_folder_full_of_churn_never_names_a_file_that_is_not_open() {
     std::fs::write(&one, b"before\n").expect("seed one");
     std::fs::write(&two, b"before\n").expect("seed two");
 
-    let (bus, rx) = bus_with_channel();
-    let watcher = start_open_file_watcher(
-        bus,
-        create_ignore_set(),
+    let mut open = OpenFiles::new(
         notes.path(),
+        &create_ignore_set(),
         FileTracking::untracked(),
-    )
-    .expect("start the open file watcher");
-    {
-        let mut registry = watcher.registry().lock().expect("registry");
-        registry.watch_parent_of("note-1", &one);
-        registry.watch_parent_of("note-2", &two);
-    }
+    );
+    open.open("note-1", &one);
+    open.open("note-2", &two);
 
     for round in 0..40 {
         std::fs::write(busy.path().join(format!("noise-{round}.log")), b"x").expect("noise");
@@ -311,34 +398,19 @@ fn a_folder_full_of_churn_never_names_a_file_that_is_not_open() {
         std::fs::write(&two, format!("round {round}\n")).expect("rewrite two");
     }
 
-    let seen = collect_external(&rx);
-    assert!(
-        !seen.is_empty(),
-        "the churn must still reach the two open tabs"
-    );
-
-    for event in &seen {
-        let JotraEvent::BufferExternal {
-            buffer_id, path, ..
-        } = event
-        else {
-            unreachable!("collect_external returns nothing else");
-        };
-        assert!(
-            buffer_id == "note-1" || buffer_id == "note-2",
-            "only an open note may be named, got {buffer_id} for {path}"
-        );
-    }
-
-    // Two open notes, one event each per 500 ms window, over a run bounded by
-    // the settle period. Anything near the 120 writes made would mean the
-    // per-window cap is not doing its job.
-    let windows = SETTLE.as_millis() / 500 + 1;
-    let ceiling = (2 * windows) as usize;
-    assert!(
-        seen.len() <= ceiling,
-        "120 writes must cost at most {ceiling} events, saw {}",
-        seen.len()
+    let seen = open.reported_in(busy.path(), &[]);
+    let mut named: Vec<&str> = external(&seen)
+        .into_iter()
+        .map(|event| match event {
+            JotraEvent::BufferExternal { buffer_id, .. } => buffer_id.as_str(),
+            _ => unreachable!("external returns nothing else"),
+        })
+        .collect();
+    named.sort_unstable();
+    assert_eq!(
+        named,
+        ["note-1", "note-2"],
+        "120 writes in one window must cost one message per open note and none for anything else"
     );
 }
 
@@ -355,67 +427,26 @@ fn a_note_inside_the_notes_folder_reaches_its_tab_when_another_program_rewrites_
     let note = notes.path().join("today.md");
     std::fs::write(&note, b"original text\n").expect("seed note");
 
-    let (bus, rx) = bus_with_channel();
     let ignore = create_ignore_set();
-    let open_files = start_open_file_watcher(
-        bus.clone(),
-        ignore.clone(),
-        notes.path(),
-        FileTracking::untracked(),
-    )
-    .expect("start the open file watcher");
-
-    let outcome = open_files
-        .registry()
-        .lock()
-        .expect("registry")
-        .watch_parent_of("note-1", &note);
+    let open = OpenFiles::new(notes.path(), &ignore, FileTracking::untracked());
     assert_eq!(
-        outcome,
+        open.open("note-1", &note),
         WatchOutcome::AlreadyCovered,
         "the notes watcher covers this folder; a second watch would double every event"
     );
+    assert!(open.native.watched().is_empty());
 
-    let _notes_watcher = start_notes_watcher(
-        bus,
-        canonical(notes.path()),
-        ignore,
-        open_files.open_notes(),
-        FileTracking::untracked(),
-    )
-    .expect("start the notes watcher");
+    let mut notes_watcher =
+        open.notes_watcher(canonical(notes.path()), &ignore, FileTracking::untracked());
+    let temp = write_by_temp_and_rename(&note, b"rewritten by another program\n");
 
-    write_by_temp_and_rename(&note, b"rewritten by another program\n");
-
-    let seen = collect_external(&rx);
-    assert_eq!(seen.len(), 1, "the tab must be told once, saw {seen:?}");
-    match &seen[0] {
-        JotraEvent::BufferExternal {
-            buffer_id,
-            path,
-            change,
-            new_path,
-            disk_hash,
-            ..
-        } => {
-            assert_eq!(buffer_id, "note-1");
-            assert_eq!(resolved(Path::new(path)), resolved(&note));
-            assert_eq!(
-                *change,
-                jotra_core::watcher::change_event::ExternalChange::Modified
-            );
-            assert_eq!(*new_path, None);
-            assert_eq!(
-                disk_hash.as_deref(),
-                Some(
-                    jotra_core::hash::comparison_digest_hex(b"rewritten by another program\n")
-                        .as_str()
-                ),
-                "the tab compares its document against this digest, so it has to be the file's"
-            );
-        }
-        other => panic!("expected BufferExternal, got {other:?}"),
-    }
+    let seen = notes_watcher.reported_in(notes.path(), &[temp]);
+    assert_one_modified(
+        &external(&seen),
+        "note-1",
+        &note,
+        b"rewritten by another program\n",
+    );
 }
 
 #[test]
@@ -423,53 +454,23 @@ fn a_save_jotra_made_inside_the_notes_folder_never_comes_back_to_the_tab() {
     // The same round trip on the notes side. Jotra stamps a write before it
     // lands; if the stamp missed, every save would return as somebody else's
     // edit and the user would be asked whether to discard their own keystrokes.
-    assert!(
-        DEFAULT_IGNORE_TTL > SETTLE,
-        "the stamp has to outlive the wait, or this passes for the wrong reason"
-    );
-
     let notes = TempDir::new().expect("notes dir");
     let note = notes.path().join("today.md");
     std::fs::write(&note, b"before\n").expect("seed note");
 
-    let (bus, rx) = bus_with_channel();
     let ignore = create_ignore_set();
-    let open_files = start_open_file_watcher(
-        bus.clone(),
-        ignore.clone(),
-        notes.path(),
-        FileTracking::untracked(),
-    )
-    .expect("start the open file watcher");
-    open_files
-        .registry()
-        .lock()
-        .expect("registry")
-        .watch_parent_of("note-1", &note);
-
-    let _notes_watcher = start_notes_watcher(
-        bus,
-        canonical(notes.path()),
-        ignore.clone(),
-        open_files.open_notes(),
-        FileTracking::untracked(),
-    )
-    .expect("start the notes watcher");
+    let open = OpenFiles::new(notes.path(), &ignore, FileTracking::untracked());
+    open.open("note-1", &note);
+    let mut notes_watcher =
+        open.notes_watcher(canonical(notes.path()), &ignore, FileTracking::untracked());
 
     let saved = b"what jotra itself wrote\n";
-    {
-        let mut set = ignore.lock().expect("ignore set");
-        set.record(
-            jotra_core::watcher::ignore::source_key(Path::new(&resolved(&note))),
-            saved,
-            Instant::now(),
-        );
-    }
-    write_by_temp_and_rename(&note, saved);
+    stamp(&ignore, &note, saved);
+    let temp = write_by_temp_and_rename(&note, saved);
 
-    let seen = collect_external(&rx);
+    let seen = notes_watcher.reported_in(notes.path(), &[temp]);
     assert!(
-        seen.is_empty(),
+        external(&seen).is_empty(),
         "a stamped write must not be reported to the tab that made it, saw {seen:?}"
     );
 }
@@ -479,55 +480,33 @@ fn a_note_nobody_has_open_tells_no_tab() {
     // The registry is the whole filter. A notes folder holds every note the
     // user has; only the ones with a tab may produce an event.
     let notes = TempDir::new().expect("notes dir");
-    let open = notes.path().join("open.md");
+    let open_note = notes.path().join("open.md");
     let closed = notes.path().join("closed.md");
-    std::fs::write(&open, b"x\n").expect("seed");
+    std::fs::write(&open_note, b"x\n").expect("seed");
     std::fs::write(&closed, b"x\n").expect("seed");
 
-    let (bus, rx) = bus_with_channel();
     let ignore = create_ignore_set();
-    // The tab on open.md has read it, so a delivery of the write that seeded
-    // it carries nothing the tab does not already hold.
-    let tracking = TabsThatHaveRead::holding("note-1", &open, b"x\n");
-    let open_files =
-        start_open_file_watcher(bus.clone(), ignore.clone(), notes.path(), tracking.clone())
-            .expect("start the open file watcher");
-    open_files
-        .registry()
-        .lock()
-        .expect("registry")
-        .watch_parent_of("note-1", &open);
+    // The tab on open.md has read it, so a report of open.md carries nothing
+    // the tab does not already hold.
+    let tracking = TabsThatHaveRead::holding("note-1", &open_note, b"x\n");
+    let open = OpenFiles::new(notes.path(), &ignore, tracking.clone());
+    open.open("note-1", &open_note);
+    let mut notes_watcher = open.notes_watcher(canonical(notes.path()), &ignore, tracking);
 
-    let _notes_watcher = start_notes_watcher(
-        bus,
-        canonical(notes.path()),
-        ignore,
-        open_files.open_notes(),
-        tracking,
-    )
-    .expect("start the notes watcher");
+    let temp = write_by_temp_and_rename(&closed, b"changed by another program\n");
 
-    write_by_temp_and_rename(&closed, b"changed by another program\n");
-
-    let seen = collect_external(&rx);
+    let seen = notes_watcher.reported_in(notes.path(), &[temp]);
     assert!(
-        seen.is_empty(),
+        external(&seen).is_empty(),
         "a note with no tab open on it has nobody to tell, saw {seen:?}"
     );
 }
 
-/// How many sweeps the bus carried in `window`.
-fn count_swept(rx: &mpsc::Receiver<JotraEvent>, window: Duration) -> usize {
-    let deadline = Instant::now() + window;
-    let mut swept = 0;
-    while let Some(left) = deadline.checked_duration_since(Instant::now()) {
-        match rx.recv_timeout(left) {
-            Ok(JotraEvent::NotesSwept { .. }) => swept += 1,
-            Ok(_) => {}
-            Err(_) => break,
-        }
-    }
-    swept
+fn swept(events: &[JotraEvent]) -> usize {
+    events
+        .iter()
+        .filter(|event| matches!(event, JotraEvent::NotesSwept { .. }))
+        .count()
 }
 
 #[test]
@@ -539,34 +518,50 @@ fn a_burst_that_stops_while_a_sweep_stands_is_swept_once_more() {
     // will raise them — the folder has gone quiet — so the cooldown ending is
     // itself the moment to sweep again.
     let notes = TempDir::new().expect("notes dir");
-    let (bus, rx) = bus_with_channel();
-
-    let _watcher = start_notes_watcher(
-        bus,
+    let mut watcher = NotesDeliveries::new(
         canonical(notes.path()),
         create_ignore_set(),
         Arc::new(NoOpenNotes),
         FileTracking::untracked(),
-    )
-    .expect("start the notes watcher");
-
+    );
     for n in 0..40 {
         std::fs::write(notes.path().join(format!("note-{n}.md")), b"x").expect("write note");
     }
 
-    // Long enough for the burst to be delivered and swept, and short of the
-    // cooldown that sweep starts.
+    let start = Instant::now();
+    let mut burst = Vec::new();
+    watcher.deliver(
+        &platform_report(notes.path(), &[]),
+        || start,
+        |event| burst.push(event),
+    );
     assert!(
-        count_swept(&rx, Duration::from_millis(1200)) >= 1,
+        swept(&burst) >= 1,
         "a burst of forty files was named one by one"
     );
 
-    // Nothing else is written from here on.
+    let due = watcher
+        .deadline()
+        .expect("the changes the standing sweep dropped are owed a sweep");
+    assert_eq!(due, start + DEFAULT_SWEEP_COOLDOWN);
+
+    let mut early = Vec::new();
+    watcher.on_deadline(due - Duration::from_millis(1), |event| early.push(event));
+    assert_eq!(swept(&early), 0, "the sweep that stands still covers them");
+
+    let mut quiet = Vec::new();
+    watcher.on_deadline(due, |event| quiet.push(event));
     assert_eq!(
-        count_swept(&rx, Duration::from_secs(3)),
+        swept(&quiet),
         1,
         "the changes the cooldown swallowed were never swept"
     );
+
+    // Nothing else is written from here on.
+    assert_eq!(watcher.deadline(), None);
+    let mut later = Vec::new();
+    watcher.on_deadline(due + DEFAULT_SWEEP_COOLDOWN * 2, |event| later.push(event));
+    assert_eq!(swept(&later), 0, "one silence costs one follow-up sweep");
 }
 
 #[test]
@@ -594,28 +589,11 @@ fn a_write_from_a_connected_program_reaches_the_tab_as_somebody_elses_edit() {
     )
     .expect("seed the settings the gate reads");
 
-    let (bus, rx) = bus_with_channel();
     let ignore = create_ignore_set();
-    let open_files = start_open_file_watcher(
-        bus.clone(),
-        ignore.clone(),
-        &root,
-        TabsThatHaveRead::holding("note-1", &note, read_by_the_tab),
-    )
-    .expect("start the open file watcher");
-    open_files
-        .registry()
-        .lock()
-        .expect("registry")
-        .watch_parent_of("note-1", &note);
-    let _notes_watcher = start_notes_watcher(
-        bus,
-        root.clone(),
-        ignore,
-        open_files.open_notes(),
-        TabsThatHaveRead::holding("note-1", &note, read_by_the_tab),
-    )
-    .expect("start the notes watcher");
+    let tracking = TabsThatHaveRead::holding("note-1", &note, read_by_the_tab);
+    let open = OpenFiles::new(&root, &ignore, tracking.clone());
+    open.open("note-1", &note);
+    let mut notes_watcher = open.notes_watcher(root.clone(), &ignore, tracking);
 
     // The server's own host, over the same folder, holding no index and no
     // ignore set — which is everything the process a client launches has.
@@ -643,36 +621,8 @@ fn a_write_from_a_connected_program_reaches_the_tab_as_somebody_elses_edit() {
     .join()
     .expect("the writing thread finished");
 
-    let seen = collect_external(&rx);
-    assert_eq!(
-        seen.len(),
-        1,
-        "the tab must be told once about a program's write, saw {seen:?}"
-    );
-    match &seen[0] {
-        JotraEvent::BufferExternal {
-            buffer_id,
-            path,
-            change,
-            new_path,
-            disk_hash,
-            ..
-        } => {
-            assert_eq!(buffer_id, "note-1");
-            assert_eq!(resolved(Path::new(path)), resolved(&note));
-            assert_eq!(
-                *change,
-                jotra_core::watcher::change_event::ExternalChange::Modified
-            );
-            assert_eq!(*new_path, None);
-            assert_eq!(
-                disk_hash.as_deref(),
-                Some(jotra_core::hash::comparison_digest_hex(written).as_str()),
-                "the tab reconciles against what the file holds now"
-            );
-        }
-        other => panic!("expected BufferExternal, got {other:?}"),
-    }
+    let seen = notes_watcher.reported_in(&root, &[]);
+    assert_one_modified(&external(&seen), "note-1", &note, written);
     assert_eq!(
         std::fs::read(&note).expect("read the note back"),
         written,
@@ -695,28 +645,11 @@ fn an_applied_proposal_reaches_the_tab_as_somebody_elses_edit() {
     let read_by_the_tab = b"as the tab read it\n";
     std::fs::write(&note, read_by_the_tab).expect("seed note");
 
-    let (bus, rx) = bus_with_channel();
     let ignore = create_ignore_set();
-    let open_files = start_open_file_watcher(
-        bus.clone(),
-        ignore.clone(),
-        &root,
-        TabsThatHaveRead::holding("note-1", &note, read_by_the_tab),
-    )
-    .expect("start the open file watcher");
-    open_files
-        .registry()
-        .lock()
-        .expect("registry")
-        .watch_parent_of("note-1", &note);
-    let _notes_watcher = start_notes_watcher(
-        bus,
-        root.clone(),
-        ignore,
-        open_files.open_notes(),
-        TabsThatHaveRead::holding("note-1", &note, read_by_the_tab),
-    )
-    .expect("start the notes watcher");
+    let tracking = TabsThatHaveRead::holding("note-1", &note, read_by_the_tab);
+    let open = OpenFiles::new(&root, &ignore, tracking.clone());
+    open.open("note-1", &note);
+    let mut notes_watcher = open.notes_watcher(root.clone(), &ignore, tracking);
 
     let written = "as the pane applied it\n";
     let outcome = jotra_tauri_lib::commands::chat::apply_proposal_inner(
@@ -733,39 +666,69 @@ fn an_applied_proposal_reaches_the_tab_as_somebody_elses_edit() {
     .expect("the proposal is applied");
     assert_eq!(outcome.path, "Launch.md");
 
-    let seen = collect_external(&rx);
-    assert_eq!(
-        seen.len(),
-        1,
-        "the tab must be told once about an applied proposal, saw {seen:?}"
-    );
-    match &seen[0] {
-        JotraEvent::BufferExternal {
-            buffer_id,
-            path,
-            change,
-            new_path,
-            disk_hash,
-            ..
-        } => {
-            assert_eq!(buffer_id, "note-1");
-            assert_eq!(resolved(Path::new(path)), resolved(&note));
-            assert_eq!(
-                *change,
-                jotra_core::watcher::change_event::ExternalChange::Modified
-            );
-            assert_eq!(*new_path, None);
-            assert_eq!(
-                disk_hash.as_deref(),
-                Some(jotra_core::hash::comparison_digest_hex(written.as_bytes()).as_str()),
-                "the tab reconciles against what the file holds now"
-            );
-        }
-        other => panic!("expected BufferExternal, got {other:?}"),
-    }
+    let seen = notes_watcher.reported_in(&root, &[]);
+    assert_one_modified(&external(&seen), "note-1", &note, written.as_bytes());
     assert_eq!(
         std::fs::read_to_string(&note).expect("read the note back"),
         written,
         "the proposal landed on the file, not on a copy of it"
+    );
+}
+
+/// Long enough for a loaded machine; only a failing run waits it out.
+const DELIVERY_BOUND: Duration = Duration::from_secs(15);
+
+/// The one test here that runs the platform's watcher. Delivery lags on a
+/// loaded machine, so a rewrite that has not been reported is made again, each
+/// time with new bytes.
+#[test]
+fn the_platform_watcher_reports_a_rename_over_an_open_file() {
+    let notes = TempDir::new().expect("notes dir");
+    let elsewhere = TempDir::new().expect("some other folder");
+    let file = elsewhere.path().join("shared.md");
+    let seed = b"as another program left it\n";
+    std::fs::write(&file, seed).expect("seed file");
+
+    let bus = Arc::new(EventBus::new());
+    let (tx, rx) = mpsc::channel();
+    bus.subscribe(move |event| {
+        let _ = tx.send(event.clone());
+    });
+    // The tab has read the seed, so a late report of the seed write is not a
+    // change and only a rewrite can answer.
+    let watcher = start_open_file_watcher(
+        bus,
+        create_ignore_set(),
+        notes.path(),
+        TabsThatHaveRead::holding("note-1", &file, seed),
+    )
+    .expect("start the open file watcher");
+    let outcome = watcher
+        .registry()
+        .lock()
+        .expect("registry")
+        .watch_parent_of("note-1", &file);
+    assert_eq!(outcome, WatchOutcome::Watching(WatcherKind::Native));
+
+    let heard = (0..4).any(|attempt| {
+        write_by_temp_and_rename(
+            &file,
+            format!("rewritten by another program, take {attempt}\n").as_bytes(),
+        );
+        let deadline = Instant::now() + DELIVERY_BOUND;
+        while let Some(left) = deadline.checked_duration_since(Instant::now()) {
+            match rx.recv_timeout(left) {
+                Ok(JotraEvent::BufferExternal { buffer_id, .. }) if buffer_id == "note-1" => {
+                    return true
+                }
+                Ok(_) => {}
+                Err(_) => return false,
+            }
+        }
+        false
+    });
+    assert!(
+        heard,
+        "a temp-plus-rename over an open file never reached its tab"
     );
 }

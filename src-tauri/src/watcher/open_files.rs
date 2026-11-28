@@ -457,6 +457,12 @@ pub struct OpenFileWatcher {
 }
 
 impl OpenFileWatcher {
+    /// A watcher over `registry` with no thread behind it, so a test holding an
+    /// [`OpenFileDeliveries`] over the same registry decides what is delivered.
+    pub fn over(registry: Arc<Mutex<OpenFileRegistry>>) -> Self {
+        Self { registry }
+    }
+
     /// The registry, for the open and close paths to add to and take from.
     pub fn registry(&self) -> &Arc<Mutex<OpenFileRegistry>> {
         &self.registry
@@ -504,31 +510,14 @@ pub fn start_open_file_watcher(
         notes_root,
     )));
 
-    let thread_registry = registry.clone();
+    let mut deliveries = OpenFileDeliveries::new(registry.clone(), ignore_set, tracking);
     std::thread::spawn(move || {
-        // Outside the batch loop: a change delivered twice arrives in a later
-        // batch the second time, so a record scoped to one batch would never
-        // see it.
-        let mut seen = LastSeen::new();
-        // A removal waits for the delivery that might answer it, so the wait
-        // for the next event ends at its deadline rather than whenever the
-        // folder happens to change again.
-        let pending = RefCell::new(PendingRemovals::publishing_to(
-            hold_window(DEBOUNCE_WINDOW),
-            tracking.holds.clone(),
-        ));
         loop {
-            // Read out before the match: the borrow would otherwise stand for
-            // the whole of it, and the timeout arm needs the same cell.
-            let due = pending.borrow().deadline();
-            let result = match due {
+            let result = match deliveries.deadline() {
                 Some(due) => match rx.recv_timeout(due.saturating_duration_since(Instant::now())) {
                     Ok(result) => result,
                     Err(mpsc::RecvTimeoutError::Timeout) => {
-                        let now = Instant::now();
-                        let answers =
-                            answer_held_removals(&mut pending.borrow_mut(), &[], &tracking, now);
-                        for (_, event) in answers {
+                        for event in deliveries.on_deadline(Instant::now()) {
                             bus.emit(event);
                         }
                         continue;
@@ -547,15 +536,7 @@ pub fn start_open_file_watcher(
                     continue;
                 }
             };
-            for message in report_delivery(
-                &events,
-                &thread_registry,
-                &ignore_set,
-                &mut seen,
-                &pending,
-                &tracking,
-                Instant::now(),
-            ) {
+            for message in deliveries.deliver(&events, Instant::now()) {
                 bus.emit(message);
             }
         }
@@ -564,6 +545,68 @@ pub fn start_open_file_watcher(
 
     info!("open file watcher started");
     Ok(OpenFileWatcher { registry })
+}
+
+/// What the open-file watcher's thread holds between deliveries, and what it
+/// makes of each one: the thread feeds it what the debouncer delivers and the
+/// moment a held removal comes due, and a test feeds it the same by hand.
+pub struct OpenFileDeliveries {
+    registry: Arc<Mutex<OpenFileRegistry>>,
+    ignore_set: IgnoreSet,
+    tracking: FileTracking,
+    /// Across deliveries: a change delivered twice arrives in a later batch
+    /// the second time, so a record scoped to one batch would never see it.
+    seen: LastSeen,
+    /// A removal waits for the delivery that might answer it, so the wait for
+    /// the next event ends at its deadline rather than whenever the folder
+    /// happens to change again.
+    pending: RefCell<PendingRemovals>,
+}
+
+impl OpenFileDeliveries {
+    pub fn new(
+        registry: Arc<Mutex<OpenFileRegistry>>,
+        ignore_set: IgnoreSet,
+        tracking: FileTracking,
+    ) -> Self {
+        let pending = RefCell::new(PendingRemovals::publishing_to(
+            hold_window(DEBOUNCE_WINDOW),
+            tracking.holds.clone(),
+        ));
+        Self {
+            registry,
+            ignore_set,
+            tracking,
+            seen: LastSeen::new(),
+            pending,
+        }
+    }
+
+    /// When the oldest held removal has waited long enough to be answered.
+    pub fn deadline(&self) -> Option<Instant> {
+        self.pending.borrow().deadline()
+    }
+
+    /// The removals no delivery answered by `now`.
+    pub fn on_deadline(&mut self, now: Instant) -> Vec<JotraEvent> {
+        answer_held_removals(&mut self.pending.borrow_mut(), &[], &self.tracking, now)
+            .into_iter()
+            .map(|(_, event)| event)
+            .collect()
+    }
+
+    /// What one delivery tells the tabs it names, in order.
+    pub fn deliver(&mut self, events: &[DebouncedEvent], now: Instant) -> Vec<JotraEvent> {
+        report_delivery(
+            events,
+            &self.registry,
+            &self.ignore_set,
+            &mut self.seen,
+            &self.pending,
+            &self.tracking,
+            now,
+        )
+    }
 }
 
 /// Everything one delivery has to say to the tabs it names, in the order they
