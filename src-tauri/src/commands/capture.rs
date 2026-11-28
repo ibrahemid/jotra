@@ -302,6 +302,22 @@ pub async fn capture_target<R: Runtime>(app: AppHandle<R>) -> Result<String, Str
     .await
 }
 
+/// IPC: the capture note's unsent text, kept across a quit.
+#[tauri::command]
+pub async fn capture_draft<R: Runtime>(app: AppHandle<R>) -> Result<String, String> {
+    run_blocking(app, ERR_WRITE_FAILED, |state| {
+        Ok(crate::capture::DRAFT.read(&state.jotra_dir))
+    })
+    .await
+}
+
+/// IPC: holds the capture note's text, written to disk when the note hides
+/// and when the app quits. On the main thread, in order with `capture_close`.
+#[tauri::command]
+pub fn capture_keep_draft(text: String) {
+    crate::capture::DRAFT.hold(text);
+}
+
 /// IPC: hides the capture note. With `return_focus`, the app that was in front
 /// before it gets the keyboard back. On the main thread, where AppKit wants
 /// activation asked for.

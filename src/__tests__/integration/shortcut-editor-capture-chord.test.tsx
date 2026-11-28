@@ -91,6 +91,14 @@ describe("the capture chord's row", () => {
     ).toBeNull();
   });
 
+  it("names the window's row, not another app, for a capture chord edited to the window's", async () => {
+    h.captureHotkeyStatus.mockResolvedValue(status("Shift+CmdOrCtrl+Space", false));
+    await captureHotkeyStore.load();
+    const row = captureRow(render(() => <ShortcutEditor />).container);
+    expect(row.textContent).toContain("Show and hide Jotra uses this shortcut.");
+    expect(row.textContent).not.toContain("Another app is using this shortcut.");
+  });
+
   it("refuses a bare key with the rule and keeps listening", async () => {
     const { container } = render(() => <ShortcutEditor />);
     fireEvent.click(captureRow(container).querySelector('[data-action="record-capture-shortcut"]')!);

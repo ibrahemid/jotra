@@ -175,6 +175,34 @@ describe("the chord that shows and hides the window", () => {
     );
   });
 
+  it("puts the OS back on the chord it held when the shortcuts cannot be saved", async () => {
+    h.globalHotkeyStatus.mockResolvedValue({
+      chord: "CmdOrCtrl+Shift+Space",
+      registered: true,
+      unsupported: false,
+    });
+    h.setGlobalHotkey
+      .mockResolvedValueOnce(given("CmdOrCtrl+Alt+Space"))
+      .mockResolvedValueOnce(given("CmdOrCtrl+Shift+Space"));
+    h.saveConfig.mockClear().mockRejectedValueOnce(new Error("disk"));
+    await hotkeyStore.load();
+
+    const { container } = render(() => <ShortcutEditor />);
+
+    fireEvent.click(row(container).querySelector('[data-action="record-global-shortcut"]')!);
+    fireEvent.keyDown(document, { key: " ", metaKey: true, altKey: true });
+
+    fireEvent.click(container.querySelector('[data-action="save-shortcuts"]')!);
+    await settle();
+
+    expect(h.setGlobalHotkey.mock.calls.map((call) => call[0])).toEqual([
+      "CmdOrCtrl+Alt+Space",
+      "CmdOrCtrl+Shift+Space",
+    ]);
+    expect(hotkeyStore.chord()).toBe("CmdOrCtrl+Shift+Space");
+    expect(hasUnsavedShortcuts()).toBe(false);
+  });
+
   // `set_global_hotkey` parses before it registers, so a chord the recorder can
   // capture but `jotra_core::hotkey` cannot read comes back as a rejected call.
   // `hotkey/mod.rs` holds the Rust half: both of these chords are `Err` there.

@@ -43,6 +43,61 @@ describe("the capture chord's store", () => {
     expect(capture.isTaken()).toBe(true);
   });
 
+  it("reads a capture chord the window's chord holds as held by it, not taken", async () => {
+    h.captureHotkeyStatus.mockResolvedValue({
+      chord: "CmdOrCtrl+Shift+Space",
+      registered: false,
+      unsupported: false,
+    });
+    const windowHeld = { chord: () => "Shift+CmdOrCtrl+Space", isHeld: () => true };
+    const capture = createRoot(() => createCaptureHotkeyStore(() => windowHeld));
+    await capture.load();
+    expect(capture.isHeldByOther()).toBe(true);
+    expect(capture.isTaken()).toBe(false);
+  });
+
+  it("reads a capture chord spelled another way as held by the window on macOS", async () => {
+    h.captureHotkeyStatus.mockResolvedValue({
+      chord: "cmd+shift+space",
+      registered: false,
+      unsupported: false,
+    });
+    const windowHeld = { chord: () => "CmdOrCtrl+Shift+Space", isHeld: () => true };
+    const capture = createRoot(() => createCaptureHotkeyStore(() => windowHeld, "mac"));
+    await capture.load();
+    expect(capture.isHeldByOther()).toBe(true);
+    expect(capture.isTaken()).toBe(false);
+  });
+
+  it("reads Ctrl as the window's CmdOrCtrl only where the OS holds them as one key", async () => {
+    h.captureHotkeyStatus.mockResolvedValue({
+      chord: "Ctrl+Shift+Space",
+      registered: false,
+      unsupported: false,
+    });
+    const windowHeld = { chord: () => "CmdOrCtrl+Shift+Space", isHeld: () => true };
+    const onWindows = createRoot(() => createCaptureHotkeyStore(() => windowHeld, "win"));
+    await onWindows.load();
+    expect(onWindows.isHeldByOther()).toBe(true);
+    const onMac = createRoot(() => createCaptureHotkeyStore(() => windowHeld, "mac"));
+    await onMac.load();
+    expect(onMac.isHeldByOther()).toBe(false);
+    expect(onMac.isTaken()).toBe(true);
+  });
+
+  it("reads the window's keys as taken when the window's chord is not held either", async () => {
+    h.captureHotkeyStatus.mockResolvedValue({
+      chord: "CmdOrCtrl+Shift+Space",
+      registered: false,
+      unsupported: false,
+    });
+    const windowUnheld = { chord: () => "CmdOrCtrl+Shift+Space", isHeld: () => false };
+    const capture = createRoot(() => createCaptureHotkeyStore(() => windowUnheld));
+    await capture.load();
+    expect(capture.isHeldByOther()).toBe(false);
+    expect(capture.isTaken()).toBe(true);
+  });
+
   it("reads capture turned off as off, not taken", async () => {
     h.captureHotkeyStatus.mockResolvedValue({ chord: "", registered: false, unsupported: false });
     const capture = store();

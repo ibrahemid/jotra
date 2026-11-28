@@ -38,7 +38,7 @@ What Jotra does, at the level of detail that answers "does it do X".
 ## Editing
 
 - CodeMirror 6. A file's name decides its language, and a `.txt` or `.text` file stays plain text whatever it holds. Change Language in the palette picks another language for one file, and the file keeps it.
-- Word wrap, tab size and reading width, under Settings, Editor, apply to open files at once. Reading width keeps lines of prose to a set width; code files keep the full width.
+- Word wrap, tab size and reading width, under Settings, Editor, apply to open files at once. Reading width keeps lines of prose to the narrow, medium or wide width Line length picks; code files keep the full width.
 - The command palette opens on a double tap of `Shift` (Help > Command Palette). Typing a file's name there lists the file under the commands.
 - File > Open Folder (`Cmd+Option+O`) shows a folder's files in the sidebar. The tree draws only the rows on screen; it is one `Tab` stop, with the arrow keys, `Home`, `End` and typing a name to move inside it. A folder Jotra cannot read says so with Try again, and folders stay open across launches. Right-click on any row shows it in the file manager or copies its path; in Jotra's folder it also renames, moves to the Trash, or makes a new file in a folder.
 - Help holds Jotra Help (the guide on the site), Keyboard Shortcuts, What's New (the changelog at this version), Show Setup Again and Report an Issue (the bug form, with the version filled in).

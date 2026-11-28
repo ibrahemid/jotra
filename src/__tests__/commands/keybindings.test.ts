@@ -11,6 +11,7 @@ import {
 import { findKeybindingConflicts } from "./keybinding-conflicts";
 import type { Command } from "../../types/commands";
 import { firstRunStore } from "../../stores/global/first-run";
+import { configStore } from "../../stores/global/config";
 
 function cmd(id: string, keybinding?: string, keybindingAliases?: string[]): Command {
   return { id, label: id, scope: "app", keybinding, keybindingAliases, execute: () => {} };
@@ -635,3 +636,43 @@ describe("editor-focus gating", () => {
     rebuildKeyMap();
   });
 });
+
+describe("a chord two commands hold", () => {
+  afterEach(() => {
+    vi.restoreAllMocks();
+    for (const id of ["test.mine", "test.offApp"]) unregisterCommand(id);
+    setKeybindingOverrides({});
+    rebuildKeyMap();
+  });
+
+  function holders(ran: string[]) {
+    registerCommand({ ...cmd("test.mine", "CmdOrCtrl+Y"), execute: () => void ran.push("test.mine") });
+    registerCommand({
+      ...cmd("test.offApp", "CmdOrCtrl+Shift+Y"),
+      app: "chat",
+      execute: () => void ran.push("test.offApp"),
+    });
+  }
+
+  it("runs the command the person gave it over one of an app that is off", () => {
+    vi.spyOn(configStore, "isAppOn").mockImplementation((app) => app !== "chat");
+    const ran: string[] = [];
+    holders(ran);
+    setKeybindingOverrides({ "test.mine": "CmdOrCtrl+Shift+Y" });
+    rebuildKeyMap();
+
+    expect(handleKeyDown(createKeyEvent({ key: "y", metaKey: true, shiftKey: true }))).toBe(true);
+    expect(ran).toEqual(["test.mine"]);
+  });
+
+  it("still answers the chord of an app that is off when nothing else holds it", () => {
+    vi.spyOn(configStore, "isAppOn").mockImplementation((app) => app !== "chat");
+    const ran: string[] = [];
+    holders(ran);
+    rebuildKeyMap();
+
+    expect(handleKeyDown(createKeyEvent({ key: "y", metaKey: true, shiftKey: true }))).toBe(true);
+    expect(ran).toEqual(["test.offApp"]);
+  });
+});
+

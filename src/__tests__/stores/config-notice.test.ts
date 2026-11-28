@@ -70,4 +70,20 @@ describe("the notice for values config.toml holds that Jotra could not read", ()
     await configStore.noticeUnreadValues();
     expect(vi.mocked(dismissToast)).toHaveBeenCalledWith(7);
   });
+
+  it("names the value a reload stopped on when it is not the one shown", async () => {
+    mockedDiagnostics.mockResolvedValueOnce([{ key: "editor.font_size", line: 2, message: "" }]);
+    await configStore.noticeUnreadValues();
+    mockedDiagnostics.mockResolvedValueOnce([
+      { key: "appearance.polarity", line: 5, message: "" },
+    ]);
+    await configStore.noticeUnreadValues();
+
+    expect(vi.mocked(dismissToast)).toHaveBeenCalledWith(7);
+    expect(vi.mocked(showToast)).toHaveBeenCalledTimes(2);
+    expect(vi.mocked(showToast).mock.calls[1][0]).toContain("appearance.polarity on line 5");
+
+    mockedDiagnostics.mockResolvedValueOnce([]);
+    await configStore.noticeUnreadValues();
+  });
 });

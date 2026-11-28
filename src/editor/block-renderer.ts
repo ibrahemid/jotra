@@ -16,12 +16,19 @@ export interface BlockRenderer {
   renderDiagram(source: string, theme: BlockTheme): Promise<string>;
 }
 
+/**
+ * Why a block could not be drawn: its source has an error, or the renderer
+ * itself did not load, which a later attempt may get past.
+ */
+export type BlockFailureReason = "source" | "runtime";
+
 /** A block that could not be drawn. `line` is the diagram line an error names. */
 export class BlockRenderError extends Error {
   constructor(
     readonly kind: "math" | "diagram",
     message: string,
     readonly line: number | null = null,
+    readonly reason: BlockFailureReason = "source",
   ) {
     super(message);
     this.name = "BlockRenderError";
@@ -30,6 +37,7 @@ export class BlockRenderError extends Error {
 
 // ─── Math ──────────────────────────────────────────────────────────────────
 
+// Singleton state — Jotra is single-window
 let mathStyles: Promise<unknown> | null = null;
 
 /** KaTeX's stylesheet and fonts, fetched the first time math is drawn. */
@@ -41,7 +49,12 @@ function loadMathStyles(): void {
 }
 
 async function typesetOnPage(tex: string, display: boolean): Promise<string> {
-  const katex = (await import("katex")).default;
+  let katex: typeof import("katex").default;
+  try {
+    katex = (await import("katex")).default;
+  } catch {
+    throw new BlockRenderError("math", "the math renderer did not load", null, "runtime");
+  }
   return typesetMath(katex, tex, display);
 }
 
@@ -116,9 +129,46 @@ interface MermaidApi {
   render(id: string, text: string): Promise<{ svg: string }>;
 }
 
-function pageMermaid(): MermaidApi | undefined {
-  return (window as unknown as { mermaid?: MermaidApi }).mermaid;
+function mermaidIn(scope: Window): MermaidApi | undefined {
+  return (scope as unknown as { mermaid?: MermaidApi }).mermaid;
 }
+
+// The app's own reset, so text is measured in the frame as the editor shows it.
+const FRAME_RESET = "*,*::before,*::after{margin:0;padding:0;box-sizing:border-box}";
+
+// Singleton state — Jotra is single-window
+let drawingFrame: HTMLIFrameElement | null = null;
+
+/**
+ * The window diagrams are drawn in: a frame with no address of its own, so it
+ * keeps the app's origin and policy, laid out out of sight and never removed.
+ * Mermaid builds a drawing in the document it runs in, so the raw markup lands
+ * in this frame's document, never in the editor's, which receives only what
+ * `sanitizedFragment` keeps of it.
+ */
+export function diagramWindow(): Window {
+  const held = drawingFrame?.contentWindow;
+  if (held) return held;
+  const frame = document.createElement("iframe");
+  frame.setAttribute("aria-hidden", "true");
+  frame.tabIndex = -1;
+  frame.style.cssText =
+    "position:fixed;left:-10000px;top:0;width:1200px;height:900px;border:0;visibility:hidden;pointer-events:none";
+  document.body.appendChild(frame);
+  const scope = frame.contentWindow;
+  if (!scope) {
+    frame.remove();
+    throw new BlockRenderError("diagram", "the diagram frame did not open", null, "runtime");
+  }
+  const reset = scope.document.createElement("style");
+  reset.textContent = FRAME_RESET;
+  scope.document.head.appendChild(reset);
+  drawingFrame = frame;
+  return scope;
+}
+
+/** How long the drawer answers at once, after the runtime failed to load, before it fetches it again. */
+const RUNTIME_RELOAD_MS = 1000;
 
 function nextTask(): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, 0));
@@ -133,19 +183,20 @@ function errorLine(error: unknown): number | null {
 /**
  * Draws diagrams one at a time, each in a task of its own, so a document of
  * diagrams never holds the page for longer than one of them takes. Mermaid
- * lays a diagram out by measuring text in the document, which a worker does
+ * lays a diagram out by measuring text in a document, which a worker does
  * not have: this is the one part of a block's drawing that runs on the
- * page's thread.
+ * page's thread, in `diagramWindow`.
  *
- * The runtime is the file the preview loads (`mermaid.min.js`), fetched the
- * first time a diagram is drawn, and set up as the preview sets it up:
- * `securityLevel: "strict"` and a theme for each polarity.
+ * The runtime is the file the preview loads (`mermaid.min.js`), fetched into
+ * that window the first time a diagram is drawn, and set up as the preview
+ * sets it up: `securityLevel: "strict"` and a theme for each polarity.
  */
 class DiagramDrawer {
   private runtime: Promise<MermaidApi> | null = null;
   private queue: Promise<unknown> = Promise.resolve();
   private theme: BlockTheme | null = null;
   private drawn = 0;
+  private failedLoadAt = Number.NEGATIVE_INFINITY;
 
   draw(source: string, theme: BlockTheme): Promise<string> {
     const job = this.queue.then(nextTask).then(() => this.drawNow(source, theme));
@@ -159,8 +210,7 @@ class DiagramDrawer {
       mermaid.initialize({
         startOnLoad: false,
         securityLevel: "strict",
-        // Mermaid draws into the live document before the sanitizer sees the
-        // SVG, so a directive in the file must not be able to set CSS there.
+        // A directive in the file must not be able to set CSS in the drawing.
         secure: ["secure", "securityLevel", "startOnLoad", "maxTextSize", "suppressErrorRendering", "maxEdges", "themeCSS", "themeVariables", "fontFamily"],
         theme: theme === "dark" ? "dark" : "default",
       });
@@ -178,33 +228,45 @@ class DiagramDrawer {
         errorLine(error),
       );
     } finally {
-      // A failed render can leave its scratch element in the page.
-      document.getElementById(`d${id}`)?.remove();
-      document.getElementById(id)?.remove();
+      // A failed render can leave its scratch element in the frame.
+      const scratch = diagramWindow().document;
+      scratch.getElementById(`d${id}`)?.remove();
+      scratch.getElementById(id)?.remove();
     }
   }
 
   private load(): Promise<MermaidApi> {
+    // The diagrams queued behind a failed load fail with it, not one fetch each.
+    if (this.runtime === null && Date.now() - this.failedLoadAt < RUNTIME_RELOAD_MS) {
+      return Promise.reject(new BlockRenderError("diagram", "the diagram runtime did not load", null, "runtime"));
+    }
     this.runtime ??= new Promise<MermaidApi>((resolve, reject) => {
-      const present = pageMermaid();
+      const scope = diagramWindow();
+      const present = mermaidIn(scope);
       if (present) {
         resolve(present);
         return;
       }
-      const script = document.createElement("script");
-      script.src = mermaidRuntimeUrl;
+      const script = scope.document.createElement("script");
+      script.src = new URL(mermaidRuntimeUrl, document.baseURI).href;
       script.async = true;
       script.addEventListener("load", () => {
-        const loaded = pageMermaid();
-        if (loaded) resolve(loaded);
-        else reject(new BlockRenderError("diagram", "the diagram runtime loaded without its API"));
+        const loaded = mermaidIn(scope);
+        if (loaded) {
+          resolve(loaded);
+          return;
+        }
+        script.remove();
+        reject(new BlockRenderError("diagram", "the diagram runtime loaded without its API", null, "runtime"));
       });
-      script.addEventListener("error", () =>
-        reject(new BlockRenderError("diagram", "the diagram runtime did not load")),
-      );
-      document.head.appendChild(script);
+      script.addEventListener("error", () => {
+        script.remove();
+        reject(new BlockRenderError("diagram", "the diagram runtime did not load", null, "runtime"));
+      });
+      scope.document.head.appendChild(script);
     }).catch((error: unknown) => {
       this.runtime = null;
+      this.failedLoadAt = Date.now();
       logFailure("the diagram runtime could not be loaded");
       throw error;
     });
@@ -252,6 +314,7 @@ export function createBlockRenderer(): BlockRenderer {
   };
 }
 
+// Singleton state — Jotra is single-window
 let shared: BlockRenderer | null = null;
 
 /** The renderer every editor in the window shares. */

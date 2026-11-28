@@ -1,5 +1,6 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
-import { EditorState, type TransactionSpec } from "@codemirror/state";
+import { EditorState, Transaction, type TransactionSpec } from "@codemirror/state";
+import { history } from "@codemirror/commands";
 import type { SpellingLint } from "../../types/spelling";
 
 const checkMock = vi.fn();
@@ -12,6 +13,7 @@ vi.mock("../../services/tauri", () => ({
 
 import { spellingStore } from "../../stores/global/spelling";
 import { spellingEntries, spellingExtension } from "../../editor/spelling";
+import { dismissToast, runToastAction, toasts } from "../../stores/global/notifications";
 
 class FakeView {
   state: EditorState;
@@ -267,5 +269,80 @@ describe("spellingStore", () => {
     expect(spellingStore.count()).toBe(3);
     spellingStore.deactivate();
     expect(spellingStore.count()).toBe(0);
+  });
+});
+
+describe("spellingStore Apply", () => {
+  class HistoryView {
+    state: EditorState;
+
+    constructor(doc: string) {
+      this.state = EditorState.create({ doc, extensions: [history(), spellingExtension(() => {})] });
+    }
+
+    // Bound, as EditorView binds it: commands call `dispatch` detached.
+    dispatch = (spec: TransactionSpec | Transaction) => {
+      this.state = (spec instanceof Transaction ? spec : this.state.update(spec)).state;
+    };
+
+    focus() {}
+  }
+
+  let fixed: HistoryView;
+
+  async function showFlagged(doc: string, ...words: string[]) {
+    flags(...words);
+    fixed = new HistoryView(doc);
+    spellingStore.attach(fixed as never);
+    spellingStore.requestCheck();
+    await settle();
+  }
+
+  function lastToast() {
+    return toasts()[toasts().length - 1];
+  }
+
+  beforeEach(() => {
+    vi.useFakeTimers();
+    checkMock.mockReset();
+    spellingStore.detach();
+    for (const toast of toasts()) dismissToast(toast.id);
+  });
+
+  afterEach(() => {
+    spellingStore.detach();
+    vi.useRealTimers();
+  });
+
+  it("says how many words changed and puts them back on Undo", async () => {
+    await showFlagged("teh cat and recieve dog", "teh", "recieve");
+
+    expect(spellingStore.applyEntries(spellingStore.entries())).toBe(2);
+    expect(fixed.state.doc.toString()).toBe("x cat and x dog");
+    const toast = lastToast();
+    expect(toast.text).toBe("Fixed 2 words");
+    expect(toast.action?.label).toBe("Undo");
+
+    runToastAction(toast.id);
+    await Promise.resolve();
+    expect(fixed.state.doc.toString()).toBe("teh cat and recieve dog");
+  });
+
+  it("withdraws the Undo once the file changes after the fix", async () => {
+    await showFlagged("teh cat", "teh");
+    spellingStore.applyEntries(spellingStore.entries());
+    expect(lastToast()?.text).toBe("Fixed 1 word");
+
+    fixed.dispatch({ changes: { from: fixed.state.doc.length, insert: "s" } });
+    spellingStore.requestCheck();
+
+    expect(toasts()).toEqual([]);
+    expect(fixed.state.doc.toString()).toBe("x cats");
+  });
+
+  it("says nothing when no word changed", async () => {
+    await showFlagged("the cat");
+    expect(spellingStore.applyEntries(spellingStore.entries())).toBe(0);
+    expect(toasts()).toEqual([]);
   });
 });

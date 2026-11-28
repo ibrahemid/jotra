@@ -1306,16 +1306,6 @@ export async function previewListRenderers(): Promise<PreviewRendererInfo[]> {
   return invoke("preview_list_renderers");
 }
 
-export async function previewRender(
-  bufferId: string,
-  contentType: string,
-  text: string,
-  theme: ThemePolarity,
-  zoom: number,
-): Promise<PreviewRenderResult> {
-  return invoke("preview_render", { bufferId, contentType, text, theme, zoom });
-}
-
 export async function previewForceRender(
   bufferId: string,
   contentType: string,
@@ -1686,6 +1676,17 @@ export async function captureTarget(): Promise<string> {
  * the keyboard back. */
 export async function closeCapture(returnFocus: boolean): Promise<void> {
   return invoke("capture_close", { returnFocus });
+}
+
+/** The capture note's unsent text, kept across a quit. */
+export async function captureDraft(): Promise<string> {
+  return invoke("capture_draft");
+}
+
+/** Hands the capture note's text to the app, which writes it to disk when the
+ * note hides and when the app quits. */
+export async function keepCaptureDraft(text: string): Promise<void> {
+  return invoke("capture_keep_draft", { text });
 }
 
 // --- Open at login ---

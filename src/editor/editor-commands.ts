@@ -1,16 +1,18 @@
 import type { EditorView } from "@codemirror/view";
 import { EDITOR_COMMANDS } from "./editor-command-table";
+import { FOLD_COMMANDS, foldChord } from "./folding";
 import { registerCommand, unregisterCommand } from "../commands/registry";
 import { rebuildKeyMap } from "../commands/keybindings";
+import { detectPlatform } from "../lib/platform";
 
 export type { EditorCommandSpec } from "./editor-command-table";
 export { EDITOR_COMMANDS, OWNED_CM_COMMANDS } from "./editor-command-table";
 
 /**
- * Registers every entry in {@link EDITOR_COMMANDS} with `scope: "editor"` and
- * rebuilds the chord map so a table chord resolves immediately, without relying
- * on a later effect to rebuild. Returns a disposer that unregisters them all
- * and rebuilds again.
+ * Registers every entry in {@link EDITOR_COMMANDS} and {@link FOLD_COMMANDS}
+ * with `scope: "editor"` and rebuilds the chord map so a table chord resolves
+ * immediately, without relying on a later effect to rebuild. Returns a
+ * disposer that unregisters them all and rebuilds again.
  */
 export function registerEditorCommands(getView: () => EditorView | null): () => void {
   for (const spec of EDITOR_COMMANDS) {
@@ -28,10 +30,26 @@ export function registerEditorCommands(getView: () => EditorView | null): () => 
       },
     });
   }
+  const platform = detectPlatform();
+  for (const fold of FOLD_COMMANDS) {
+    registerCommand({
+      id: fold.id,
+      label: fold.label,
+      keywords: [...fold.keywords],
+      keybinding: foldChord(fold, platform),
+      scope: "editor",
+      execute: () => {
+        const view = getView();
+        if (!view) return false;
+        return fold.run(view);
+      },
+    });
+  }
   rebuildKeyMap();
 
   return () => {
     for (const spec of EDITOR_COMMANDS) unregisterCommand(spec.id);
+    for (const fold of FOLD_COMMANDS) unregisterCommand(fold.id);
     rebuildKeyMap();
   };
 }

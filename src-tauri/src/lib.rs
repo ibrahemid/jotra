@@ -4,6 +4,7 @@ mod bundle_rename;
 pub mod bus_subscribers;
 pub mod capture;
 pub mod commands;
+pub mod devtools;
 pub mod dictation;
 pub mod events;
 pub mod first_run;
@@ -73,6 +74,8 @@ pub(crate) fn finish_shutdown(app_handle: &tauri::AppHandle) {
         &app_handle.state::<commands::chat::ChatState>(),
         commands::chat::CHAT_SHUTDOWN_BUDGET,
     );
+
+    capture::write_draft(app_handle);
 
     let pending = state.fts_scheduler.drain_pending();
     if !pending.is_empty() {
@@ -672,7 +675,6 @@ pub fn run() {
             commands::update::restart_app,
             commands::preview::preview_list_renderers,
             commands::preview::preview_close,
-            commands::preview::preview_render,
             commands::preview::preview_force_render,
             commands::preview::preview_set_layout,
             commands::preview::preview_get_layout,
@@ -714,6 +716,8 @@ pub fn run() {
             commands::capture::capture_append,
             commands::capture::capture_target,
             commands::capture::capture_close,
+            commands::capture::capture_draft,
+            commands::capture::capture_keep_draft,
             commands::login_item::launch_at_login_status,
             commands::login_item::set_launch_at_login,
             commands::notices::open_third_party_notices,
@@ -787,6 +791,7 @@ pub fn run() {
             windows_rename::spawn_rename_step(&handle, windows_rename::CurrentUserRegistry);
             #[cfg(target_os = "linux")]
             linux_rename::spawn_rename_steps(&handle);
+            commands::login_item::spawn_reconcile(&handle);
 
             // Started by the login item: the window stays hidden until the
             // chord, the Dock or a second launch asks for it, so neither
@@ -824,6 +829,9 @@ pub fn run() {
                 let state = maintenance_handle.state::<AppState>();
                 state.wait_for_reveal(FIRST_PAINT_FALLBACK * 2);
                 state.run_startup_maintenance();
+                if let Err(error) = commands::notices::retire_old_notices(&state) {
+                    tracing::warn!(%error, "the earlier licence listing could not be removed");
+                }
             });
 
             let fallback_handle = handle.clone();
@@ -900,6 +908,11 @@ pub fn run() {
 
             if let Err(e) = hotkey::setup_global_hotkey(&handle) {
                 tracing::warn!(error = %e, "failed to register global hotkey");
+            }
+
+            #[cfg(debug_assertions)]
+            if let Err(e) = app.add_capability(devtools::devtools_toggle_capability()) {
+                tracing::warn!(error = %e, "failed to grant the devtools toggle");
             }
 
             {

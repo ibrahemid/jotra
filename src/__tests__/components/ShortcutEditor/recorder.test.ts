@@ -124,6 +124,13 @@ describe("findConflicts across platforms", () => {
     expect(findConflicts(draft, "win").get("a.cmd")).toEqual(["b.cmd"]);
     expect(findConflicts(draft, "mac").size).toBe(0);
   });
+
+  it("counts a chord spelled another way as the same keys", () => {
+    const draft = { "a.cmd": "shift+cmdorctrl+k", "b.cmd": "CmdOrCtrl+Shift+K" };
+    expect(findConflicts(draft, "win").get("a.cmd")).toEqual(["b.cmd"]);
+    const onMac = { "a.cmd": "Cmd+Option+up", "b.cmd": "CmdOrCtrl+Alt+ArrowUp" };
+    expect(findConflicts(onMac, "mac").get("b.cmd")).toEqual(["a.cmd"]);
+  });
 });
 
 describe("findFixedConflicts", () => {
@@ -137,6 +144,12 @@ describe("findFixedConflicts", () => {
     );
     expect(conflicts.get("a.cmd")).toBe("Quit Jotra");
     expect(conflicts.has("b.cmd")).toBe(false);
+  });
+
+  it("names the menu item a draft spelled another way would collide with", () => {
+    expect(findFixedConflicts({ "a.cmd": "command+q" }, fixed, "mac").get("a.cmd")).toBe(
+      "Quit Jotra",
+    );
   });
 
   it("finds nothing with no fixed chords", () => {

@@ -11,18 +11,19 @@ interface Props {
   onCommit: () => void;
   /** What the handle resizes, for assistive tech; the preview split's when not given. */
   label?: string;
+  /** The narrowest and widest ratio; the preview split's when not given. */
+  bounds?: { min: number; max: number };
 }
 
 const MIN_RATIO = 0.15;
 const MAX_RATIO = 0.85;
 const KEY_STEP = 0.02;
 
-function clamp(r: number): number {
-  return Math.min(MAX_RATIO, Math.max(MIN_RATIO, r));
-}
-
 export default function PreviewSplit(props: Props) {
   let dragging = false;
+  const min = () => props.bounds?.min ?? MIN_RATIO;
+  const max = () => props.bounds?.max ?? MAX_RATIO;
+  const clamp = (r: number) => Math.min(max(), Math.max(min(), r));
 
   function onPointerDown(e: PointerEvent) {
     e.preventDefault();
@@ -64,8 +65,8 @@ export default function PreviewSplit(props: Props) {
       role="separator"
       aria-orientation={props.orientation}
       aria-valuenow={Math.round(props.ratio * 100)}
-      aria-valuemin={Math.round(MIN_RATIO * 100)}
-      aria-valuemax={Math.round(MAX_RATIO * 100)}
+      aria-valuemin={Math.round(min() * 100)}
+      aria-valuemax={Math.round(max() * 100)}
       aria-label={props.label ?? "Resize preview split"}
       tabIndex={0}
       onPointerDown={onPointerDown}

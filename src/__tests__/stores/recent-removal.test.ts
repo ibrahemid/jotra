@@ -20,7 +20,11 @@ vi.mock("../../services/tauri", () => ({
 vi.mock("../../stores/global/notifications", () => ({ showToast: h.showToast }));
 
 import { bufferRegistry } from "../../stores/global/buffer-registry";
-import { removeFromRecent, removeOneFromRecent } from "../../stores/global/recent-removal";
+import {
+  dropPendingRecentRemovals,
+  removeFromRecent,
+  removeOneFromRecent,
+} from "../../stores/global/recent-removal";
 import type { ToastRequest } from "../../stores/global/notifications";
 
 function closed(id: string): BufferDocument {
@@ -96,5 +100,27 @@ describe("Clear Recent", () => {
     await vi.waitFor(() => expect(h.deleteBuffer).toHaveBeenCalledTimes(2));
     expect(h.clearHistory).not.toHaveBeenCalled();
     expect(shown()).toEqual(["c"]);
+  });
+});
+
+describe("quitting with the Undo still on screen", () => {
+  it("deletes the hidden rows before the window goes, and only once", async () => {
+    removeOneFromRecent("b");
+    await dropPendingRecentRemovals();
+    expect(h.deleteBuffer).toHaveBeenCalledWith("b");
+
+    toast().onClose!(false);
+    await dropPendingRecentRemovals();
+    expect(h.deleteBuffer).toHaveBeenCalledTimes(1);
+  });
+
+  it("deletes nothing that Undo brought back", async () => {
+    removeFromRecent(["a", "c"], "Cleared Recent");
+    toast().action!.run();
+    toast().onClose!(true);
+    await dropPendingRecentRemovals();
+    expect(h.deleteBuffer).not.toHaveBeenCalled();
+    expect(h.clearHistory).not.toHaveBeenCalled();
+    expect(shown()).toEqual(["a", "b", "c"]);
   });
 });

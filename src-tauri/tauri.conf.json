@@ -28,7 +28,7 @@
             }
         ],
         "security": {
-            "csp": "default-src 'self'; connect-src 'self' ipc: http://ipc.localhost; img-src 'self' data: jotra-preview:; style-src 'self' 'unsafe-inline'; script-src 'self'; font-src 'self' data:; object-src 'none'; base-uri 'self'; frame-src jotra-preview:; form-action 'none'; frame-ancestors 'none'"
+            "csp": "default-src 'self'; connect-src ipc: http://ipc.localhost; img-src 'self' data: jotra-preview:; style-src 'self' 'unsafe-inline'; script-src 'self'; font-src 'self' data:; object-src 'none'; base-uri 'self'; frame-src jotra-preview:; form-action 'none'; frame-ancestors 'none'"
         }
     },
     "plugins": {

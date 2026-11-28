@@ -1,7 +1,8 @@
 import { describe, it, expect } from "vitest";
 import { EditorView } from "@codemirror/view";
 import { EditorState } from "@codemirror/state";
-import { autoTextDirection, buildAutoDirectionDecorations } from "../../editor/bidi";
+import { autoDirectionOf, autoTextDirection, buildAutoDirectionDecorations } from "../../editor/bidi";
+import { MAX_NORMAL_LINE_LENGTH } from "../../editor/large-file";
 
 const MIXED_DOC = ["مرحبا بالعالم", "const greeting = 1;", "سطر عربي آخر"].join("\n");
 
@@ -78,5 +79,25 @@ describe("autoTextDirection", () => {
       expect(line.getAttribute("dir")).toBe("auto");
     }
     view.destroy();
+  });
+});
+
+describe("autoDirectionOf", () => {
+  it("follows the first strong character, past neutral heading marks and digits", () => {
+    expect(autoDirectionOf("# مرحبا بالعالم")).toBe("rtl");
+    expect(autoDirectionOf("## 2026 שלום")).toBe("rtl");
+    expect(autoDirectionOf("# Hello مرحبا")).toBe("ltr");
+    expect(autoDirectionOf("« مرحبا »")).toBe("rtl");
+  });
+
+  it("reads a line with no strong character, and one too long for dir=auto, as left-to-right", () => {
+    expect(autoDirectionOf("# 123 -- !")).toBe("ltr");
+    expect(autoDirectionOf("")).toBe("ltr");
+    expect(autoDirectionOf("م".repeat(MAX_NORMAL_LINE_LENGTH + 1))).toBe("ltr");
+  });
+
+  it("takes the right-to-left and left-to-right marks as strong", () => {
+    expect(autoDirectionOf("\u200F# 1. Title")).toBe("rtl");
+    expect(autoDirectionOf("\u200E# مرحبا")).toBe("ltr");
   });
 });

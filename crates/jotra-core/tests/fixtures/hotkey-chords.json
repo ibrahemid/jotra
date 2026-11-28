@@ -1,0 +1,70 @@
+{
+  "mac": {
+    "same": [
+      ["cmd+shift+space", "CmdOrCtrl+Shift+Space"],
+      ["COMMAND+SHIFT+SPACE", "CmdOrCtrl+Shift+Space"],
+      ["cmdorctrl+shift+space", "CmdOrCtrl+Shift+Space"],
+      ["Super+Shift+Space", "Meta+Shift+Space"],
+      ["Mod+Option+Space", "CtrlOrCmd+Alt+Space"],
+      ["Space+Shift+CmdOrCtrl", "CmdOrCtrl+Shift+Space"],
+      ["CmdOrCtrl+Cmd+Shift+Space", "CmdOrCtrl+Shift+Space"],
+      ["control+opt+return", "Ctrl+Alt+Enter"],
+      ["CmdOrCtrl+Alt+up", "CmdOrCtrl+Alt+ArrowUp"],
+      ["CmdOrCtrl+esc", "CmdOrCtrl+Escape"],
+      ["CmdOrCtrl+Shift+backslash", "CmdOrCtrl+Shift+\\"],
+      ["CmdOrCtrl+f07", "CmdOrCtrl+F7"],
+      ["CmdOrCtrl+Shift+n", "CmdOrCtrl+Shift+N"],
+      [" CmdOrCtrl + Shift + Space ", "CmdOrCtrl+Shift+Space"],
+      ["\u0085CmdOrCtrl+Shift+Space\u3000", "CmdOrCtrl+Shift+Space"]
+    ],
+    "different": [
+      ["CmdOrCtrl+Space", "Ctrl+Space"],
+      ["Cmd+Shift+Space", "Control+Shift+Space"],
+      ["CmdOrCtrl+Shift+Space", "CmdOrCtrl+Shift+Alt+Space"],
+      ["CmdOrCtrl+Shift+1", "CmdOrCtrl+Shift+F1"]
+    ]
+  },
+  "other": {
+    "same": [
+      ["CmdOrCtrl+Space", "Ctrl+Space"],
+      ["control+shift+space", "CmdOrCtrl+Shift+Space"],
+      ["Mod+Shift+Space", "Ctrl+Shift+Space"],
+      ["CmdOrCtrl+Ctrl+Space", "Ctrl+Space"],
+      ["Super+Shift+Space", "cmd+shift+space"],
+      ["Meta+Alt+Space", "Command+Option+Space"],
+      ["ctrl+alt+right", "Ctrl+Alt+ArrowRight"],
+      ["CmdOrCtrl+period", "CmdOrCtrl+."]
+    ],
+    "different": [
+      ["Cmd+Shift+Space", "CmdOrCtrl+Shift+Space"],
+      ["Super+Space", "Ctrl+Space"],
+      ["CmdOrCtrl+Alt+Space", "CmdOrCtrl+Space"]
+    ]
+  },
+  "spelledKeys": [
+    ["a", "KeyA"],
+    ["Z", "KeyZ"],
+    ["0", "Digit0"],
+    ["9", "Digit9"],
+    ["f1", "F1"],
+    ["F07", "F7"],
+    ["F24", "F24"]
+  ],
+  "unparsed": [
+    "",
+    "   ",
+    "CmdOrCtrl+Shift",
+    "CmdOrCtrl++",
+    "CmdOrCtrl+ +Space",
+    "CmdOrCtrl+A+B",
+    "CommandOrControl+Shift+Space",
+    "Hyper+Space",
+    "CmdOrCtrl+F0",
+    "CmdOrCtrl+F25",
+    "CmdOrCtrl+F256",
+    "CmdOrCtrl+Backspace",
+    "CmdOrCtrl+\u212a",
+    "CmdOrCtrl+\u0131",
+    "\ufeffCmdOrCtrl+Shift+Space"
+  ]
+}

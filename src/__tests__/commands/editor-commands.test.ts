@@ -1,5 +1,6 @@
 import { describe, it, expect } from "vitest";
 import { EDITOR_COMMANDS } from "../../editor/editor-commands";
+import { FOLD_COMMANDS } from "../../editor/folding";
 import { normalizeKey } from "../../commands/keybindings";
 import { findKeybindingConflicts } from "./keybinding-conflicts";
 import type { Command } from "../../types/commands";
@@ -92,6 +93,14 @@ describe("EDITOR_COMMANDS", () => {
     const all = [...EDITOR_AS_COMMANDS, ...FORMAT_COMMANDS, ...OTHER_REGISTERED];
     const conflicts = findKeybindingConflicts(all);
     expect([...conflicts.keys()]).toEqual([]);
+  });
+
+  it("gives the fold chords of each platform to no other command", () => {
+    for (const side of ["mac", "other"] as const) {
+      const folds = FOLD_COMMANDS.map((fold) => stub(fold.id, fold[side]));
+      const all = [...EDITOR_AS_COMMANDS, ...FORMAT_COMMANDS, ...OTHER_REGISTERED, ...folds];
+      expect([...findKeybindingConflicts(all).keys()], side).toEqual([]);
+    }
   });
 
   it("round-trips every chord through normalizeKey from a synthesized event", () => {

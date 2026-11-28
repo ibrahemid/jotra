@@ -24,6 +24,9 @@ use jotra_tauri_lib::commands::buffer::{
     close_buffer_inner, read_buffer_content_inner, save_buffer_content_inner,
 };
 use jotra_tauri_lib::commands::file::open_generated_document;
+use jotra_tauri_lib::commands::notices::{
+    retire_old_notices, RETIRED_NOTICES_TITLE, THIRD_PARTY_NOTICES_TITLE,
+};
 use jotra_tauri_lib::preview::handler::RenderCache;
 use jotra_tauri_lib::quit::QuitState;
 use jotra_tauri_lib::security::AuthorizedPaths;
@@ -320,4 +323,75 @@ fn a_generated_document_reopened_after_a_restart_reports_no_outside_change() {
         0,
         "nothing changed under the document, so nothing may be announced"
     );
+}
+
+fn generated_names(state: &AppState) -> Vec<String> {
+    let mut names: Vec<String> = std::fs::read_dir(state.jotra_dir.join("generated"))
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    names.sort();
+    names
+}
+
+fn rows(state: &AppState) -> usize {
+    let store = state.store.lock().unwrap();
+    [
+        jotra_core::buffer::document::BufferStatus::Active,
+        jotra_core::buffer::document::BufferStatus::History,
+    ]
+    .into_iter()
+    .map(|status| store.list_by_status(status).unwrap().len())
+    .sum()
+}
+
+#[test]
+fn the_listing_an_earlier_build_left_is_removed_with_its_closed_tab() {
+    let dir = TempDir::new().unwrap();
+    let state = make_state(&dir);
+    let old = open_generated_document(&state, RETIRED_NOTICES_TITLE, "old").expect("open");
+    close_buffer_inner(&state, &old.doc.expect("the file opened").id).expect("close the tab");
+    open_generated_document(&state, THIRD_PARTY_NOTICES_TITLE, "new").expect("open");
+
+    assert!(retire_old_notices(&state).expect("retire"));
+
+    assert_eq!(
+        generated_names(&state),
+        [format!("{THIRD_PARTY_NOTICES_TITLE}.md")]
+    );
+    assert_eq!(rows(&state), 1, "only the current listing's tab is left");
+}
+
+#[test]
+fn an_earlier_listing_still_open_in_a_tab_is_kept() {
+    let dir = TempDir::new().unwrap();
+    let state = make_state(&dir);
+    open_generated_document(&state, RETIRED_NOTICES_TITLE, "old").expect("open");
+
+    assert!(!retire_old_notices(&state).expect("retire"));
+
+    assert_eq!(
+        generated_names(&state),
+        [format!("{RETIRED_NOTICES_TITLE}.md")]
+    );
+    assert_eq!(rows(&state), 1);
+}
+
+#[test]
+fn a_data_folder_with_no_earlier_listing_is_left_alone() {
+    let dir = TempDir::new().unwrap();
+    let state = make_state(&dir);
+    open_generated_document(&state, THIRD_PARTY_NOTICES_TITLE, "new").expect("open");
+
+    assert!(!retire_old_notices(&state).expect("retire"));
+    assert_eq!(
+        generated_names(&state),
+        [format!("{THIRD_PARTY_NOTICES_TITLE}.md")]
+    );
+}
+
+#[test]
+fn startup_retires_the_earlier_listing() {
+    let lib_rs = include_str!("../src/lib.rs");
+    assert!(lib_rs.contains("commands::notices::retire_old_notices(&state)"));
 }

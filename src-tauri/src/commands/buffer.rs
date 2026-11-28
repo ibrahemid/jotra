@@ -112,6 +112,9 @@ pub const ERR_FILE_MISSING: &str = "ERR_FILE_MISSING";
 /// disconnected network volume looks like.
 pub const ERR_WRITE_TIMED_OUT: &str = "ERR_WRITE_TIMED_OUT";
 
+/// Code a save carries when the disk has no room for the write.
+pub const ERR_DISK_FULL: &str = "ERR_DISK_FULL";
+
 /// Code a save carries when the write failed for a reason with no sentence of
 /// its own.
 ///
@@ -157,6 +160,12 @@ pub fn failure_code(error: &StorageError) -> &'static str {
         StorageError::DestinationFolderNotWritable { .. } => ERR_FOLDER_NOT_WRITABLE,
         StorageError::EncodingLossy { .. } => ERR_ENCODING_LOSSY,
         StorageError::Io(io) => io_failure_code(io.kind()),
+        StorageError::AtomicWrite(atomic) => match atomic {
+            jotra_storage::atomic::AtomicWriteError::HardLinked { .. } => ERR_HARD_LINKED,
+            jotra_storage::atomic::AtomicWriteError::ReadOnly => ERR_READ_ONLY_DESTINATION,
+            jotra_storage::atomic::AtomicWriteError::FolderNotWritable => ERR_FOLDER_NOT_WRITABLE,
+            jotra_storage::atomic::AtomicWriteError::Io(io) => io_failure_code(io.kind()),
+        },
         _ => ERR_WRITE_FAILED,
     }
 }
@@ -172,6 +181,7 @@ fn io_failure_code(kind: std::io::ErrorKind) -> &'static str {
         std::io::ErrorKind::ResourceBusy => ERR_FILE_IN_USE,
         std::io::ErrorKind::NotFound => ERR_FILE_MISSING,
         std::io::ErrorKind::TimedOut => ERR_WRITE_TIMED_OUT,
+        std::io::ErrorKind::StorageFull => ERR_DISK_FULL,
         _ => ERR_WRITE_FAILED,
     }
 }
@@ -2216,7 +2226,7 @@ pub fn close_buffer_inner(state: &AppState, id: &str) -> Result<(), String> {
     state.forget_disk_state(id);
     state.forget_source_record(id);
     state.stop_following_note(id);
-    state.preview_render_cache.release_remote_images(id);
+    state.preview_render_cache.release_buffer(id);
     Ok(())
 }
 
@@ -2262,7 +2272,7 @@ pub fn close_buffers_inner(state: &AppState, ids: &[String]) -> Result<(), Strin
         state.forget_disk_state(id);
         state.forget_source_record(id);
         state.stop_following_note(id);
-        state.preview_render_cache.release_remote_images(id);
+        state.preview_render_cache.release_buffer(id);
     }
     Ok(())
 }
@@ -2296,7 +2306,7 @@ pub(crate) fn delete_buffer_in_turn(state: &AppState, turn: &Turn) -> Result<(),
     state.forget_disk_state(id);
     state.forget_source_record(id);
     state.stop_following_note(id);
-    state.preview_render_cache.release_remote_images(id);
+    state.preview_render_cache.release_buffer(id);
     Ok(())
 }
 
