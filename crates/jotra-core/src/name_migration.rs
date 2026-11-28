@@ -25,6 +25,9 @@ pub enum MigrationStep {
     LoginItem,
     /// The command links pointed at the renamed bundle.
     CommandLinks,
+    /// The Dock's tiles for the bundle under the old name pointed at the new
+    /// one.
+    Dock,
     /// The Linux autostart entry renamed.
     LinuxAutostart,
     /// The Windows `Run` value moved to the new name.
@@ -33,11 +36,12 @@ pub enum MigrationStep {
 
 impl MigrationStep {
     /// Every step, in the order the record lists them.
-    pub const ALL: [Self; 6] = [
+    pub const ALL: [Self; 7] = [
         Self::BundleRename,
         Self::BundleLink,
         Self::LoginItem,
         Self::CommandLinks,
+        Self::Dock,
         Self::LinuxAutostart,
         Self::WindowsRunValue,
     ];
@@ -49,6 +53,7 @@ impl MigrationStep {
             Self::BundleLink => "bundle_link",
             Self::LoginItem => "login_item",
             Self::CommandLinks => "command_links",
+            Self::Dock => "dock",
             Self::LinuxAutostart => "linux_autostart",
             Self::WindowsRunValue => "windows_run_value",
         }

@@ -32,6 +32,7 @@ fn every_step_has_its_own_key() {
             "bundle_link",
             "login_item",
             "command_links",
+            "dock",
             "linux_autostart",
             "windows_run_value"
         ]
