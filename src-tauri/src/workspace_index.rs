@@ -22,13 +22,16 @@
 //! per write. A `build_epoch` supersedes any in-flight build when the root
 //! changes, so a stale walk can never clobber a newer one.
 
+use std::collections::HashSet;
 use std::hash::{BuildHasher, RandomState};
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::sync::{Arc, RwLock};
 
 use hashbrown::HashTable;
 use jotra_core::workspace::file_search::{rank_file_hits, FileHit};
-use jotra_storage::workspace_search::{walk_index, IndexWalk, WorkspaceIgnore};
+use jotra_storage::workspace_search::{
+    is_rules_file_name, walk_index, walk_index_within, IndexWalk, WorkspaceIgnore,
+};
 
 /// Upper bound on indexed files; past it the index is marked truncated.
 pub const MAX_INDEXED_FILES: usize = 200_000;
@@ -36,6 +39,10 @@ pub const MAX_INDEXED_FILES: usize = 200_000;
 /// Upper bound on changes queued during one build; past it the build walks
 /// once more instead of replaying them.
 pub const MAX_PENDING_CHANGES: usize = 4_096;
+
+/// Upper bound on files a sweep's patch walks on the watcher thread; past it
+/// the sweep walks the whole tree in the background instead.
+pub const MAX_SWEEP_WALK: usize = 4_096;
 
 /// Shared handle to the workspace index, cloned into the watcher subscriber and
 /// the build thread.
@@ -84,6 +91,12 @@ enum Change {
     Upsert(String),
     /// Nothing is at this relative path any more.
     Remove(String),
+    /// What is at or under each of `cleared` is now exactly the `found` files
+    /// a walk of those paths listed.
+    Replace {
+        cleared: Vec<String>,
+        found: Vec<String>,
+    },
 }
 
 /// The workspace file-name index.
@@ -260,6 +273,32 @@ impl WorkspaceIndex {
         match change {
             Change::Upsert(rel) => self.upsert(rel),
             Change::Remove(rel) => self.remove(&rel),
+            Change::Replace { cleared, found } => self.replace(&cleared, found),
+        }
+    }
+
+    /// Drops every entry at or under each of `cleared`, then adds `found`. A
+    /// cleared path the index holds as a file has nothing under it, so only
+    /// the others cost a pass over the entries, and all of them share one.
+    fn replace(&mut self, cleared: &[String], found: Vec<String>) {
+        let mut folders: HashSet<&str> = HashSet::new();
+        for rel in cleared {
+            if self.position(rel).is_some() {
+                self.remove(rel);
+            } else {
+                folders.insert(rel.as_str());
+            }
+        }
+        if !folders.is_empty() {
+            let before = self.entries.len();
+            self.entries
+                .retain(|entry| !lies_under_any(&entry.path, &folders));
+            if self.entries.len() != before {
+                self.reindex_positions();
+            }
+        }
+        for rel in found {
+            self.upsert(rel);
         }
     }
 
@@ -331,17 +370,29 @@ fn read(index: &SharedIndex) -> std::sync::RwLockReadGuard<'_, WorkspaceIndex> {
     })
 }
 
-/// Normalizes an absolute workspace path to a relative, forward-slash string.
+/// Whether the relative `path` lies inside one of `folders`.
+fn lies_under_any(path: &str, folders: &HashSet<&str>) -> bool {
+    path.match_indices('/')
+        .any(|(at, _)| folders.contains(&path[..at]))
+}
+
+/// Normalizes an absolute workspace path to a relative, forward-slash string,
+/// or `None` for the root itself and for a path that names no place under it:
+/// outside it, or climbing out of it through `..`.
 fn relative(root: &Path, path: &Path) -> Option<String> {
     let rel = path.strip_prefix(root).ok()?;
-    if rel.as_os_str().is_empty() {
+    let mut parts = Vec::new();
+    for component in rel.components() {
+        match component {
+            Component::Normal(part) => parts.push(part.to_string_lossy()),
+            Component::CurDir => {}
+            Component::ParentDir | Component::RootDir | Component::Prefix(_) => return None,
+        }
+    }
+    if parts.is_empty() {
         return None;
     }
-    let mut s = rel.to_string_lossy().into_owned();
-    if std::path::MAIN_SEPARATOR == '\\' {
-        s = s.replace('\\', "/");
-    }
-    Some(s)
+    Some(parts.join("/"))
 }
 
 /// Rebuilds `index` synchronously from a fresh walk, blocking until the swap is
@@ -377,17 +428,88 @@ pub fn set_root_and_rebuild(index: &SharedIndex, root: Option<PathBuf>) {
     }
 }
 
-/// Handles a `WorkspaceSwept` event: more changed than the watcher named,
-/// possibly the root's own ignore rules among it, so the rules are read again
-/// and the tree walked.
-pub fn on_workspace_swept(index: &SharedIndex) {
-    let Some(root) = read(index).root.clone() else {
+/// Handles a `WorkspaceSwept` event: more changed than the watcher named.
+///
+/// The paths the sweep carries are patched in place ([`patch_swept`]). A sweep
+/// that carries none, because more changed than it holds, reads the root's
+/// ignore rules again and walks the tree, and so does one the patch cannot
+/// express.
+pub fn on_workspace_swept(index: &SharedIndex, paths: Option<&[String]>) {
+    let Some(paths) = paths else {
+        let Some(root) = read(index).root.clone() else {
+            return;
+        };
+        reread_rules_and_rebuild(index, &root);
         return;
     };
-    reread_rules_and_rebuild(index, &root);
+    patch_swept(index, paths, MAX_SWEEP_WALK);
 }
 
-/// Reads `root`'s ignore rules again, outside the lock, and walks the tree.
+/// Patches the index for the paths a sweep carries.
+///
+/// The paths are walked under the whole walk's policy, nested rule files
+/// included ([`walk_index_within`]), and what the index holds at or under each
+/// one is replaced by what the walk lists there. A folder moved away leaves
+/// nothing behind it, a folder moved in brings every file under it, and a
+/// nested rule file stands for the folder it governs. Everything else reads
+/// the policy again and walks the tree: a sweep that names nothing, the root,
+/// a root rule file, or a path that maps to no place under the root, a sweep
+/// over an index already past [`MAX_INDEXED_FILES`], and a patch walk that
+/// would list more than `cap` files.
+fn patch_swept(index: &SharedIndex, paths: &[String], cap: usize) {
+    let (root, ignore, truncated) = {
+        let idx = read(index);
+        match (idx.root.clone(), idx.ignore.clone()) {
+            (Some(root), Some(ignore)) => (root, ignore, idx.truncated),
+            _ => return,
+        }
+    };
+    if paths.is_empty() || truncated {
+        reread_rules_and_rebuild(index, &root);
+        return;
+    }
+
+    let mut targets = Vec::with_capacity(paths.len());
+    for path in paths {
+        let abs = Path::new(path);
+        if relative(&root, abs).is_none() || ignore.is_rules_file(abs) {
+            reread_rules_and_rebuild(index, &root);
+            return;
+        }
+        let target = if is_rules_file_name(abs) {
+            abs.parent().unwrap_or(abs)
+        } else {
+            abs
+        };
+        targets.push(target.to_path_buf());
+    }
+
+    let walk = walk_index_within(&root, &targets, cap);
+    if walk.truncated {
+        reread_rules_and_rebuild(index, &root);
+        return;
+    }
+    let change = Change::Replace {
+        cleared: targets
+            .iter()
+            .filter_map(|target| relative(&root, target))
+            .collect(),
+        found: walk.paths,
+    };
+
+    let mut idx = write(index);
+    if idx.root.as_deref() != Some(root.as_path()) {
+        return;
+    }
+    if idx.building {
+        idx.queue(change);
+    } else {
+        idx.apply_change(change);
+    }
+}
+
+/// Reads `root`'s ignore rules again, outside the lock, and walks the tree: a
+/// build in flight is armed to walk once more, otherwise one is started.
 fn reread_rules_and_rebuild(index: &SharedIndex, root: &Path) {
     let reread = Arc::new(WorkspaceIgnore::new(root));
     {
@@ -396,6 +518,10 @@ fn reread_rules_and_rebuild(index: &SharedIndex, root: &Path) {
             return;
         }
         idx.ignore = Some(reread);
+        if idx.building {
+            idx.rebuild_needed = true;
+            return;
+        }
     }
     spawn_rebuild(index.clone());
 }
@@ -728,9 +854,9 @@ mod tests {
     }
 
     #[test]
-    fn a_sweep_reads_the_roots_ignore_rules_again() {
-        // The rule file's own event may be one the budget folded into the
-        // sweep, so the sweep is what has to read it.
+    fn a_sweep_past_its_cap_reads_the_roots_ignore_rules_again() {
+        // The rule file's own event may be one the budget folded into a sweep
+        // that names nothing, so the sweep is what has to read it.
         let dir = TempDir::new().unwrap();
         write_file(dir.path(), "keep.rs", "x");
         let index: SharedIndex = Arc::new(RwLock::new(WorkspaceIndex::new(Some(
@@ -740,9 +866,339 @@ mod tests {
 
         write_file(dir.path(), ".gitignore", "secret.txt\n");
         write_file(dir.path(), "secret.txt", "x");
-        on_workspace_swept(&index);
+        on_workspace_swept(&index, None);
         let ignore = write(&index).ignore.clone().expect("policy");
         assert!(!ignore.is_indexed(&dir.path().join("secret.txt")));
+    }
+
+    fn absolute(dir: &Path, rel: &str) -> String {
+        dir.join(rel).to_string_lossy().into_owned()
+    }
+
+    #[test]
+    fn a_sweep_patches_the_paths_it_carries_without_walking() {
+        let dir = TempDir::new().unwrap();
+        write_file(dir.path(), "old.rs", "x");
+        let index: SharedIndex = Arc::new(RwLock::new(WorkspaceIndex::new(Some(
+            dir.path().to_path_buf(),
+        ))));
+        build_now(&index);
+        let built = read(&index).generation();
+
+        write_file(dir.path(), "src/new.rs", "x");
+        write_file(dir.path(), "unlisted.rs", "x");
+        fs::remove_file(dir.path().join("old.rs")).unwrap();
+        on_workspace_swept(
+            &index,
+            Some(&[
+                absolute(dir.path(), "src/new.rs"),
+                absolute(dir.path(), "old.rs"),
+            ]),
+        );
+
+        let idx = read(&index);
+        assert!(idx.position("src/new.rs").is_some());
+        assert_eq!(idx.position("old.rs"), None);
+        assert!(!idx.building, "a sweep that names its paths starts no walk");
+        assert_eq!(idx.generation(), built);
+        assert_eq!(idx.position("unlisted.rs"), None);
+    }
+
+    #[test]
+    fn a_sweep_carrying_the_root_rules_file_reads_it_again() {
+        let dir = TempDir::new().unwrap();
+        write_file(dir.path(), "keep.rs", "x");
+        let index: SharedIndex = Arc::new(RwLock::new(WorkspaceIndex::new(Some(
+            dir.path().to_path_buf(),
+        ))));
+        build_now(&index);
+
+        write_file(dir.path(), ".gitignore", "secret.txt\n");
+        write_file(dir.path(), "secret.txt", "x");
+        on_workspace_swept(&index, Some(&[absolute(dir.path(), ".gitignore")]));
+        let ignore = write(&index).ignore.clone().expect("policy");
+        assert!(!ignore.is_indexed(&dir.path().join("secret.txt")));
+    }
+
+    #[test]
+    fn a_sweep_naming_a_renamed_folder_moves_every_file_under_it() {
+        let dir = TempDir::new().unwrap();
+        write_file(dir.path(), "keep.rs", "x");
+        write_file(dir.path(), "olddir/a.rs", "x");
+        write_file(dir.path(), "olddir/deep/b.rs", "x");
+        let index: SharedIndex = Arc::new(RwLock::new(WorkspaceIndex::new(Some(
+            dir.path().to_path_buf(),
+        ))));
+        build_now(&index);
+        let built = read(&index).generation();
+
+        fs::rename(dir.path().join("olddir"), dir.path().join("newdir")).unwrap();
+        on_workspace_swept(
+            &index,
+            Some(&[
+                absolute(dir.path(), "newdir"),
+                absolute(dir.path(), "olddir"),
+            ]),
+        );
+
+        let idx = read(&index);
+        assert_eq!(
+            paths(&idx),
+            vec![
+                "keep.rs".to_string(),
+                "newdir/a.rs".to_string(),
+                "newdir/deep/b.rs".to_string(),
+            ]
+        );
+        assert!(
+            !idx.building,
+            "a folder the sweep names is patched in place"
+        );
+        assert_eq!(idx.generation(), built);
+    }
+
+    #[test]
+    fn a_sweep_naming_a_nested_rules_file_applies_it_to_its_folder() {
+        let dir = TempDir::new().unwrap();
+        write_file(dir.path(), "top.log", "x");
+        write_file(dir.path(), "sub/.gitignore", "*.log\n");
+        write_file(dir.path(), "sub/a.log", "x");
+        write_file(dir.path(), "sub/keep.rs", "x");
+        write_file(dir.path(), "sub/inner/b.log", "x");
+        let index: SharedIndex = Arc::new(RwLock::new(WorkspaceIndex::new(Some(
+            dir.path().to_path_buf(),
+        ))));
+        build_now(&index);
+        assert_eq!(
+            paths(&read(&index)),
+            vec![
+                "sub/.gitignore".to_string(),
+                "sub/keep.rs".to_string(),
+                "top.log".to_string(),
+            ]
+        );
+
+        write_file(dir.path(), "sub/.gitignore", "*.rs\n");
+        on_workspace_swept(&index, Some(&[absolute(dir.path(), "sub/.gitignore")]));
+
+        assert_eq!(
+            paths(&read(&index)),
+            vec![
+                "sub/.gitignore".to_string(),
+                "sub/a.log".to_string(),
+                "sub/inner/b.log".to_string(),
+                "top.log".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_sweep_keeps_out_a_file_a_nested_rule_ignores() {
+        let dir = TempDir::new().unwrap();
+        write_file(dir.path(), "web/.gitignore", "generated/\n");
+        write_file(dir.path(), "web/app.ts", "x");
+        let index: SharedIndex = Arc::new(RwLock::new(WorkspaceIndex::new(Some(
+            dir.path().to_path_buf(),
+        ))));
+        build_now(&index);
+
+        write_file(dir.path(), "web/generated/app.js", "x");
+        write_file(dir.path(), "web/main.ts", "x");
+        on_workspace_swept(
+            &index,
+            Some(&[
+                absolute(dir.path(), "web/generated/app.js"),
+                absolute(dir.path(), "web/main.ts"),
+            ]),
+        );
+
+        assert_eq!(
+            paths(&read(&index)),
+            vec![
+                "web/.gitignore".to_string(),
+                "web/app.ts".to_string(),
+                "web/main.ts".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_sweep_during_a_build_is_replayed_after_the_swap() {
+        let dir = TempDir::new().unwrap();
+        write_file(dir.path(), "olddir/a.rs", "x");
+        let index: SharedIndex = Arc::new(RwLock::new(WorkspaceIndex::new(Some(
+            dir.path().to_path_buf(),
+        ))));
+        let (epoch, walk) = walk_in_flight(&index);
+
+        fs::rename(dir.path().join("olddir"), dir.path().join("newdir")).unwrap();
+        on_workspace_swept(
+            &index,
+            Some(&[
+                absolute(dir.path(), "newdir"),
+                absolute(dir.path(), "olddir"),
+            ]),
+        );
+
+        assert!(!write(&index).apply_build(epoch, walk));
+        assert_eq!(paths(&read(&index)), vec!["newdir/a.rs".to_string()]);
+    }
+
+    #[test]
+    fn a_sweep_whose_patch_walk_passes_the_cap_walks_the_whole_tree() {
+        let dir = TempDir::new().unwrap();
+        write_file(dir.path(), "keep.rs", "x");
+        let index: SharedIndex = Arc::new(RwLock::new(WorkspaceIndex::new(Some(
+            dir.path().to_path_buf(),
+        ))));
+        let (epoch, walk) = walk_in_flight(&index);
+        let policy = read(&index).ignore.clone().expect("policy");
+
+        write_file(dir.path(), "moved/a.rs", "x");
+        write_file(dir.path(), "moved/b.rs", "x");
+        patch_swept(&index, &[absolute(dir.path(), "moved")], 1);
+
+        let reread = read(&index).ignore.clone().expect("policy");
+        assert!(
+            !Arc::ptr_eq(&policy, &reread),
+            "a patch that cannot list everything must hand over to the whole walk"
+        );
+        let mut idx = write(&index);
+        idx.apply_build(epoch, walk);
+        assert_eq!(
+            paths(&idx),
+            vec!["keep.rs".to_string()],
+            "a truncated patch must not be applied"
+        );
+    }
+
+    /// A workspace `ws` inside its own temporary folder, holding `keep.rs`,
+    /// whose build walked before `new.rs` was written and has not swapped yet.
+    struct SweptMidBuild {
+        dir: TempDir,
+        ws: PathBuf,
+        index: SharedIndex,
+        epoch: u64,
+        walk: IndexWalk,
+    }
+
+    fn swept_mid_build() -> SweptMidBuild {
+        let dir = TempDir::new().unwrap();
+        let ws = dir.path().join("ws");
+        write_file(&ws, "keep.rs", "x");
+        let index: SharedIndex = Arc::new(RwLock::new(WorkspaceIndex::new(Some(ws.clone()))));
+        let (epoch, walk) = walk_in_flight(&index);
+        write_file(&ws, "new.rs", "x");
+        SweptMidBuild {
+            dir,
+            ws,
+            index,
+            epoch,
+            walk,
+        }
+    }
+
+    impl SweptMidBuild {
+        fn assert_the_tree_is_walked_again(self) {
+            assert!(
+                write(&self.index).apply_build(self.epoch, self.walk),
+                "a sweep the patch cannot express must walk the whole tree"
+            );
+            let again = walk_index(&self.ws, MAX_INDEXED_FILES);
+            assert!(!write(&self.index).apply_build(self.epoch, again));
+            assert_eq!(
+                paths(&read(&self.index)),
+                vec!["keep.rs".to_string(), "new.rs".to_string()]
+            );
+        }
+    }
+
+    #[test]
+    fn a_sweep_naming_the_root_walks_the_whole_tree() {
+        let swept = swept_mid_build();
+        on_workspace_swept(
+            &swept.index,
+            Some(&[swept.ws.to_string_lossy().into_owned()]),
+        );
+        swept.assert_the_tree_is_walked_again();
+    }
+
+    #[test]
+    fn a_sweep_naming_an_ancestor_of_the_root_walks_the_whole_tree() {
+        let swept = swept_mid_build();
+        on_workspace_swept(
+            &swept.index,
+            Some(&[swept.dir.path().to_string_lossy().into_owned()]),
+        );
+        swept.assert_the_tree_is_walked_again();
+    }
+
+    #[test]
+    fn a_sweep_naming_a_path_outside_the_root_walks_the_whole_tree() {
+        let swept = swept_mid_build();
+        on_workspace_swept(
+            &swept.index,
+            Some(&[absolute(swept.dir.path(), "elsewhere/a.rs")]),
+        );
+        swept.assert_the_tree_is_walked_again();
+    }
+
+    #[test]
+    fn a_sweep_naming_a_path_that_climbs_out_of_the_root_walks_the_whole_tree() {
+        let swept = swept_mid_build();
+        on_workspace_swept(&swept.index, Some(&[absolute(&swept.ws, "../ws/new.rs")]));
+        swept.assert_the_tree_is_walked_again();
+    }
+
+    #[test]
+    fn a_sweep_naming_nothing_walks_the_whole_tree() {
+        let swept = swept_mid_build();
+        on_workspace_swept(&swept.index, Some(&[]));
+        swept.assert_the_tree_is_walked_again();
+    }
+
+    #[test]
+    fn a_sweep_over_an_index_past_its_cap_walks_the_whole_tree() {
+        let swept = swept_mid_build();
+        write(&swept.index).truncated = true;
+        on_workspace_swept(&swept.index, Some(&[absolute(&swept.ws, "keep.rs")]));
+        swept.assert_the_tree_is_walked_again();
+    }
+
+    #[test]
+    fn a_sweep_with_repeated_nested_and_gone_paths_matches_the_whole_walk() {
+        let dir = TempDir::new().unwrap();
+        write_file(dir.path(), "keep.rs", "x");
+        write_file(dir.path(), "gone/a.rs", "x");
+        write_file(dir.path(), "src/old.rs", "x");
+        let index: SharedIndex = Arc::new(RwLock::new(WorkspaceIndex::new(Some(
+            dir.path().to_path_buf(),
+        ))));
+        build_now(&index);
+        let built = read(&index).generation();
+
+        fs::remove_dir_all(dir.path().join("gone")).unwrap();
+        fs::remove_file(dir.path().join("src/old.rs")).unwrap();
+        write_file(dir.path(), "src/deep/b.rs", "x");
+        on_workspace_swept(
+            &index,
+            Some(&[
+                absolute(dir.path(), "src/deep/b.rs"),
+                absolute(dir.path(), "src"),
+                absolute(dir.path(), "gone/a.rs"),
+                absolute(dir.path(), "src/deep"),
+                absolute(dir.path(), "gone"),
+                absolute(dir.path(), "src"),
+                absolute(dir.path(), "gone/a.rs"),
+            ]),
+        );
+
+        let mut whole = walk_index(dir.path(), MAX_INDEXED_FILES).paths;
+        whole.sort();
+        let idx = read(&index);
+        assert_eq!(paths(&idx), whole);
+        assert!(!idx.building, "these paths are patched in place");
+        assert_eq!(idx.generation(), built);
     }
 
     #[test]

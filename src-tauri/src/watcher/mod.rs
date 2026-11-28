@@ -1,3 +1,4 @@
+pub mod changes_only;
 #[cfg(target_os = "macos")]
 pub mod fsevents;
 pub mod handler;

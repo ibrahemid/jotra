@@ -116,7 +116,7 @@ fn translate(event: &JotraEvent) -> Option<JotraFrontendEvent> {
             path: path.clone(),
             removed: *removed,
         }),
-        JotraEvent::WorkspaceSwept { root } => {
+        JotraEvent::WorkspaceSwept { root, .. } => {
             Some(JotraFrontendEvent::WorkspaceSwept { root: root.clone() })
         }
         JotraEvent::NotesSwept { root } => {

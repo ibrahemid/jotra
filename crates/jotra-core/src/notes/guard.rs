@@ -82,6 +82,32 @@ pub fn decide_save(
     SaveDecision::Refuse
 }
 
+/// Whether `mtime` is fine enough to tell two writes apart.
+///
+/// A volume that keeps two seconds (FAT), whole seconds (HFS+) or hundredths
+/// (exFAT) gives an edit landing in the same tick as Jotra's look the time
+/// Jotra recorded. A time with digits below the millisecond came from a volume
+/// that keeps them; a time before the epoch is taken as coarse.
+pub fn is_fine_grained_mtime(mtime: SystemTime) -> bool {
+    mtime
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .is_ok_and(|since| since.subsec_nanos() % 1_000_000 != 0)
+}
+
+/// Whether a file of `size` bytes last modified at `mtime` is, from its
+/// metadata alone, the file `last` recorded.
+///
+/// The size and the time have to agree, and the recorded time has to be fine
+/// grained ([`is_fine_grained_mtime`]): on a coarse one a same-size edit inside
+/// one tick keeps both, so only the bytes can answer. A record with no time
+/// matches nothing.
+pub fn metadata_matches_record(last: &DiskState, size: u64, mtime: Option<SystemTime>) -> bool {
+    let Some(recorded) = last.mtime else {
+        return false;
+    };
+    last.size == size && mtime == Some(recorded) && is_fine_grained_mtime(recorded)
+}
+
 /// macOS `SF_DATALESS`: the file's bytes are not on this machine.
 ///
 /// The name and value are `sys/stat.h`'s. The constant is defined here rather
