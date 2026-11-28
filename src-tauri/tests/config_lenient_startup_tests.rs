@@ -106,6 +106,42 @@ fn nothing_is_written_until_the_file_reads_in_full() {
 }
 
 #[test]
+fn a_reload_that_fails_on_another_value_names_that_value() {
+    let data = TempDir::new().expect("data dir");
+    let notes = TempDir::new().expect("notes dir");
+    let path = data.path().join("config.toml");
+    std::fs::write(&path, BAD).expect("write config");
+    let state = launch(data.path(), notes.path());
+
+    std::fs::write(
+        &path,
+        "[editor]\nfont_size = 16\n\n[appearance]\npolarity = \"Dark\"\n",
+    )
+    .expect("edit config");
+    assert!(!state.reload_config_from_disk());
+
+    let named = config_diagnostics(&state);
+    assert_eq!(named.len(), 1, "{named:?}");
+    assert_eq!(named[0].key, "appearance.polarity");
+    assert_eq!(named[0].line, 5);
+    assert_eq!(live(&state).sidebar.width, 300, "the running config stays");
+}
+
+#[test]
+fn a_reload_that_fails_with_nothing_held_holds_nothing() {
+    let data = TempDir::new().expect("data dir");
+    let notes = TempDir::new().expect("notes dir");
+    let path = data.path().join("config.toml");
+    std::fs::write(&path, "[sidebar]\nwidth = 300\n").expect("write config");
+    let state = launch(data.path(), notes.path());
+
+    std::fs::write(&path, "[sidebar]\nwidth = \"wide\"\n").expect("edit config");
+    assert!(!state.reload_config_from_disk());
+
+    assert!(config_diagnostics(&state).is_empty());
+}
+
+#[test]
 fn command_usage_in_an_older_config_moves_into_the_database_once() {
     let data = TempDir::new().expect("data dir");
     let notes = TempDir::new().expect("notes dir");
@@ -221,4 +257,44 @@ fn a_move_the_file_cannot_record_is_turned_down_before_anything_moves() {
         assert_eq!(state.notes_root(), from);
         assert_eq!(std::fs::read_to_string(&path).unwrap(), text);
     }
+}
+
+#[test]
+fn a_file_that_is_not_toml_launches_on_the_notes_folder_it_names() {
+    let data = TempDir::new().expect("data dir");
+    let notes = TempDir::new().expect("notes dir");
+    let path = data.path().join("config.toml");
+    let text = format!(
+        "[editor\nfont_size = 16\n\n[notes]\nroot = '{}'\n",
+        notes.path().display()
+    );
+    std::fs::write(&path, &text).expect("write config");
+
+    let state = launch_on_configured_root(data.path());
+
+    let expected =
+        jotra_tauri_lib::security::canonicalize_root(notes.path()).expect("canonical notes");
+    assert_eq!(state.notes_root(), expected);
+    assert_eq!(config_diagnostics(&state).len(), 1);
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), text);
+}
+
+#[test]
+fn command_usage_in_a_config_that_is_not_toml_moves_once_the_file_is_fixed() {
+    let data = TempDir::new().expect("data dir");
+    let notes = TempDir::new().expect("notes dir");
+    let path = data.path().join("config.toml");
+    let usage = "[commands.usage.\"palette.open\"]\ncount = 17\nlast_used_ms = 1715500000000\n";
+    std::fs::write(&path, format!("[editor\n{usage}")).expect("write config");
+
+    let state = launch(data.path(), notes.path());
+    assert!(get_command_usage_inner(&state).expect("usage").is_empty());
+    drop(state);
+
+    std::fs::write(&path, usage).expect("fix config");
+    let relaunched = launch(data.path(), notes.path());
+    assert_eq!(
+        get_command_usage_inner(&relaunched).expect("usage")["palette.open"].count,
+        17
+    );
 }

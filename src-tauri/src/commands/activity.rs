@@ -17,6 +17,7 @@ use std::time::Instant;
 use jotra_core::activity::{ActivityRecord, PendingClient};
 use jotra_core::cli_install::{client_command, ClientCommandFacts, InstallTarget};
 use jotra_core::config::mcp::{ClientApproval, McpConfig};
+use jotra_core::config::JotraConfig;
 use tauri::{AppHandle, Manager};
 
 use crate::events::emitter::{emit_event, JotraFrontendEvent};
@@ -544,20 +545,14 @@ pub fn return_to_waiting_inner(
     settings_moved: impl FnOnce(),
 ) -> Result<McpClients, String> {
     let location = "commands::activity::mcp_return_to_waiting";
-    let (updated, undone, previous) = {
-        let mut guard = recover_poison(state.config.lock(), location);
-        let previous = guard.mcp.approved_clients.clone();
-        let undone = undo_denial_inner(&mut guard.mcp, name);
-        (guard.clone(), undone, previous)
-    };
+    let mut undone = None;
+    super::config::mutate_config(state, |config| {
+        undone = undo_denial_inner(&mut config.mcp, name);
+        undone.is_some()
+    })?;
     let Some(undone) = undone else {
         return Ok(clients_now(state, location));
     };
-    if let Err(reason) = super::config::persist_config(state, &updated) {
-        let mut guard = recover_poison(state.config.lock(), location);
-        guard.mcp.approved_clients = previous;
-        return Err(reason);
-    }
     settings_moved();
     jotra_storage::pending_clients::put_back(
         &state.jotra_dir,
@@ -623,12 +618,22 @@ pub fn mcp_forget_client(app: AppHandle, name: String) -> Result<McpClients, Str
     })
 }
 
-/// Applies `change` to the `[mcp]` section under the lock and persists it.
-///
-/// The section is edited inside the lock and re-read there, so a settings write
-/// landing between a read and this point is not overwritten with a stale clone.
-/// On a failed disk write the list is put back, so memory and disk never
-/// disagree about who was approved — the same shape `ai_consent_host` holds.
+/// Applies `change` to the `[mcp]` section and writes it, under the config
+/// lock ([`super::config::mutate_config`]): a settings write landing meanwhile
+/// is neither overwritten nor lost, and a failed write leaves memory and disk
+/// agreeing about who was approved. Answers the config as written.
+pub fn record_approvals(
+    state: &AppState,
+    change: impl FnOnce(&mut McpConfig) -> Result<(), String>,
+) -> Result<JotraConfig, String> {
+    let mut outcome = Err(String::new());
+    super::config::mutate_config(state, |config| {
+        outcome = change(&mut config.mcp).map(|()| config.clone());
+        outcome.is_ok()
+    })?;
+    outcome
+}
+
 fn write_approvals(
     app: &AppHandle,
     location: &'static str,
@@ -636,17 +641,9 @@ fn write_approvals(
     change: impl FnOnce(&mut McpConfig) -> Result<(), String>,
 ) -> Result<McpClients, String> {
     let state = app.state::<AppState>();
-    let (updated, previous) = {
-        let mut guard = recover_poison(state.config.lock(), location);
-        let previous = guard.mcp.approved_clients.clone();
-        change(&mut guard.mcp)?;
-        (guard.clone(), previous)
-    };
-    if let Err(reason) = super::config::persist_config(&state, &updated) {
-        let mut guard = recover_poison(state.config.lock(), location);
-        guard.mcp.approved_clients = previous;
-        return Err(reason);
-    }
+    let updated = record_approvals(&state, change).inspect_err(|_| {
+        tracing::warn!(operation = location, "approval not saved");
+    })?;
     tell_settings_moved(app);
 
     // The decision is made, so the program is no longer one to decide on. A

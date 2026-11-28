@@ -1,8 +1,13 @@
 pub mod panic_handler;
 
+use jotra_core::log_line::redact_paths;
+use std::io::Write;
 use std::path::Path;
+use std::sync::{Mutex, PoisonError};
+use tracing::Metadata;
 use tracing_appender::non_blocking::WorkerGuard;
 use tracing_appender::rolling::{RollingFileAppender, Rotation};
+use tracing_subscriber::fmt::MakeWriter;
 use tracing_subscriber::registry::LookupSpan;
 use tracing_subscriber::{fmt, layer::SubscriberExt, util::SubscriberInitExt, EnvFilter, Layer};
 
@@ -17,18 +22,79 @@ const RELEASE_DIRECTIVES: &str = "info";
 /// What a debug build logs.
 const DEBUG_DIRECTIVES: &str = "info,jotra_core=debug,jotra_storage=debug,jotra_tauri_lib=debug";
 
-/// Holds the log file writer open. Dropping it, or calling [`LogGuard::flush`],
-/// writes the lines still queued.
+/// The log file writer, held for the life of the process so an exit outside
+/// the run loop can write the queued lines too ([`flush_logs`]).
+static LOG_WRITER: LogWriter = LogWriter::empty();
+
+/// Holds the log file writer open. Dropping it, or calling
+/// [`LogWriter::flush`], writes the lines still queued.
+struct LogWriter(Mutex<Option<WorkerGuard>>);
+
+impl LogWriter {
+    const fn empty() -> Self {
+        Self(Mutex::new(None))
+    }
+
+    fn hold(&self, guard: Option<WorkerGuard>) {
+        *self.0.lock().unwrap_or_else(PoisonError::into_inner) = guard;
+    }
+
+    fn flush(&self) {
+        self.0.lock().unwrap_or_else(PoisonError::into_inner).take();
+    }
+}
+
+/// What [`init_logging`] hands back; [`LogGuard::flush`] writes the lines
+/// still queued.
 ///
 /// The event loop ends the process with `exit`, which runs no destructors, so
-/// the run loop calls `flush` on its way out.
-pub struct LogGuard(Option<WorkerGuard>);
+/// the run loop calls `flush` on its way out. The Windows installer ends it
+/// from the updater's hook instead, which calls [`flush_logs`].
+pub struct LogGuard(());
 
 impl LogGuard {
     /// Writes the queued lines and closes the file writer. Lines logged after
     /// this are dropped.
     pub fn flush(&mut self) {
-        self.0.take();
+        flush_logs();
+    }
+}
+
+/// Writes the queued log lines and closes the file writer, from anywhere in
+/// the process. Lines logged after this are dropped.
+pub fn flush_logs() {
+    LOG_WRITER.flush();
+}
+
+/// A log writer whose lines name files, never their full paths
+/// ([`redact_paths`]). Error values carry paths in their own text, so the
+/// cut is made here rather than at each call site.
+struct FileNamesOnly<M>(M);
+
+impl<'a, M: MakeWriter<'a>> MakeWriter<'a> for FileNamesOnly<M> {
+    type Writer = FileNamesOnlyWriter<M::Writer>;
+
+    fn make_writer(&'a self) -> Self::Writer {
+        FileNamesOnlyWriter(self.0.make_writer())
+    }
+
+    fn make_writer_for(&'a self, meta: &Metadata<'_>) -> Self::Writer {
+        FileNamesOnlyWriter(self.0.make_writer_for(meta))
+    }
+}
+
+/// Takes one formatted log line per write, as the fmt layer hands them over.
+struct FileNamesOnlyWriter<W>(W);
+
+impl<W: Write> Write for FileNamesOnlyWriter<W> {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        let line = String::from_utf8_lossy(buf);
+        self.0.write_all(redact_paths(&line).as_bytes())?;
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.0.flush()
     }
 }
 
@@ -47,11 +113,16 @@ pub fn init_logging(logs_dir: &Path) -> LogGuard {
 
     tracing_subscriber::registry()
         .with(env_filter)
-        .with(fmt::layer().with_writer(std::io::stdout).with_target(true))
+        .with(
+            fmt::layer()
+                .with_writer(FileNamesOnly(std::io::stdout))
+                .with_target(true),
+        )
         .with(file_layer)
         .init();
 
-    LogGuard(guard)
+    LOG_WRITER.hold(guard);
+    LogGuard(())
 }
 
 /// The filter a build starts with when `RUST_LOG` is unset.
@@ -85,7 +156,9 @@ where
     let appender = build_appender(logs_dir)?;
     let (non_blocking, guard) = tracing_appender::non_blocking(appender);
     Some((
-        fmt::layer().with_writer(non_blocking).with_ansi(false),
+        fmt::layer()
+            .with_writer(FileNamesOnly(non_blocking))
+            .with_ansi(false),
         guard,
     ))
 }
@@ -105,8 +178,52 @@ fn build_appender(logs_dir: &Path) -> Option<RollingFileAppender> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::Write;
+    use std::sync::Arc;
     use tracing::level_filters::LevelFilter;
+
+    #[derive(Clone, Default)]
+    struct Captured(Arc<Mutex<Vec<u8>>>);
+
+    impl Write for Captured {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> MakeWriter<'a> for Captured {
+        type Writer = Captured;
+
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    #[test]
+    fn a_warn_line_names_the_file_an_error_value_carries_the_path_of() {
+        let captured = Captured::default();
+        let subscriber = tracing_subscriber::registry().with(
+            fmt::layer()
+                .with_writer(FileNamesOnly(captured.clone()))
+                .with_ansi(false),
+        );
+        let error = jotra_storage::errors::StorageError::DestinationReadOnly {
+            path: "/Users/someone/Notes/Plans/launch.md".to_string(),
+        };
+
+        tracing::subscriber::with_default(subscriber, || {
+            tracing::warn!(%error, "the save was refused");
+        });
+
+        let line = String::from_utf8(captured.0.lock().unwrap().clone()).unwrap();
+        assert!(line.contains("error=launch.md cannot be written"));
+        assert!(!line.contains("/Users/someone"));
+        assert!(!line.contains("Plans"));
+    }
 
     #[test]
     fn appender_opens_a_writable_logs_dir_that_does_not_exist_yet() {
@@ -191,15 +308,32 @@ mod tests {
         let logs = tempfile::tempdir().unwrap();
         let (mut writer, guard) =
             tracing_appender::non_blocking(build_appender(logs.path()).unwrap());
-        let mut guard = LogGuard(Some(guard));
+        let held = LogWriter::empty();
+        held.hold(Some(guard));
 
         writer.write_all(b"the last line before quit\n").unwrap();
-        guard.flush();
+        held.flush();
 
         let written: String = std::fs::read_dir(logs.path())
             .unwrap()
             .map(|entry| std::fs::read_to_string(entry.unwrap().path()).unwrap())
             .collect();
         assert!(written.contains("the last line before quit"));
+    }
+
+    #[test]
+    fn the_windows_installer_exit_writes_the_queued_log_lines() {
+        const UPDATE_RS: &str = include_str!("../commands/update.rs");
+        let hook = UPDATE_RS
+            .split("on_before_exit(")
+            .nth(1)
+            .expect("the updater's exit hook");
+        let hook = &hook[..hook.find("})").expect("the hook's end")];
+
+        assert!(hook.contains("crate::logging::flush_logs();"));
+        assert!(
+            hook.find("flush_logs").unwrap() > hook.find("cleanup_before_exit").unwrap(),
+            "the lines the shutdown logs are written too"
+        );
     }
 }

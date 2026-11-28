@@ -706,6 +706,94 @@ mod tests {
         }
     }
 
+    const HOST: &str = if cfg!(target_os = "macos") {
+        "mac"
+    } else {
+        "other"
+    };
+
+    fn json(text: &str) -> serde_json::Value {
+        serde_json::from_str(text).expect("the file is json")
+    }
+
+    fn held_modifier(name: &str) -> Modifiers {
+        match name {
+            "Super" => Modifiers::SUPER,
+            "Control" => Modifiers::CONTROL,
+            "Shift" => Modifiers::SHIFT,
+            "Alt" => Modifiers::ALT,
+            other => panic!("the token table names a modifier the OS has no flag for: {other}"),
+        }
+    }
+
+    /// src/lib/chord.ts reads the shortcut each chord is held as from this table.
+    #[test]
+    fn each_modifier_and_key_is_held_as_the_token_table_says() {
+        let tokens = json(include_str!("../../../src/lib/hotkey-tokens.json"));
+        let held = tokens["held"][HOST]
+            .as_object()
+            .expect("held names this host");
+        assert_eq!(held.len(), 5);
+        for (modifier, name) in held {
+            let shortcut = chord_from_config(&format!("{modifier}+F13")).expect("the chord parses");
+            let name = name.as_str().expect("a modifier name");
+            assert_eq!(shortcut.mods, held_modifier(name), "{modifier}");
+        }
+        let lacking: Vec<&str> = tokens["keysTheOsLacks"][HOST]
+            .as_array()
+            .expect("keysTheOsLacks names this host")
+            .iter()
+            .map(|key| key.as_str().expect("a key name"))
+            .collect();
+        for n in 1..=24 {
+            let key = format!("F{n}");
+            let answer = chord_from_config(&format!("CmdOrCtrl+{key}"));
+            if lacking.contains(&key.as_str()) {
+                assert!(matches!(answer, Err(HotkeyError::UnsupportedKey)), "{key}");
+            } else {
+                assert!(answer.is_ok(), "{key}");
+            }
+        }
+    }
+
+    #[test]
+    fn the_fixture_chords_are_one_shortcut_where_the_frontend_says() {
+        let cases = json(include_str!(
+            "../../../crates/jotra-core/tests/fixtures/hotkey-chords.json"
+        ));
+        let pairs = |kind: &str| -> Vec<(String, String)> {
+            cases[HOST][kind]
+                .as_array()
+                .expect("the host has pairs")
+                .iter()
+                .map(|pair| {
+                    let side = |i: usize| pair[i].as_str().expect("a chord").to_string();
+                    (side(0), side(1))
+                })
+                .collect()
+        };
+        for (a, b) in pairs("same") {
+            let left = chord_from_config(&a).expect("the chord parses");
+            assert_eq!(
+                left,
+                chord_from_config(&b).expect("the chord parses"),
+                "{a} and {b}"
+            );
+        }
+        for (a, b) in pairs("different") {
+            let left = chord_from_config(&a).expect("the chord parses");
+            assert_ne!(
+                left,
+                chord_from_config(&b).expect("the chord parses"),
+                "{a} and {b}"
+            );
+        }
+        for chord in cases["unparsed"].as_array().expect("unparsed is a list") {
+            let chord = chord.as_str().expect("a chord");
+            assert!(chord_from_config(chord).is_err(), "{chord}");
+        }
+    }
+
     #[test]
     fn f13_to_f20_register_on_their_own() {
         let shortcut = chord_from_config("F13").expect("F13 types nothing");

@@ -1,4 +1,5 @@
 import type { Platform } from "./platform";
+import HOTKEY_TOKENS from "./hotkey-tokens.json";
 
 /** The fields of a `KeyboardEvent` a chord is read from. */
 export interface ChordEvent {
@@ -122,19 +123,140 @@ export function chordParts(binding: string): string[] {
   return binding.split("+");
 }
 
+type HotkeyMod = keyof typeof HOTKEY_TOKENS.modifiers;
+
+/** The modifier and key spellings `parse_hotkey_chord` in jotra-core reads,
+ * by their lowercase or uppercase form. */
+const MODIFIER_BY_ALIAS: ReadonlyMap<string, HotkeyMod> = new Map(
+  (Object.entries(HOTKEY_TOKENS.modifiers) as [HotkeyMod, string[]][]).flatMap(
+    ([name, aliases]) => aliases.map((alias) => [alias, name] as const),
+  ),
+);
+const KEY_BY_ALIAS: ReadonlyMap<string, string> = new Map(
+  Object.entries(HOTKEY_TOKENS.keys).flatMap(([name, aliases]) =>
+    aliases.map((alias) => [alias, name] as const),
+  ),
+);
+
+// Rust's `str::trim` set: it removes U+0085 and keeps U+FEFF, unlike String.prototype.trim.
+const RUST_TRIM =
+  /^[\t\n\v\f\r \u0085\u00a0\u1680\u2000-\u200a\u2028\u2029\u202f\u205f\u3000]+|[\t\n\v\f\r \u0085\u00a0\u1680\u2000-\u200a\u2028\u2029\u202f\u205f\u3000]+$/g;
+
+const asciiLower = (text: string) => text.replace(/[A-Z]/g, (c) => c.toLowerCase());
+const asciiUpper = (text: string) => text.replace(/[a-z]/g, (c) => c.toUpperCase());
+
+/** The key a token names, as jotra-core's `HotkeyKey` calls it, or
+ * `undefined` for a token it does not read as a key. */
+function hotkeyKey(token: string): string | undefined {
+  const upper = asciiUpper(token);
+  const named = KEY_BY_ALIAS.get(upper);
+  if (named !== undefined) return named;
+  if (/^[A-Z]$/.test(upper)) return `Key${upper}`;
+  if (/^[0-9]$/.test(upper)) return `Digit${upper}`;
+  const fn = /^F([0-9]+)$/.exec(upper);
+  if (fn === null) return undefined;
+  const n = Number(fn[1]);
+  return n >= 1 && n <= 24 ? `F${n}` : undefined;
+}
+
+/** A chord as `parse_hotkey_chord` reads it, or `null` where it fails. */
+function parseHotkeyChord(binding: string): { modifiers: Set<HotkeyMod>; key: string } | null {
+  const trimmed = binding.replace(RUST_TRIM, "");
+  if (trimmed === "") return null;
+  const modifiers = new Set<HotkeyMod>();
+  let key: string | undefined;
+  for (const raw of trimmed.split("+")) {
+    const token = raw.replace(RUST_TRIM, "");
+    if (token === "") return null;
+    const modifier = MODIFIER_BY_ALIAS.get(asciiLower(token));
+    if (modifier !== undefined) {
+      modifiers.add(modifier);
+      continue;
+    }
+    const named = hotkeyKey(token);
+    if (named === undefined || key !== undefined) return null;
+    key = named;
+  }
+  return key === undefined ? null : { modifiers, key };
+}
+
+const HELD_ORDER = ["Super", "Control", "Alt", "Shift"];
+
 /**
- * A stored chord in the form this platform's events produce. Off macOS there
- * is one Control key, so a `Ctrl` recorded on a Mac is `CmdOrCtrl` here.
+ * The shortcut the OS is asked for on `platform`, as `chord_from_config` in
+ * src-tauri builds it from a chord, or `null` for a chord it cannot read. Two
+ * chords the OS holds as one shortcut come out the same: on macOS `Cmd` and
+ * `CmdOrCtrl` are both Command, elsewhere `Ctrl` and `CmdOrCtrl` are both
+ * Control.
+ */
+export function osShortcut(binding: string, platform: Platform): string | null {
+  const chord = parseHotkeyChord(binding);
+  if (chord === null) return null;
+  const os = platform === "mac" ? "mac" : "other";
+  if ((HOTKEY_TOKENS.keysTheOsLacks[os] as readonly string[]).includes(chord.key)) return null;
+  const held: Readonly<Record<HotkeyMod, string>> = HOTKEY_TOKENS.held[os];
+  const modifiers = new Set([...chord.modifiers].map((modifier) => held[modifier]));
+  return [...HELD_ORDER.filter((modifier) => modifiers.has(modifier)), chord.key].join("+");
+}
+
+const TYPED_MODIFIER_ORDER = ["CmdOrCtrl", "Ctrl", "Shift", "Alt"];
+const TYPED_PUNCTUATION: Readonly<Record<string, string>> = {
+  Backquote: "`",
+  Comma: ",",
+  Period: ".",
+  Slash: "/",
+  Semicolon: ";",
+  Quote: "'",
+  LeftBracket: "[",
+  RightBracket: "]",
+  Backslash: "\\",
+  Minus: "-",
+  Equal: "=",
+};
+
+/** How `modifierParts` spells a modifier: Command is `CmdOrCtrl`, and off
+ * macOS so is Control. */
+function typedModifier(modifier: HotkeyMod, platform: Platform): string {
+  if (modifier === "Cmd") return "CmdOrCtrl";
+  if (modifier === "Ctrl" && platform !== "mac") return "CmdOrCtrl";
+  return modifier;
+}
+
+/** How `keyName` spells a key a chord names. A key outside jotra-core's set
+ * keeps its spelling. */
+function typedKey(key: string): string {
+  if (key.length === 1) return keyName(key);
+  const named = hotkeyKey(key);
+  if (named === undefined) return key;
+  return TYPED_PUNCTUATION[named] ?? named;
+}
+
+/**
+ * A stored chord in the form this platform's events produce: modifiers by any
+ * spelling jotra-core reads, in the order `modifierParts` writes them, and the
+ * key as `keyName` writes it. Off macOS there is one Control key, so a `Ctrl`
+ * recorded on a Mac is `CmdOrCtrl` here. A chord with a modifier jotra-core
+ * does not read keeps its order.
  */
 export function canonicalChord(binding: string, platform: Platform): string {
   const trimmed = binding.trim();
-  if (platform === "mac" || trimmed === "") return trimmed;
+  if (trimmed === "") return trimmed;
   const parts = chordParts(trimmed);
   const key = parts[parts.length - 1];
-  const modifiers = parts.slice(0, -1);
-  if (!modifiers.includes("Ctrl")) return trimmed;
-  const merged = [...new Set(modifiers.map((part) => (part === "Ctrl" ? "CmdOrCtrl" : part)))];
-  return [...merged, key].join("+");
+  const written = parts.slice(0, -1);
+  const named = written.map((part) => MODIFIER_BY_ALIAS.get(asciiLower(part)));
+  const modifiers = [
+    ...new Set(
+      written.map((part, i) => {
+        const modifier = named[i];
+        return modifier === undefined ? part : typedModifier(modifier, platform);
+      }),
+    ),
+  ];
+  if (named.every((modifier) => modifier !== undefined)) {
+    modifiers.sort((a, b) => TYPED_MODIFIER_ORDER.indexOf(a) - TYPED_MODIFIER_ORDER.indexOf(b));
+  }
+  return [...modifiers, typedKey(key)].join("+");
 }
 
 const HOLDING_MODIFIERS: ReadonlySet<string> = new Set(["CmdOrCtrl", "Ctrl", "Cmd", "Alt"]);
@@ -153,16 +275,12 @@ export function worksFromAnyApp(binding: string): boolean {
   return parts.slice(0, -1).some((part) => HOLDING_MODIFIERS.has(part));
 }
 
-/** Whether two chords name the same keys, whatever order their modifiers are
- * written in. */
-export function sameChord(a: string, b: string): boolean {
-  if (a.trim() === "" || b.trim() === "") return false;
-  const left = chordParts(a.trim());
-  const right = chordParts(b.trim());
-  if (left.length === 0 || left.length !== right.length) return false;
-  const key = (parts: string[]) => (parts[parts.length - 1] ?? "").toUpperCase();
-  const modifiers = (parts: string[]) => [...parts.slice(0, -1)].sort().join("+");
-  return key(left) === key(right) && modifiers(left) === modifiers(right);
+/** Whether the OS holds two chords as one shortcut on `platform`, the test
+ * `settle` in src-tauri turns the second of them down on. A chord the OS
+ * cannot be asked for matches nothing. */
+export function sameChord(a: string, b: string, platform: Platform): boolean {
+  const left = osShortcut(a, platform);
+  return left !== null && left === osShortcut(b, platform);
 }
 
 /** Why the window's chord was not taken: Rust registers only these keys. */

@@ -23,3 +23,8 @@ Release builds aborted on panic, so a bug in a parser fed by a note (pulldown-cm
 - A crash from a release older than 90 days cannot be symbolicated from CI.
 - A Linux machine without the webkit2gtk-4.1 library never reaches `main`: the dynamic loader refuses the binary first, so no dialog can appear.
 - Error values that embed a path in their own text still reach warn and error lines.
+
+## Amendment, 2026-11-28: paths cut at the log writer
+
+- The log file writer passes every line through `jotra_core::log_line::redact_paths`, which cuts each absolute path to its file name, so an error value that embeds a path reaches the file as a file name. The last consequence above no longer holds.
+- The file writer lives in a process-wide static behind `logging::LogGuard`. The run loop flushes it on its way out, and the updater's exit hook calls `logging::flush_logs` before the Windows installer ends the process.

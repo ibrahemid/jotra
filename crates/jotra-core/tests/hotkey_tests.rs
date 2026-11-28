@@ -1,3 +1,5 @@
+use std::collections::BTreeSet;
+
 use jotra_core::hotkey::{
     check_global_chord, is_wayland_session, parse_hotkey_chord, GlobalChordError, HotkeyKey,
     HotkeyMod, HotkeyParseError,
@@ -180,4 +182,125 @@ fn a_wayland_session_is_recognised_from_either_variable() {
     assert!(!is_wayland_session(Some("x11"), None));
     assert!(!is_wayland_session(None, None));
     assert!(!is_wayland_session(Some("tty"), Some("  ")));
+}
+
+// src/lib/chord.ts reads chords through this table, so it has to hold every spelling the parser takes.
+const HOTKEY_TOKENS: &str = include_str!("../../../src/lib/hotkey-tokens.json");
+const PARSER_SOURCE: &str = include_str!("../src/hotkey/mod.rs");
+
+fn hotkey_tokens() -> serde_json::Value {
+    serde_json::from_str(HOTKEY_TOKENS).expect("the token table is json")
+}
+
+fn hotkey_chord_cases() -> serde_json::Value {
+    let path = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/hotkey-chords.json"
+    );
+    let text = std::fs::read_to_string(path).expect("fixture is readable");
+    serde_json::from_str(&text).expect("fixture is json")
+}
+
+/// The string literals in `function`'s match arms ahead of its fallback arm.
+fn match_arm_literals(function: &str) -> BTreeSet<String> {
+    let start = PARSER_SOURCE
+        .find(&format!("fn {function}("))
+        .expect("the parser function is there");
+    let body = &PARSER_SOURCE[start..];
+    let arms = &body[body.find("match").expect("a match")..body.find("_ =>").expect("a fallback")];
+    let mut literals = BTreeSet::new();
+    let mut chars = arms.chars();
+    while let Some(c) = chars.next() {
+        if c != '"' {
+            continue;
+        }
+        let mut literal = String::new();
+        loop {
+            match chars.next().expect("the literal closes") {
+                '"' => break,
+                '\\' => literal.push(chars.next().expect("an escaped character")),
+                other => literal.push(other),
+            }
+        }
+        literals.insert(literal);
+    }
+    literals
+}
+
+/// Each spelling in a section of the token table, with the name it reads as.
+fn table_spellings(tokens: &serde_json::Value, section: &str) -> Vec<(String, String)> {
+    tokens[section]
+        .as_object()
+        .expect("the section is an object")
+        .iter()
+        .flat_map(|(name, spellings)| {
+            spellings
+                .as_array()
+                .expect("spellings are a list")
+                .iter()
+                .map(move |spelling| {
+                    let spelling = spelling.as_str().expect("a spelling is a string");
+                    (spelling.to_string(), name.clone())
+                })
+        })
+        .collect()
+}
+
+fn variant_name(value: impl serde::Serialize) -> String {
+    serde_json::to_value(value)
+        .expect("a variant serializes")
+        .as_str()
+        .expect("a unit variant serializes as its name")
+        .to_string()
+}
+
+#[test]
+fn the_token_table_lists_every_spelling_the_parser_reads() {
+    let tokens = hotkey_tokens();
+    let modifiers: BTreeSet<String> = table_spellings(&tokens, "modifiers")
+        .into_iter()
+        .map(|(spelling, _)| spelling)
+        .collect();
+    assert_eq!(modifiers, match_arm_literals("parse_modifier_token"));
+    let keys: BTreeSet<String> = table_spellings(&tokens, "keys")
+        .into_iter()
+        .map(|(spelling, _)| spelling)
+        .collect();
+    assert_eq!(keys, match_arm_literals("parse_key_token"));
+}
+
+#[test]
+fn every_spelling_in_the_token_table_parses_as_its_name() {
+    let tokens = hotkey_tokens();
+    for (alias, name) in table_spellings(&tokens, "modifiers") {
+        for spelling in [alias.clone(), alias.to_ascii_uppercase()] {
+            let chord = parse_hotkey_chord(&format!("{spelling}+A")).expect("a modifier parses");
+            let names: Vec<String> = chord.modifiers().iter().map(|m| variant_name(*m)).collect();
+            assert_eq!(names, vec![name.clone()], "{spelling}");
+        }
+    }
+    for (alias, name) in table_spellings(&tokens, "keys") {
+        for spelling in [alias.clone(), alias.to_ascii_lowercase()] {
+            let chord = parse_hotkey_chord(&format!("CmdOrCtrl+{spelling}")).expect("a key parses");
+            assert_eq!(variant_name(chord.key()), name, "{spelling}");
+        }
+    }
+}
+
+#[test]
+fn the_fixture_keys_and_refusals_are_the_parsers() {
+    let cases = hotkey_chord_cases();
+    for pair in cases["spelledKeys"]
+        .as_array()
+        .expect("spelledKeys is a list")
+    {
+        let token = pair[0].as_str().expect("a token");
+        let name = pair[1].as_str().expect("a key name");
+        let chord = parse_hotkey_chord(&format!("CmdOrCtrl+{token}")).expect("the key parses");
+        assert_eq!(variant_name(chord.key()), name, "{token}");
+    }
+    for chord in cases["unparsed"].as_array().expect("unparsed is a list") {
+        let chord = chord.as_str().expect("a chord");
+        assert!(parse_hotkey_chord(chord).is_err(), "{chord}");
+    }
 }

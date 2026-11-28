@@ -35,6 +35,8 @@ pub trait BusHost: Clone + Send + Sync + 'static {
     fn redraw_menu_bar(&self);
     /// Tells the frontend the programs waiting for approval changed.
     fn announce_waiting_clients(&self);
+    /// Brings the OS login item in line with a config read again.
+    fn reconcile_login_item(&self);
 }
 
 impl BusHost for AppHandle {
@@ -53,6 +55,10 @@ impl BusHost for AppHandle {
     fn announce_waiting_clients(&self) {
         crate::commands::activity::announce_waiting(self);
     }
+
+    fn reconcile_login_item(&self) {
+        crate::commands::login_item::spawn_reconcile(self);
+    }
 }
 
 /// Subscribes everything the application listens for on its bus, in the
@@ -70,6 +76,7 @@ pub fn attach_bus_subscribers<H: BusHost>(host: &H) {
             if let JotraEvent::ConfigChanged { .. } = event {
                 if host.app_state().reload_config_from_disk() {
                     host.redraw_menu_bar();
+                    host.reconcile_login_item();
                 }
             }
         });

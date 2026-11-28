@@ -393,6 +393,8 @@ function hexToRgb(hex: string): string {
 import { APPS } from "../../lib/apps";
 import { pendingConfirm, settleConfirm } from "../../stores/global/dialogs";
 import { updateStore } from "../../stores/global/update";
+import { hotkeyStore } from "../../stores/global/hotkey";
+import { toasts } from "../../stores/global/notifications";
 import { APP_VERSION } from "../../lib/app-info";
 import { clearDefaultAppSupport, probeDefaultAppSupport } from "../../stores/global/default-app-support";
 
@@ -951,6 +953,33 @@ describe("SettingsModal", () => {
       await waitFor(() => expect(mocks.rebindHotkey).toHaveBeenCalledTimes(1));
       await waitFor(() => expect(mocks.save).toHaveBeenCalledTimes(1));
       expect((mocks.save.mock.calls[0][0] as JotraConfig).hotkey.toggle).toBe("Alt+Space");
+    });
+
+    it("puts the OS back on the chord it held when the new one cannot be saved", async () => {
+      const answer = (chord: string) => ({
+        status: { chord, registered: true, unsupported: false },
+        refused: false,
+      });
+      mocks.rebindHotkey.mockResolvedValueOnce(answer("CmdOrCtrl+Shift+Space"));
+      await hotkeyStore.rebind("CmdOrCtrl+Shift+Space");
+      mocks.rebindHotkey
+        .mockReset()
+        .mockResolvedValueOnce(answer("Alt+Space"))
+        .mockResolvedValueOnce(answer("CmdOrCtrl+Shift+Space"));
+      mocks.save.mockRejectedValueOnce(new Error("disk"));
+      const { container } = render(() => <SettingsModal />);
+      openSettings("general");
+      await waitFor(() =>
+        expect(container.querySelector("[data-action='record-global-chord']")).not.toBeNull(),
+      );
+      fireEvent.click(container.querySelector("[data-action='record-global-chord']")!);
+      fireEvent.keyDown(document.body, { key: " ", code: "Space", altKey: true });
+      await waitFor(() => expect(mocks.rebindHotkey).toHaveBeenCalledTimes(2));
+      expect(mocks.rebindHotkey.mock.calls.map((call) => call[0])).toEqual([
+        "Alt+Space",
+        "CmdOrCtrl+Shift+Space",
+      ]);
+      expect(hotkeyStore.chord()).toBe("CmdOrCtrl+Shift+Space");
     });
 
     it("cancels a recording on Escape and keeps Settings open", async () => {
@@ -2468,6 +2497,23 @@ describe("Files section — the folder row", () => {
       expect(mocks.notesCopyPath).toHaveBeenCalledTimes(1);
       expect(mocks.notesMove).toHaveBeenCalledTimes(1);
     });
+  });
+
+  it("names why Jotra refused the folder picked", async () => {
+    mocks.notesMove.mockRejectedValue("Pick a folder outside your current one.");
+    const { container } = await openNotes();
+    fireEvent.click(container.querySelector("[data-action='notes-move']")!);
+    await waitFor(() =>
+      expect(toasts().map((toast) => toast.text)).toContain("Pick a folder outside your current one."),
+    );
+  });
+
+  it("keeps an OS error's own text out of the move failure", async () => {
+    mocks.notesMove.mockRejectedValue("Permission denied (os error 13)");
+    const { container } = await openNotes();
+    fireEvent.click(container.querySelector("[data-action='notes-move']")!);
+    await waitFor(() => expect(toasts().map((toast) => toast.text)).toContain("Could not move the folder"));
+    expect(toasts().map((toast) => toast.text)).not.toContain("Permission denied (os error 13)");
   });
 
   // ADR-028 §2: a `jotra.db` path is never the answer to "where are my notes".

@@ -137,14 +137,27 @@ describe("Option+Space on a Mac", () => {
 
 describe("sameChord", () => {
   it("matches the same keys whatever order the modifiers are written in", () => {
-    expect(sameChord("CmdOrCtrl+Shift+Alt+Space", "CmdOrCtrl+Alt+Shift+Space")).toBe(true);
-    expect(sameChord("CmdOrCtrl+Shift+N", "CmdOrCtrl+Shift+n")).toBe(true);
+    expect(sameChord("CmdOrCtrl+Shift+Alt+Space", "CmdOrCtrl+Alt+Shift+Space", "mac")).toBe(true);
+    expect(sameChord("CmdOrCtrl+Shift+N", "CmdOrCtrl+Shift+n", "win")).toBe(true);
+  });
+
+  it("matches a modifier by any name the config reads, as the OS holds it", () => {
+    expect(sameChord("cmd+shift+space", "CmdOrCtrl+Shift+Space", "mac")).toBe(true);
+    expect(sameChord("Command+Option+Space", "CmdOrCtrl+Alt+Space", "mac")).toBe(true);
+    expect(sameChord("control+shift+space", "CmdOrCtrl+Shift+Space", "linux")).toBe(true);
+    expect(sameChord("cmd+shift+space", "CmdOrCtrl+Shift+Space", "win")).toBe(false);
+  });
+
+  it("matches a key by any name the config reads", () => {
+    expect(sameChord("CmdOrCtrl+Alt+up", "CmdOrCtrl+Alt+ArrowUp", "mac")).toBe(true);
+    expect(sameChord("CmdOrCtrl+Shift+backslash", "CmdOrCtrl+Shift+\\", "win")).toBe(true);
   });
 
   it("tells different keys and modifiers apart, and matches nothing to empty", () => {
-    expect(sameChord("CmdOrCtrl+Shift+Space", "CmdOrCtrl+Shift+Alt+Space")).toBe(false);
-    expect(sameChord("CmdOrCtrl+Space", "Ctrl+Space")).toBe(false);
-    expect(sameChord("", "")).toBe(false);
+    expect(sameChord("CmdOrCtrl+Shift+Space", "CmdOrCtrl+Shift+Alt+Space", "mac")).toBe(false);
+    expect(sameChord("CmdOrCtrl+Space", "Ctrl+Space", "mac")).toBe(false);
+    expect(sameChord("CmdOrCtrl+Space", "Ctrl+Space", "win")).toBe(true);
+    expect(sameChord("", "", "mac")).toBe(false);
   });
 });
 
@@ -163,6 +176,25 @@ describe("canonicalChord", () => {
 
   it("keeps Control apart from Command on macOS", () => {
     expect(canonicalChord("Ctrl+K", "mac")).toBe("Ctrl+K");
+  });
+
+  it("reads a modifier by any name the config reads, in the order events write it", () => {
+    expect(canonicalChord("shift+cmdorctrl+k", "win")).toBe("CmdOrCtrl+Shift+K");
+    expect(canonicalChord("Option+Cmd+K", "mac")).toBe("CmdOrCtrl+Alt+K");
+    expect(canonicalChord("control+k", "mac")).toBe("Ctrl+K");
+    expect(canonicalChord("Super+K", "linux")).toBe("CmdOrCtrl+K");
+  });
+
+  it("reads a key by any name the config reads, as events spell it", () => {
+    expect(canonicalChord("Alt+up", "mac")).toBe("Alt+ArrowUp");
+    expect(canonicalChord("CmdOrCtrl+backslash", "mac")).toBe("CmdOrCtrl+\\");
+    expect(canonicalChord("CmdOrCtrl+esc", "win")).toBe("CmdOrCtrl+Escape");
+  });
+
+  it("keeps a chord it cannot read as written", () => {
+    expect(canonicalChord("CmdOrCtrl+double+S", "mac")).toBe("CmdOrCtrl+double+S");
+    expect(canonicalChord("Shift+Shift", "mac")).toBe("Shift+Shift");
+    expect(canonicalChord("CmdOrCtrl+Shift++", "mac")).toBe("CmdOrCtrl+Shift++");
   });
 });
 

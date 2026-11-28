@@ -173,6 +173,7 @@ vi.mock("../../stores/global/hotkey", async () => {
       captureHotkeyStore: {
         chord: () => "CmdOrCtrl+Shift+Alt+Space",
         isTaken: () => false,
+        isHeldByOther: () => false,
         isUnsupported: () => false,
       },
     };

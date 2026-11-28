@@ -25,7 +25,7 @@ const ENGINES: readonly { id: DictationEngine; label: string }[] = [
   { id: "on_device", label: "On this Mac" },
 ];
 
-function patchDictation(fields: Partial<DictationConfig>): Promise<void> {
+function patchDictation(fields: Partial<DictationConfig>): Promise<boolean> {
   return patchConfig((prev) => ({ ...prev, dictation: { ...prev.dictation, ...fields } }));
 }
 

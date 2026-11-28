@@ -337,14 +337,17 @@ impl AppState {
         // before that carries it; it is moved once, and a failed move costs
         // the palette its ordering, not the launch.
         let command_usage = CommandUsageStore::new(open_database(&db_path)?);
-        let usage_in_config = jotra_core::command::usage::usage_from_config_text(&config_text);
-        match command_usage.import_once(&usage_in_config) {
-            Ok(true) => info!(
-                commands = usage_in_config.len(),
-                "command usage moved out of config.toml"
-            ),
-            Ok(false) => {}
-            Err(error) => warn!(%error, "command usage could not be moved out of config.toml"),
+        if let Some(usage_in_config) =
+            jotra_core::command::usage::usage_from_config_text(&config_text)
+        {
+            match command_usage.import_once(&usage_in_config) {
+                Ok(true) => info!(
+                    commands = usage_in_config.len(),
+                    "command usage moved out of config.toml"
+                ),
+                Ok(false) => {}
+                Err(error) => warn!(%error, "command usage could not be moved out of config.toml"),
+            }
         }
 
         // The notes folder is where every note Jotra mints lands, and the file
@@ -680,7 +683,8 @@ impl AppState {
     /// A file that no longer parses leaves the running config alone: the
     /// person editing it gets the last good state, never the defaults, and
     /// the reason is logged. A file that reads in full ends the hold the
-    /// launch put on config writes ([`AppState::config_diagnostics`]).
+    /// launch put on config writes ([`AppState::config_diagnostics`]); one
+    /// that does not, while the hold stands, names what the file holds now.
     /// Returns whether the copy was replaced.
     pub fn reload_config_from_disk(&self) -> bool {
         match self.config_store.read() {
@@ -697,6 +701,15 @@ impl AppState {
             }
             Err(error) => {
                 tracing::warn!(%error, "config.toml changed on disk but could not be read");
+                if let Ok((read, _)) = self.config_store.read_lenient() {
+                    let mut held = recover_poison(
+                        self.config_diagnostics.lock(),
+                        "state::reload_config_from_disk:diagnostics",
+                    );
+                    if !held.is_empty() && !read.diagnostics.is_empty() {
+                        *held = read.diagnostics;
+                    }
+                }
                 false
             }
         }

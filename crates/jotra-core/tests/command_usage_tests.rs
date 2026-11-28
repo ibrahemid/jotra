@@ -1,3 +1,5 @@
+use std::collections::HashMap;
+
 use jotra_core::command::usage::{usage_from_config_text, CommandUsage};
 
 #[test]
@@ -5,7 +7,7 @@ fn the_usage_table_of_an_older_config_is_read_for_the_move() {
     let text = "[editor]\nfont_size = 18\n\n\
                 [commands.usage.\"palette.open\"]\ncount = 17\nlast_used_ms = 1715500000000\n\n\
                 [commands.usage.\"tab.new\"]\ncount = 2\n";
-    let usage = usage_from_config_text(text);
+    let usage = usage_from_config_text(text).expect("TOML");
     assert_eq!(usage.len(), 2);
     assert_eq!(
         usage["palette.open"],
@@ -24,17 +26,24 @@ fn the_usage_table_of_an_older_config_is_read_for_the_move() {
 }
 
 #[test]
-fn a_config_without_the_table_or_that_does_not_parse_gives_nothing() {
-    assert!(usage_from_config_text("[editor]\nfont_size = 18\n").is_empty());
-    assert!(usage_from_config_text("").is_empty());
-    assert!(usage_from_config_text("[commands\nusage =").is_empty());
+fn a_config_without_the_table_gives_nothing_to_move() {
+    assert_eq!(
+        usage_from_config_text("[editor]\nfont_size = 18\n"),
+        Some(HashMap::new())
+    );
+    assert_eq!(usage_from_config_text(""), Some(HashMap::new()));
+}
+
+#[test]
+fn a_config_that_is_not_toml_holds_the_move_back() {
+    assert_eq!(usage_from_config_text("[commands\nusage ="), None);
 }
 
 #[test]
 fn an_entry_of_the_wrong_shape_is_skipped_and_the_rest_move() {
     let text = "[commands.usage.\"a\"]\ncount = \"many\"\n\n\
                 [commands.usage.\"b\"]\ncount = 1\nlast_used_ms = 5\n";
-    let usage = usage_from_config_text(text);
+    let usage = usage_from_config_text(text).expect("TOML");
     assert_eq!(usage.len(), 1);
     assert_eq!(usage["b"].count, 1);
 }

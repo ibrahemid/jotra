@@ -181,15 +181,21 @@ const RUST_ALLOWLIST: &[AllowedString] = &[
     },
     AllowedString {
         file: "src-tauri/src/state.rs",
-        line: 456,
+        line: 459,
         word: "note",
         note: "log line the prefix test misses inside a multi-line macro",
     },
     AllowedString {
         file: "src-tauri/src/state.rs",
-        line: 651,
+        line: 654,
         word: "note",
         note: "log line the prefix test misses inside a multi-line macro",
+    },
+    AllowedString {
+        file: "src-tauri/src/commands/notices.rs",
+        line: 18,
+        word: "licence",
+        note: "the title earlier builds wrote, kept to find and remove their file",
     },
 ];
 
@@ -667,9 +673,14 @@ const OTHER_LOCALE_AND_VOICE: &[&str] = &[
 
 #[test]
 fn rust_user_messages_use_one_locale_and_one_voice() {
+    let allowed: Vec<String> = RUST_ALLOWLIST
+        .iter()
+        .map(|entry| key(entry.file, entry.line, entry.word))
+        .collect();
     let found: Vec<String> = collect_matches(OTHER_LOCALE_AND_VOICE)
         .into_iter()
         .map(|(file, line, word)| key(&file, line, word))
+        .filter(|found| !allowed.contains(found))
         .collect();
     assert!(
         found.is_empty(),
@@ -682,6 +693,7 @@ fn rust_user_messages_use_one_locale_and_one_voice() {
 fn rust_banned_words_allowlist_has_no_stale_entries() {
     let live: Vec<String> = collect_offenders()
         .into_iter()
+        .chain(collect_matches(OTHER_LOCALE_AND_VOICE))
         .map(|(file, line, word)| key(&file, line, word))
         .collect();
     let stale: Vec<String> = RUST_ALLOWLIST

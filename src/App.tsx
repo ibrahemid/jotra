@@ -69,7 +69,13 @@ import { toggleChat } from "./commands/chat";
 import { openRecent } from "./commands/recent";
 import { followAppSwitches } from "./commands/app-switches";
 import { registerPreviewKeymap } from "./keymap/preview";
-import { registerCommand, executeCommand, getAllCommands, setExecuteListener } from "./commands/registry";
+import {
+  registerCommand,
+  executeCommand,
+  getAllCommands,
+  getCommand,
+  setExecuteListener,
+} from "./commands/registry";
 import {
   installKeyboardHandler,
   uninstallKeyboardHandler,
@@ -835,7 +841,11 @@ function AppShell() {
     },
     registerCommands,
     installKeyboard,
-    runMenuAction: (id) => executeCommand(id),
+    runMenuAction: (id) => {
+      if (!getCommand(id)) return false;
+      executeCommand(id);
+      return true;
+    },
     afterReveal: [
       [
         "transforms",

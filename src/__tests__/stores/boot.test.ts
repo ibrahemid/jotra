@@ -9,6 +9,7 @@ import { createRoot } from "solid-js";
 const h = vi.hoisted(() => ({
   showToast: vi.fn(),
   subscribed: [] as string[],
+  handlers: new Map<string, (payload: unknown) => void>(),
   takeDroppedImages: vi.fn(async (paths: string[]) => paths),
 }));
 
@@ -17,8 +18,9 @@ vi.mock("../../stores/global/images", () => ({ takeDroppedImages: h.takeDroppedI
 vi.mock("../../stores/global/notifications", () => ({ showToast: h.showToast }));
 
 vi.mock("../../services/events", () => ({
-  onEvent: vi.fn(async (kind: string) => {
+  onEvent: vi.fn(async (kind: string, handler: (payload: unknown) => void) => {
     h.subscribed.push(kind);
+    h.handlers.set(kind, handler);
     return () => {};
   }),
   emitFrontendReady: vi.fn(async () => {}),
@@ -167,7 +169,7 @@ describe("the window's plan", () => {
       prepareShell: () => [],
       registerCommands: () => {},
       installKeyboard: () => () => {},
-      runMenuAction: () => {},
+      runMenuAction: () => true,
       afterReveal: [],
     });
     for (const [, subscribe] of plan.subscriptions) await subscribe();
@@ -193,6 +195,41 @@ describe("the window's plan", () => {
     ]) {
       expect(h.subscribed, kind).toContain(kind);
     }
+  });
+});
+
+describe("a native menu item chosen during the boot", () => {
+  it("runs once its command is registered after the reveal", async () => {
+    const known = new Set<string>();
+    const ran: string[] = [];
+    const win = { editor: {}, tabs: {} } as unknown as WindowState;
+    const plan = createBootPlan(win, {
+      prepareShell: () => [],
+      registerCommands: () => {},
+      installKeyboard: () => () => {},
+      runMenuAction: (id) => {
+        if (!known.has(id)) return false;
+        ran.push(id);
+        return true;
+      },
+      afterReveal: [["transforms", () => void known.add("transform.upper")]],
+    });
+    for (const [kind, subscribe] of plan.subscriptions) {
+      if (kind === "menu:action") await subscribe();
+    }
+    h.handlers.get("menu:action")!({ action: "transform.upper" });
+    expect(ran).toEqual([]);
+
+    for (const [name, task] of plan.afterReveal) {
+      if (["transforms", "held menu items"].includes(name)) await task();
+    }
+    expect(ran).toEqual(["transform.upper"]);
+
+    h.handlers.get("menu:action")!({ action: "transform.lower" });
+    for (const [name, task] of plan.afterReveal) {
+      if (name === "held menu items") await task();
+    }
+    expect(ran).toEqual(["transform.upper"]);
   });
 });
 

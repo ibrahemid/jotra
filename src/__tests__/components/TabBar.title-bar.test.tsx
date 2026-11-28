@@ -116,10 +116,16 @@ describe("the tab strip's empty stretch answers a double-click as the title bar 
     expect(mocks.titleBarDoubleClick).toHaveBeenCalledTimes(1);
   });
 
-  // Tabs keep their press for moving between panes.
-  it("a press on the empty strip does not move the window", () => {
+  it.each([".tabbar-tabs", ".tabbar"])("a press on the empty %s moves the window", (selector) => {
     const { container } = render(() => <TabBar />);
-    fireEvent.mouseDown(pick(container, ".tabbar-tabs"), { button: 0, detail: 1 });
+    fireEvent.mouseDown(pick(container, selector), { button: 0, detail: 1 });
+    expect(mocks.startDragging).toHaveBeenCalledTimes(1);
+  });
+
+  // Tabs keep their press for moving between panes.
+  it.each([".tab", ".tab-title"])("a press on %s leaves the window where it is", (selector) => {
+    const { container } = render(() => <TabBar />);
+    fireEvent.mouseDown(pick(container, selector), { button: 0, detail: 1 });
     expect(mocks.startDragging).not.toHaveBeenCalled();
   });
 
@@ -156,13 +162,12 @@ describe("the tab strip's empty stretch answers a double-click as the title bar 
     expect(mocks.titleBarDoubleClick).not.toHaveBeenCalled();
   });
 
-  it("a single click on the empty strip changes nothing", () => {
+  it("a single click on the empty strip is not a double-click", () => {
     const { container } = render(() => <TabBar />);
     const strip = pick(container, ".tabbar-tabs");
     fireEvent.mouseDown(strip, { button: 0, detail: 1 });
     fireEvent.mouseUp(strip, { button: 0, detail: 1 });
     fireEvent.click(strip, { button: 0, detail: 1 });
     expect(mocks.titleBarDoubleClick).not.toHaveBeenCalled();
-    expect(mocks.startDragging).not.toHaveBeenCalled();
   });
 });

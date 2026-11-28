@@ -5,10 +5,11 @@ use std::cell::RefCell;
 
 use jotra_core::title_bar::{DoubleClickPreference, TitleBarEffect};
 use jotra_tauri_lib::commands::window::{
-    title_bar_double_click_inner, TitleBarError, TitleBarWindow,
+    title_bar_double_click_inner, zoom_window_inner, TitleBarError, TitleBarWindow,
 };
 
 const LIB_RS: &str = include_str!("../src/lib.rs");
+const APP_MENU_RS: &str = include_str!("../src/app_menu.rs");
 
 /// A window that records what it was told and holds a state to report.
 #[derive(Default)]
@@ -193,4 +194,31 @@ fn there_is_no_setting_to_read_off_macos() {
         jotra_tauri_lib::title_bar::read_double_click_preference(),
         DoubleClickPreference::default()
     );
+}
+
+#[test]
+fn window_zoom_maximizes_and_restores_whatever_the_setting_names() {
+    let floating = FakeWindow::default();
+    assert_eq!(
+        zoom_window_inner(&floating).unwrap(),
+        TitleBarEffect::Maximize
+    );
+    assert_eq!(floating.calls(), ["maximize"]);
+
+    let maximized = FakeWindow {
+        maximized: true,
+        ..FakeWindow::default()
+    };
+    assert_eq!(
+        zoom_window_inner(&maximized).unwrap(),
+        TitleBarEffect::Unmaximize
+    );
+    assert_eq!(maximized.calls(), ["unmaximize"]);
+}
+
+#[test]
+fn window_zoom_is_jotra_s_item_not_appkit_s() {
+    assert!(!APP_MENU_RS.contains(".maximize()"));
+    assert!(APP_MENU_RS.contains("MenuItemBuilder::with_id(ZOOM_MENU_ID, \"Zoom\")"));
+    assert!(APP_MENU_RS.contains("crate::commands::window::zoom_main_window(app_handle)"));
 }

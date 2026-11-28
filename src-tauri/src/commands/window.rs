@@ -1,4 +1,6 @@
-use jotra_core::title_bar::{title_bar_effect, DoubleClickPreference, TitleBarEffect, WindowState};
+use jotra_core::title_bar::{
+    title_bar_effect, DoubleClickPreference, TitleBarDoubleClick, TitleBarEffect, WindowState,
+};
 use serde::Serialize;
 use tauri::{AppHandle, Manager};
 
@@ -143,11 +145,38 @@ pub fn title_bar_double_click_inner(
     window: &impl TitleBarWindow,
     preference: &DoubleClickPreference,
 ) -> Result<TitleBarEffect, TitleBarError> {
+    apply_title_bar_action(window, preference.resolve())
+}
+
+/// Window > Zoom: the double-click's maximize and restore, whatever the
+/// system setting names. AppKit's own Zoom item reads the zoom button, which
+/// an undecorated window does not have, and only beeps.
+pub fn zoom_window_inner(window: &impl TitleBarWindow) -> Result<TitleBarEffect, TitleBarError> {
+    apply_title_bar_action(window, TitleBarDoubleClick::Zoom)
+}
+
+/// Runs [`zoom_window_inner`] on the main window, off the calling thread. A
+/// failure is logged and leaves the window as it was.
+pub fn zoom_main_window(app: &AppHandle) {
+    let Some(window) = app.get_webview_window("main") else {
+        return;
+    };
+    std::thread::spawn(move || {
+        if let Err(error) = zoom_window_inner(&window) {
+            tracing::warn!(%error, "Window > Zoom left the window as it was");
+        }
+    });
+}
+
+fn apply_title_bar_action(
+    window: &impl TitleBarWindow,
+    action: TitleBarDoubleClick,
+) -> Result<TitleBarEffect, TitleBarError> {
     let state = WindowState {
         maximized: window.is_maximized()?,
         fullscreen: window.is_fullscreen()?,
     };
-    let effect = title_bar_effect(preference.resolve(), state);
+    let effect = title_bar_effect(action, state);
     match effect {
         TitleBarEffect::Maximize => window.maximize()?,
         TitleBarEffect::Unmaximize => window.unmaximize()?,
