@@ -279,6 +279,35 @@ fn a_read_only_row_has_no_write_to_plan() {
 }
 
 #[test]
+fn a_write_planned_in_another_encoding_lands_in_it_and_leaves_the_row_alone() {
+    let f = fixture();
+    let path = f.notes.join("Menu.csv");
+    std::fs::write(&path, b"Caf\xe9\n").expect("write");
+    let doc = row(&f.store, &path, 5, false);
+    let windows_1252 = TextEncoding::from_label("windows-1252").expect("an encoding");
+    f.store
+        .set_encoding(&doc.id, Some(windows_1252))
+        .expect("encoding");
+    assert!(matches!(
+        f.store.plan_source_write(&doc.id, "Café 😀\n"),
+        Err(StorageError::EncodingLossy { .. })
+    ));
+
+    let planned = f
+        .store
+        .plan_source_write_in(&doc.id, "Café 😀\n", TextEncoding::utf8())
+        .expect("plan");
+    planned.land(None, None).expect("land");
+
+    assert_eq!(std::fs::read(&path).expect("read"), "Café 😀\n".as_bytes());
+    assert_eq!(
+        f.store.get(&doc.id).expect("row").encoding,
+        Some(windows_1252),
+        "the caller records the encoding once the write has landed"
+    );
+}
+
+#[test]
 fn reading_a_row_in_hand_reads_what_the_store_reads() {
     let f = fixture();
     let path = f.notes.join("Note.md");
@@ -315,6 +344,29 @@ fn one_read_of_a_note_file_answers_its_state_and_its_bytes() {
     assert!(read_disk_state(&f.notes.join("missing.md"))
         .expect("read")
         .is_none());
+}
+
+#[test]
+fn the_disk_state_and_its_bytes_come_from_one_read() {
+    let f = fixture();
+    let path = f.notes.join("Note.md");
+    std::fs::write(&path, b"caf\xe9\r\n").expect("write");
+    let (disk, bytes) = jotra_storage::buffer_store::read_disk_state_and_bytes(&path)
+        .expect("read")
+        .expect("file");
+    assert_eq!(bytes, b"caf\xe9\r\n");
+    assert_eq!(disk.hash, jotra_core::hash::sha256_bytes(&bytes));
+    assert_eq!(disk.size, bytes.len() as u64);
+    assert_eq!(
+        Some(disk),
+        read_disk_state(&path).expect("disk"),
+        "the pair describes the file as the guard reads it"
+    );
+    assert!(
+        jotra_storage::buffer_store::read_disk_state_and_bytes(&f.notes.join("missing.md"))
+            .expect("read")
+            .is_none()
+    );
 }
 
 #[test]

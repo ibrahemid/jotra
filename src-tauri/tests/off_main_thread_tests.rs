@@ -16,12 +16,15 @@ use jotra_core::watcher::reconcile::ReconcileGate;
 use jotra_plugin::transform::TransformRegistry;
 use jotra_storage::buffer_store::BufferStore;
 use jotra_storage::config_store::ConfigStore;
-use jotra_storage::database::connection::open_database;
+use jotra_storage::database::connection::{
+    open_database, open_database_for_maintenance, yielding_to_writes,
+};
 use jotra_storage::database::migrations::run_migrations;
 use jotra_storage::layout_state::LayoutStateStore;
 use jotra_storage::notes_index::NotesIndexStore;
 use jotra_tauri_lib::commands::buffer::{
-    close_buffers_inner, save_buffer_content_inner, save_in_turn,
+    close_buffers_inner, get_buffer, record_unsaved_notes, record_unsaved_notes_inner,
+    reindex_settled_buffer, save_buffer_content_inner, save_in_turn, UnsavedNote,
 };
 use jotra_tauri_lib::commands::chat::{apply_proposal_to_state, EarlierTexts};
 use jotra_tauri_lib::commands::file::open_file_from_path;
@@ -31,6 +34,8 @@ use jotra_tauri_lib::quit::QuitState;
 use jotra_tauri_lib::security::{canonicalize_for_authorization, AuthorizedPaths};
 use jotra_tauri_lib::state::AppState;
 use jotra_tauri_lib::watcher::handler::create_ignore_set;
+use tauri::test::{mock_builder, mock_context, noop_assets};
+use tauri::Manager;
 use tempfile::TempDir;
 
 fn make_state(dir: &TempDir) -> AppState {
@@ -141,10 +146,9 @@ fn the_wait_for_a_window_nothing_shows_gives_up_at_its_limit() {
     assert!(!state.wait_for_reveal(Duration::from_millis(60)));
 }
 
-#[test]
-fn startup_maintenance_vacuums_a_database_that_is_mostly_free_pages() {
-    let dir = TempDir::new().unwrap();
-    let state = make_state(&dir);
+/// Leaves the state's database mostly free pages, which a startup `VACUUM`
+/// reclaims.
+fn fill_with_free_pages(state: &AppState) {
     let side = open_database(&state.jotra_dir.join("jotra.db")).expect("db");
     side.execute_batch(
         "CREATE TABLE bloat (body BLOB);
@@ -154,7 +158,13 @@ fn startup_maintenance_vacuums_a_database_that_is_mostly_free_pages() {
          PRAGMA wal_checkpoint(TRUNCATE);",
     )
     .expect("bloat");
-    drop(side);
+}
+
+#[test]
+fn startup_maintenance_vacuums_a_database_that_is_mostly_free_pages() {
+    let dir = TempDir::new().unwrap();
+    let state = make_state(&dir);
+    fill_with_free_pages(&state);
     let before = state.store.lock().unwrap().database_stats().expect("stats");
     assert!(before.freelist_count > jotra_core::maintenance::VACUUM_MIN_FREE_PAGES);
 
@@ -162,6 +172,177 @@ fn startup_maintenance_vacuums_a_database_that_is_mostly_free_pages() {
     let after = state.store.lock().unwrap().database_stats().expect("stats");
     assert_eq!(after.freelist_count, 0);
     assert!(after.page_count < before.page_count);
+}
+
+#[test]
+fn startup_maintenance_leaves_the_store_free_while_it_runs() {
+    let dir = TempDir::new().unwrap();
+    let state = make_state(&dir);
+    fill_with_free_pages(&state);
+
+    std::thread::scope(|scope| {
+        let maintenance = state.notes_index.holding_writes(|| {
+            let maintenance = scope.spawn(|| state.run_startup_maintenance());
+            std::thread::sleep(Duration::from_millis(300));
+            assert!(
+                !maintenance.is_finished(),
+                "it waits for the index's writer"
+            );
+            assert!(
+                state.store.try_lock().is_ok(),
+                "the store is held while the maintenance waits to run"
+            );
+            maintenance
+        });
+        maintenance.join().expect("the maintenance ran");
+    });
+    let after = state.store.lock().unwrap().database_stats().expect("stats");
+    assert_eq!(after.freelist_count, 0);
+}
+
+/// A write that holds the database's write lock for seconds, as a `VACUUM`
+/// of a large file does, until it is cut short.
+const LONG_WRITE: &str = "INSERT INTO held SELECT count(*) FROM (
+     WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 30000000)
+     SELECT i FROM n)";
+
+/// Waits until another connection holds the write lock of the database at
+/// `path`.
+fn wait_until_the_write_lock_is_held(path: &std::path::Path) {
+    let probe = open_database_for_maintenance(path).expect("probe");
+    probe.busy_timeout(Duration::ZERO).expect("no busy wait");
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while probe.execute_batch("BEGIN IMMEDIATE; ROLLBACK;").is_ok() {
+        assert!(
+            Instant::now() < deadline,
+            "the long write never took the lock"
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    }
+}
+
+#[test]
+fn a_row_write_under_the_store_cuts_short_the_maintenance_it_meets() {
+    let dir = TempDir::new().unwrap();
+    let state = make_state(&dir);
+    let path = state.notes_root().join("Plan.md");
+    std::fs::write(&path, "# Plan\n").unwrap();
+    let id = open(&state, &path);
+    let database = state.jotra_dir.join("jotra.db");
+    let side = open_database_for_maintenance(&database).expect("maintenance connection");
+    side.execute_batch("CREATE TABLE held (n INTEGER)")
+        .expect("table");
+
+    std::thread::scope(|scope| {
+        let work =
+            scope.spawn(move || yielding_to_writes(&side, || side.execute_batch(LONG_WRITE)));
+        wait_until_the_write_lock_is_held(&database);
+        let started = Instant::now();
+        record_unsaved_notes_inner(
+            &state,
+            vec![UnsavedNote {
+                id: id.clone(),
+                content: "# Plan\n\nNot saved yet.\n".into(),
+            }],
+        )
+        .expect("journaled");
+        let waited = started.elapsed();
+        assert!(
+            waited < Duration::from_secs(2),
+            "the write held the store for {} ms while the maintenance ran",
+            waited.as_millis()
+        );
+        assert!(
+            work.join().expect("the long write ran").is_err(),
+            "the write cut the long write short"
+        );
+    });
+}
+
+/// How long the startup maintenance is held at its `VACUUM` at most.
+const VACUUM_HELD_FOR: Duration = Duration::from_secs(6);
+
+fn index_hits(state: &AppState, word: &str) -> usize {
+    let query = jotra_core::search::to_prefix_match(word).expect("query");
+    let terms = jotra_core::search::search_terms(word);
+    state
+        .notes_index
+        .search_hits(&query, &terms, 10)
+        .expect("search")
+        .len()
+}
+
+#[test]
+fn an_edit_during_the_startup_vacuum_leaves_the_store_free_and_reaches_the_index_after() {
+    let dir = TempDir::new().unwrap();
+    let app = mock_builder()
+        .manage(make_state(&dir))
+        .build(mock_context(noop_assets()))
+        .expect("mock app");
+    let state: &AppState = app.state::<AppState>().inner();
+    let path = state.notes_root().join("Plan.md");
+    std::fs::write(&path, "# Plan\n").unwrap();
+    let id = open(state, &path);
+    fill_with_free_pages(state);
+    let bloated = state.store.lock().unwrap().database_stats().expect("stats");
+    let (reached_tx, reached_rx) = mpsc::channel();
+    let (release_tx, release_rx) = mpsc::channel::<()>();
+
+    std::thread::scope(|scope| {
+        let maintenance = scope.spawn(move || {
+            jotra_storage::maintenance::before_next_vacuum(move || {
+                let _ = reached_tx.send(());
+                let _ = release_rx.recv_timeout(VACUUM_HELD_FOR);
+            });
+            state.run_startup_maintenance();
+        });
+        reached_rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("the maintenance reached its VACUUM");
+
+        save_buffer_content_inner(state, &id, "# Plan\n\nkestrel\n").expect("the save lands");
+        let reindex = scope.spawn(|| reindex_settled_buffer(state, &id));
+        let settled = Instant::now() + Duration::from_millis(500);
+        while !reindex.is_finished() && Instant::now() < settled {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let started = Instant::now();
+        get_buffer(app.state(), id.clone()).expect("the row");
+        let read = started.elapsed();
+        let started = Instant::now();
+        record_unsaved_notes(
+            app.state(),
+            vec![UnsavedNote {
+                id: id.clone(),
+                content: "# Plan\n\nkestrel, not saved yet\n".into(),
+            }],
+        )
+        .expect("journaled");
+        let journaled = started.elapsed();
+        let indexed_during = index_hits(state, "kestrel");
+        let _ = release_tx.send(());
+        maintenance.join().expect("the maintenance ran");
+        reindex.join().expect("the reindex ran");
+
+        assert!(
+            read < Duration::from_secs(2),
+            "get_buffer waited {} ms for the store during the VACUUM",
+            read.as_millis()
+        );
+        assert!(
+            journaled < Duration::from_secs(2),
+            "record_unsaved_notes waited {} ms for the store during the VACUUM",
+            journaled.as_millis()
+        );
+        assert_eq!(indexed_during, 0, "the index was written during the VACUUM");
+    });
+    let after = state.store.lock().unwrap().database_stats().expect("stats");
+    assert!(after.page_count < bloated.page_count, "the VACUUM ran");
+    assert_eq!(
+        index_hits(state, "kestrel"),
+        1,
+        "the edit reached the index once the VACUUM ended"
+    );
 }
 
 #[test]
@@ -241,6 +422,31 @@ fn a_search_reads_a_note_saved_a_moment_ago_after_its_write_lands() {
 }
 
 #[test]
+fn a_thread_that_panicked_holding_the_store_leaves_saves_and_closes_working() {
+    let dir = TempDir::new().unwrap();
+    let state = make_state(&dir);
+    let path = dir.path().join("a.md");
+    std::fs::write(&path, "before\n").unwrap();
+    let id = open(&state, &path);
+
+    std::thread::scope(|scope| {
+        let panicked = scope
+            .spawn(|| {
+                let _store = state.store.lock();
+                panic!("a worker failed while it held the store");
+            })
+            .join();
+        assert!(panicked.is_err());
+    });
+    assert!(state.store.is_poisoned());
+
+    save_buffer_content_inner(&state, &id, "after\n").expect("the save lands");
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), "after\n");
+    assert!(!state.store.is_poisoned());
+    close_buffers_inner(&state, std::slice::from_ref(&id)).expect("the close lands");
+}
+
+#[test]
 fn a_close_waits_for_its_notes_turns_and_takes_each_once() {
     let dir = TempDir::new().unwrap();
     let state = Arc::new(make_state(&dir));
@@ -312,6 +518,48 @@ fn a_chat_edit_of_an_open_file_checks_it_after_a_save_still_landing() {
     assert_eq!(std::fs::read_to_string(&file).unwrap(), "Y\n");
 }
 
+#[test]
+fn a_rename_that_waited_for_the_store_is_stamped_after_the_wait() {
+    use jotra_core::watcher::ignore::{source_key, SuppressDecision};
+    use jotra_tauri_lib::commands::notes::rename_note_inner;
+
+    let dir = TempDir::new().unwrap();
+    let state = Arc::new(make_state(&dir));
+    let file = dir.path().join("stamped.log");
+    std::fs::write(&file, "X\n").unwrap();
+    let file = std::path::PathBuf::from(canonicalize_for_authorization(&file).expect("canonical"));
+    let id = open(&state, &file);
+
+    let ignore = state.watcher_ignore.lock().unwrap();
+    let renamer = Arc::clone(&state);
+    let renamed_id = id.clone();
+    let renaming = std::thread::spawn(move || rename_note_inner(&renamer, &renamed_id, "renamed"));
+    // The rename reads the file and blocks on its stamps.
+    std::thread::sleep(Duration::from_millis(200));
+    let store = state.store.lock().unwrap();
+    drop(ignore);
+    std::thread::sleep(Duration::from_millis(600));
+    drop(store);
+    let renamed = renaming
+        .join()
+        .expect("rename thread")
+        .expect("the rename lands");
+
+    let to = file.with_file_name("renamed.log");
+    assert_eq!(renamed.source_path.as_deref(), to.to_str());
+    let decision = state.watcher_ignore.lock().unwrap().decide(
+        &source_key(&to),
+        Some(b"X\n"),
+        Instant::now(),
+        Duration::from_millis(300),
+    );
+    assert_eq!(
+        decision,
+        SuppressDecision::Suppress,
+        "the new name's stamp aged out while the rename waited for the store"
+    );
+}
+
 #[cfg(unix)]
 #[test]
 fn a_rename_reads_its_file_with_the_store_free() {
@@ -335,22 +583,14 @@ fn a_rename_reads_its_file_with_the_store_free() {
     let (go_on, let_go) = mpsc::channel::<()>();
     let pipe = file.clone();
     std::thread::spawn(move || {
-        // The guard's read, then the stamp's: each opens the pipe once.
-        for read in 0..2 {
-            let mut writer = std::fs::OpenOptions::new()
-                .write(true)
-                .open(&pipe)
-                .expect("open the pipe");
-            if read == 0 {
-                reading.send(()).unwrap();
-                let_go.recv().unwrap();
-            }
-            writer.write_all(b"X\n").expect("feed the pipe");
-            drop(writer);
-            // The reader sees end-of-file only while no writer holds the pipe.
-            // Reopening at once can land between its reads and feed it twice.
-            std::thread::sleep(Duration::from_millis(200));
-        }
+        // Fed once: a second read of the file waits for a writer that never comes.
+        let mut writer = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&pipe)
+            .expect("open the pipe");
+        reading.send(()).unwrap();
+        let_go.recv().unwrap();
+        writer.write_all(b"X\n").expect("feed the pipe");
     });
     let (done, renamed) = mpsc::channel();
     let renamer = Arc::clone(&state);

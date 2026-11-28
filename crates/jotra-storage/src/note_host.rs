@@ -29,7 +29,7 @@ use jotra_core::notes::WriteOrigin;
 use jotra_core::write_review::{verdict, ProposedChange, Refused, WriteProposal, WriteReview};
 use tracing::warn;
 
-use crate::buffer_store::{dataless_flags, read_disk_state};
+use crate::buffer_store::{dataless_flags, read_disk_state, read_disk_state_and_bytes};
 use crate::database::migrations::binary_schema_version;
 use crate::errors::StorageError;
 use crate::guarded::{
@@ -431,10 +431,7 @@ impl<'a> NoteHostImpl<'a> {
         let read = std::fs::read(file).map_err(|_| HostError::Unreadable {
             path: path.to_string(),
         })?;
-        let decoded =
-            jotra_core::text_encoding::decode_file(&read).ok_or_else(|| HostError::NotText {
-                path: path.to_string(),
-            })?;
+        let decoded = editable_text(path, &read)?;
         let appended = jotra_core::capture::append_entry(&decoded.text, entry);
         let written = decoded
             .encoding
@@ -496,10 +493,7 @@ impl<'a> NoteHostImpl<'a> {
         origin: &WriteOrigin,
     ) -> Result<Option<PassageReceipt>, HostError> {
         let read = read_whole_note(path, file)?;
-        let decoded =
-            jotra_core::text_encoding::decode_file(&read).ok_or_else(|| HostError::NotText {
-                path: path.to_string(),
-            })?;
+        let decoded = editable_text(path, &read)?;
         let replaced = replace_passage(&decoded.text, old, new).map_err(|error| match error {
             PassageError::Empty => HostError::PassageEmpty {
                 path: path.to_string(),
@@ -579,6 +573,53 @@ fn read_held_note(path: &str, file: &Path) -> Result<Option<(DiskState, Vec<u8>)
         mtime: std::fs::metadata(file).ok().and_then(|m| m.modified().ok()),
     };
     Ok(Some((state, read)))
+}
+
+/// The bytes `content` is in the encoding of the file that held `held`
+/// (ADR-049), UTF-8 for a new file.
+///
+/// The whole text is replaced, so a file that is binary or a UTF-8 file with
+/// damaged sequences takes it in UTF-8: nothing of theirs is kept.
+fn in_encoding_of<'a>(
+    path: &str,
+    held: Option<&[u8]>,
+    content: &'a str,
+) -> Result<std::borrow::Cow<'a, [u8]>, HostError> {
+    let Some(encoding) = held
+        .and_then(jotra_core::text_encoding::decode_file)
+        .map(|decoded| decoded.encoding)
+    else {
+        return Ok(std::borrow::Cow::Borrowed(content.as_bytes()));
+    };
+    encoding
+        .encode(content)
+        .map_err(|lossy| HostError::EncodingLossy {
+            path: path.to_string(),
+            encoding: lossy.encoding.name().to_string(),
+            characters: jotra_core::text_encoding::code_points(&lossy.characters),
+        })
+}
+
+/// A note's bytes as the text an edit of part of it is made in, read in their
+/// own encoding.
+///
+/// Text with a replacement character standing in for bytes is refused: an
+/// edit written back from it would replace those bytes with it.
+fn editable_text<'a>(
+    path: &str,
+    read: &'a [u8],
+) -> Result<jotra_core::text_encoding::DecodedText<'a>, HostError> {
+    let decoded =
+        jotra_core::text_encoding::decode_file(read).ok_or_else(|| HostError::NotText {
+            path: path.to_string(),
+        })?;
+    if decoded.replaced {
+        return Err(HostError::NotInEncoding {
+            path: path.to_string(),
+            encoding: decoded.encoding.name().to_string(),
+        });
+    }
+    Ok(decoded)
 }
 
 /// A note's bytes as the person reads them, for a held write's comparison.
@@ -850,23 +891,23 @@ impl NoteHost for NoteHostImpl<'_> {
                 path: path.to_string(),
             });
         }
-        // A held write shows what the file holds, so the bytes are read once
-        // and the state the guard compares is taken from them.
-        let (on_disk, held) = if self.review.is_some() {
-            match read_held_note(path, &file)? {
-                Some((state, read)) => (Some(state), Some(read)),
-                None => (None, None),
-            }
+        // The bytes are read once: the state the guard compares is taken from
+        // them, the encoding the text is written in is theirs, and a held
+        // write shows them.
+        let held = if self.review.is_some() {
+            read_held_note(path, &file)?
         } else {
-            let state = read_disk_state(&file).map_err(|_| HostError::Unreadable {
+            read_disk_state_and_bytes(&file).map_err(|_| HostError::Unreadable {
                 path: path.to_string(),
-            })?;
-            (state, None)
+            })?
         };
+        let on_disk = held.as_ref().map(|(state, _)| *state);
+        let held = held.map(|(_, read)| read);
+        let written = in_encoding_of(path, held.as_deref(), content)?;
         // Asked only for a write that would land: one the guard is about to
         // refuse, or one that leaves the file as it is, holds nothing.
         let current = expected.is_none_or(|hash| on_disk.map(|state| state.hash) == Some(hash));
-        let unchanged = held.as_deref() == Some(content.as_bytes());
+        let unchanged = held.as_deref() == Some(&*written);
         // Refused here rather than by the guard, which writes a missing file
         // and sets refused text beside the note: a held write reaches the
         // folder only as the person applied it.
@@ -904,7 +945,7 @@ impl NoteHost for NoteHostImpl<'_> {
         let outcome = self
             .write_guarded(
                 &file,
-                content.as_bytes(),
+                &written,
                 last_known,
                 on_disk,
                 self.on_conflict(),

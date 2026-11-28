@@ -29,8 +29,15 @@ fn recorded(path: &Path) -> DiskState {
 fn create_note_writes_a_file_immediately() {
     let root = TempDir::new().expect("temp dir");
 
-    let path = note_ops::create_note(root.path(), "2026-08-29", "md", WriteOrigin::Editor, None)
-        .expect("create");
+    let path = note_ops::create_note(
+        root.path(),
+        "2026-08-29",
+        "md",
+        WriteOrigin::Editor,
+        None,
+        None,
+    )
+    .expect("create");
 
     assert!(path.exists(), "{} was not created", path.display());
     assert_eq!(path, root.path().join("2026-08-29.md"));
@@ -50,7 +57,8 @@ fn create_note_refuses_rather_than_writing_over_a_note_the_dedupe_could_not_see(
     std::fs::write(&existing, "first").expect("seed");
     std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o300)).expect("chmod");
 
-    let outcome = note_ops::create_note(root.path(), "Notes", "md", WriteOrigin::Editor, None);
+    let outcome =
+        note_ops::create_note(root.path(), "Notes", "md", WriteOrigin::Editor, None, None);
 
     std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o700)).expect("chmod");
     assert!(
@@ -75,7 +83,7 @@ fn create_note_refuses_a_name_a_dangling_link_already_holds() {
 
     // The dedupe sees the name and picks `Notes-2.md`, so this only proves the
     // link is not followed and written through when the listing is what fails.
-    let path = note_ops::create_note(root.path(), "Notes", "md", WriteOrigin::Editor, None)
+    let path = note_ops::create_note(root.path(), "Notes", "md", WriteOrigin::Editor, None, None)
         .expect("create");
     assert_eq!(path, root.path().join("Notes-2.md"));
     assert!(
@@ -94,8 +102,15 @@ fn create_note_makes_a_second_note_beside_a_decomposed_name() {
     let decomposed = root.path().join("Cafe\u{301}.md");
     std::fs::write(&decomposed, "first").expect("seed");
 
-    let path = note_ops::create_note(root.path(), "Caf\u{e9}", "md", WriteOrigin::Editor, None)
-        .expect("create");
+    let path = note_ops::create_note(
+        root.path(),
+        "Caf\u{e9}",
+        "md",
+        WriteOrigin::Editor,
+        None,
+        None,
+    )
+    .expect("create");
 
     assert_eq!(path, root.path().join("Café-2.md"));
     assert_eq!(
@@ -110,7 +125,7 @@ fn create_note_dedupes_against_an_existing_name() {
     let root = TempDir::new().expect("temp dir");
     std::fs::write(root.path().join("Notes.md"), "first").expect("seed");
 
-    let path = note_ops::create_note(root.path(), "Notes", "md", WriteOrigin::Editor, None)
+    let path = note_ops::create_note(root.path(), "Notes", "md", WriteOrigin::Editor, None, None)
         .expect("create");
 
     assert_eq!(path, root.path().join("Notes-2.md"));
@@ -308,7 +323,7 @@ fn restore_trashed_puts_the_bytes_back_as_they_were() {
             .push((at.to_path_buf(), written.to_vec()))
     };
 
-    note_ops::restore_trashed(&path, &bytes, Some(&hook)).expect("restore");
+    note_ops::restore_trashed(&path, &bytes, Some(&hook), None).expect("restore");
 
     assert_eq!(std::fs::read(&path).expect("read back"), bytes);
     assert_eq!(
@@ -323,7 +338,7 @@ fn restore_trashed_never_replaces_a_file_at_the_path() {
     let path = root.path().join("Plan.md");
     std::fs::write(&path, "written since").expect("seed");
 
-    let error = note_ops::restore_trashed(&path, b"the old text", None).expect_err("taken");
+    let error = note_ops::restore_trashed(&path, b"the old text", None, None).expect_err("taken");
 
     assert!(matches!(error, StorageError::NoteNameTaken { ref name, .. } if name == "Plan.md"));
     assert_eq!(
@@ -431,6 +446,7 @@ fn every_write_is_stamped_before_it_happens() {
         "md",
         WriteOrigin::Editor,
         Some(&hook),
+        None,
     )
     .expect("create");
     assert_eq!(stamps.paths(), vec![created.clone()]);
@@ -446,6 +462,7 @@ fn every_write_is_stamped_before_it_happens() {
         "the text",
         WriteOrigin::Editor,
         Some(&hook),
+        None,
     )
     .expect("copy");
     assert!(
@@ -502,6 +519,7 @@ fn save_copy_writes_into_the_notes_folder_and_leaves_the_original_untouched() {
         "the text",
         WriteOrigin::Editor,
         None,
+        None,
     )
     .expect("copy");
 
@@ -518,10 +536,11 @@ fn save_copy_writes_into_the_notes_folder_and_leaves_the_original_untouched() {
 fn the_extension_the_caller_names_is_the_one_the_file_carries() {
     let root = tempfile::tempdir().expect("tempdir");
 
-    let text = note_ops::create_note(root.path(), MINTED, "txt", WriteOrigin::Editor, None)
+    let text = note_ops::create_note(root.path(), MINTED, "txt", WriteOrigin::Editor, None, None)
         .expect("create");
-    let markdown = note_ops::create_note(root.path(), MINTED, "md", WriteOrigin::Editor, None)
-        .expect("create");
+    let markdown =
+        note_ops::create_note(root.path(), MINTED, "md", WriteOrigin::Editor, None, None)
+            .expect("create");
 
     assert_eq!(text, root.path().join("jotra-260921-0748.txt"));
     assert_eq!(markdown, root.path().join("jotra-260921-0748.md"));
@@ -531,9 +550,9 @@ fn the_extension_the_caller_names_is_the_one_the_file_carries() {
 fn a_second_unnamed_file_dedupes_within_its_own_format() {
     let root = tempfile::tempdir().expect("tempdir");
 
-    let first = note_ops::create_note(root.path(), MINTED, "txt", WriteOrigin::Editor, None)
+    let first = note_ops::create_note(root.path(), MINTED, "txt", WriteOrigin::Editor, None, None)
         .expect("create");
-    let second = note_ops::create_note(root.path(), MINTED, "txt", WriteOrigin::Editor, None)
+    let second = note_ops::create_note(root.path(), MINTED, "txt", WriteOrigin::Editor, None, None)
         .expect("create");
 
     assert_eq!(first, root.path().join("jotra-260921-0748.txt"));
@@ -727,11 +746,26 @@ fn a_text_file_renamed_into_markdown_takes_the_markdown_name() {
 fn a_new_note_is_minted_under_the_one_name_policy() {
     let root = TempDir::new().expect("temp dir");
 
-    let markdown = note_ops::create_note(root.path(), "C# notes", "md", WriteOrigin::Editor, None)
-        .expect("create");
-    let text = note_ops::create_note(root.path(), "C# notes", "txt", WriteOrigin::Editor, None)
-        .expect("create");
-    let nothing = note_ops::create_note(root.path(), "# ^ []", "md", WriteOrigin::Editor, None);
+    let markdown = note_ops::create_note(
+        root.path(),
+        "C# notes",
+        "md",
+        WriteOrigin::Editor,
+        None,
+        None,
+    )
+    .expect("create");
+    let text = note_ops::create_note(
+        root.path(),
+        "C# notes",
+        "txt",
+        WriteOrigin::Editor,
+        None,
+        None,
+    )
+    .expect("create");
+    let nothing =
+        note_ops::create_note(root.path(), "# ^ []", "md", WriteOrigin::Editor, None, None);
 
     assert_eq!(markdown, root.path().join("C notes.md"));
     assert_eq!(text, root.path().join("C# notes.txt"));

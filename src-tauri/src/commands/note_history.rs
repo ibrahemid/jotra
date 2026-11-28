@@ -375,7 +375,7 @@ pub fn note_file_of(
 
 /// The tab holding `file`, when one has it open.
 fn open_tab_id(state: &AppState, file: &Path) -> Option<String> {
-    let store = state.store.lock().ok()?;
+    let store = state.lock_store();
     let doc = store
         .find_active_by_source_path(&file.to_string_lossy())
         .ok()??;

@@ -459,7 +459,7 @@ struct NoteTarget {
 /// The note `buffer_id` is, or `None` for a tab with no file on disk.
 fn note_target(state: &AppState, buffer_id: &str) -> Result<Option<NoteTarget>, String> {
     let row = {
-        let store = state.store.lock().map_err(|e| e.to_string())?;
+        let store = state.lock_store();
         store.find(buffer_id).map_err(|e| e.to_string())?
     };
     let Some(row) = row.filter(|row| row.status == BufferStatus::Active) else {

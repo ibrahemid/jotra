@@ -12,7 +12,7 @@ use jotra_core::notes::guard::{is_not_downloaded, DiskState};
 use jotra_core::notes::line_ending::LineEnding;
 use jotra_core::notes::WriteOrigin;
 use jotra_core::preview::scripts::{opt_in_carries_over_write, opt_in_standing, OptInStanding};
-use jotra_core::text_encoding::TextEncoding;
+use jotra_core::text_encoding::{OwnedText, TextEncoding};
 use rusqlite::Connection;
 use tracing::{info, warn};
 
@@ -128,6 +128,9 @@ pub struct BufferStore {
     /// Each note's text this session wrote beside the note as a dated copy,
     /// as `(note id, text hash)` ([`Self::remember_text_written_beside`]).
     texts_written_beside: HashSet<(String, String)>,
+    /// Whether a thread panicked while it held this store
+    /// ([`Self::mark_held_through_a_panic`]).
+    held_through_a_panic: bool,
 }
 
 impl BufferStore {
@@ -142,7 +145,22 @@ impl BufferStore {
             notes_index: None,
             session_marked_running: false,
             texts_written_beside: HashSet::new(),
+            held_through_a_panic: false,
         }
+    }
+
+    /// Records that a thread panicked while it held this store. From then on,
+    /// for as long as the store lives, [`Self::check_preview_scripts`] answers
+    /// off and [`Self::enable_preview_scripts`] fails: a lock a panic poisoned
+    /// fails closed where it guards script execution, however its other work
+    /// goes on (ADR-045).
+    pub fn mark_held_through_a_panic(&mut self) {
+        self.held_through_a_panic = true;
+    }
+
+    /// Whether [`Self::mark_held_through_a_panic`] was called on this store.
+    pub fn was_held_through_a_panic(&self) -> bool {
+        self.held_through_a_panic
     }
 
     /// Names the folder whose files this store keeps in the notes index.
@@ -373,8 +391,7 @@ impl BufferStore {
 
     /// Whether the notes index holds the text of `doc`'s file.
     fn takes_text_of(&self, doc: &BufferDocument) -> bool {
-        !doc.read_only
-            && doc.size_bytes <= THRESHOLD_NORMAL_BYTES
+        holds_text(doc)
             && doc
                 .source_path
                 .as_deref()
@@ -391,6 +408,10 @@ impl BufferStore {
     /// Jotra generated; a large or binary file is not text to search. Nothing
     /// here is fatal to a save: the bytes are already durable, and a file whose
     /// metadata cannot be read is picked up by the next reconcile.
+    ///
+    /// The store is held, so this never waits for the index's writer: when it
+    /// is busy, the write is left for it
+    /// ([`notes_index::NotesIndexStore::upsert_or_defer`]).
     fn index_note(&self, doc: &BufferDocument, content: &str) -> StorageResult<()> {
         if doc.read_only || doc.size_bytes > THRESHOLD_NORMAL_BYTES {
             return Ok(());
@@ -406,7 +427,7 @@ impl BufferStore {
             return Ok(());
         };
         match &self.notes_index {
-            Some(index) => index.upsert(&note, content),
+            Some(index) => index.upsert_or_defer(&note, content),
             None => notes_index::NotesIndex::new(&self.conn).upsert(&note, content),
         }
     }
@@ -500,35 +521,48 @@ impl BufferStore {
     /// the index is re-keyed to it: the row under the old path goes, and the
     /// file is indexed under the new one. Jotra's own rename is stamped into the
     /// watcher's ignore set, so the notes watcher will not do this for it.
-    pub fn rename_to_file(&self, id: &str, source_path: &str, title: &str) -> StorageResult<()> {
+    ///
+    /// `text` is what the index records for the file, read before the store
+    /// was taken ([`indexable_text_of`], [`indexable_text_at`]); nothing is
+    /// read here. It is unused for a row the index holds no text of, and for a
+    /// file that keeps its path, whose entry the index already holds.
+    pub fn rename_to_file(
+        &self,
+        id: &str,
+        source_path: &str,
+        title: &str,
+        text: &str,
+    ) -> StorageResult<()> {
         let doc = queries::get_buffer(&self.conn, id)?;
         let old_path = doc.source_path.clone();
         let renamed = BufferDocument {
             source_path: Some(source_path.to_string()),
             ..doc
         };
-        let content = if self.takes_text_of(&renamed) {
-            read_indexable_text(&renamed)
-        } else {
-            String::new()
+        let content = match self.takes_text_of(&renamed) {
+            true => text,
+            false => "",
         };
 
         let tx = self.conn.unchecked_transaction()?;
         queries::update_source_path(&tx, id, source_path)?;
         queries::rename_buffer(&tx, id, title)?;
         tx.commit()?;
+        if old_path.as_deref() == Some(source_path) {
+            return Ok(());
+        }
 
         if let Some(old_path) = old_path {
             let old = Path::new(&old_path);
             if self.is_within_notes(old) {
                 match &self.notes_index {
-                    Some(index) => index.forget_path(old)?,
+                    Some(index) => index.forget_path_or_defer(old)?,
                     None => notes_index::NotesIndex::new(&self.conn)
                         .remove(&notes_index::index_key(old))?,
                 }
             }
         }
-        self.index_note(&renamed, &content)
+        self.index_note(&renamed, content)
     }
 
     /// Updates the persistent tab order for a buffer.
@@ -768,6 +802,31 @@ impl BufferStore {
         id: &str,
         content: &'a str,
     ) -> StorageResult<SourceWrite<'a>> {
+        self.plan_source_write_with(id, content, None)
+    }
+
+    /// [`Self::plan_source_write`] with `content` encoded in `encoding` rather
+    /// than in the encoding the row records. The row is left as it is: the
+    /// caller records `encoding` once the write has landed.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::plan_source_write`].
+    pub fn plan_source_write_in<'a>(
+        &self,
+        id: &str,
+        content: &'a str,
+        encoding: TextEncoding,
+    ) -> StorageResult<SourceWrite<'a>> {
+        self.plan_source_write_with(id, content, Some(encoding))
+    }
+
+    fn plan_source_write_with<'a>(
+        &self,
+        id: &str,
+        content: &'a str,
+        encoding: Option<TextEncoding>,
+    ) -> StorageResult<SourceWrite<'a>> {
         let doc = queries::get_buffer(&self.conn, id)?;
         if doc.read_only {
             return Err(StorageError::Consistency {
@@ -789,8 +848,8 @@ impl BufferStore {
         // change. Text the encoding cannot hold is refused here, before the
         // guard reads anything (ADR-049).
         let content = doc.line_ending.apply(content);
-        let bytes = match doc
-            .encoding
+        let bytes = match encoding
+            .or(doc.encoding)
             .unwrap_or_else(TextEncoding::utf8)
             .encode(&content)?
         {
@@ -1040,12 +1099,16 @@ impl BufferStore {
     /// when it was given and what Jotra has written since. Other bytes were
     /// another program's, read in with the tab open, on a reopen or after a
     /// relaunch, and the opt-in lapses here. With no bytes to compare the
-    /// scripts stay off this time and the opt-in is kept.
+    /// scripts stay off this time and the opt-in is kept. A store a panic was
+    /// held through answers off ([`Self::mark_held_through_a_panic`]).
     pub fn check_preview_scripts(
         &self,
         id: &str,
         seen: Option<Sha256Digest>,
     ) -> StorageResult<bool> {
+        if self.held_through_a_panic {
+            return Ok(false);
+        }
         let Some(opt_in) = queries::get_preview_scripts_opt_in(&self.conn, id)? else {
             return Ok(false);
         };
@@ -1071,12 +1134,17 @@ impl BufferStore {
     ///
     /// # Errors
     ///
-    /// [`StorageError::BufferMissing`] for an id with no row.
+    /// [`StorageError::BufferMissing`] for an id with no row, and
+    /// [`StorageError::HeldThroughAPanic`] once a panic was held through the
+    /// store ([`Self::mark_held_through_a_panic`]).
     pub fn enable_preview_scripts(
         &self,
         id: &str,
         covers: Option<Sha256Digest>,
     ) -> StorageResult<()> {
+        if self.held_through_a_panic {
+            return Err(StorageError::HeldThroughAPanic);
+        }
         queries::enable_preview_scripts(&self.conn, id, covers.map(digest_hex).as_deref())
     }
 
@@ -1341,6 +1409,14 @@ impl BufferStore {
         maintenance::run_maintenance(&self.conn)
     }
 
+    /// The file the store's database lives in; `None` for one held in memory.
+    pub fn database_path(&self) -> Option<PathBuf> {
+        self.conn
+            .path()
+            .filter(|path| !path.is_empty())
+            .map(PathBuf::from)
+    }
+
     /// Records that a note's file was read into its tab, with the bytes that
     /// were read.
     ///
@@ -1501,6 +1577,11 @@ pub fn read_disk_state(path: &Path) -> StorageResult<Option<DiskState>> {
     Ok(read_if_there(path)?.map(|bytes| disk_state_of(path, &bytes)))
 }
 
+/// [`read_disk_state`] with the bytes it was taken from, read once.
+pub fn read_disk_state_and_bytes(path: &Path) -> StorageResult<Option<(DiskState, Vec<u8>)>> {
+    Ok(read_if_there(path)?.map(|bytes| (disk_state_of(path, &bytes), bytes)))
+}
+
 /// The bytes at `path`, or `None` when no file is there.
 fn read_if_there(path: &Path) -> StorageResult<Option<Vec<u8>>> {
     match std::fs::read(path) {
@@ -1571,20 +1652,14 @@ pub fn read_doc_text(doc: &BufferDocument) -> StorageResult<ReadText> {
     let encoding = doc.encoding.unwrap_or_else(TextEncoding::utf8);
     // Bytes that are already the text are handed over as the text rather
     // than copied, so a file in the large tiers is held once.
-    let decoded = match encoding.decode(&bytes)? {
-        std::borrow::Cow::Borrowed(text) if text.len() == bytes.len() => None,
-        other => Some(other.into_owned()),
-    };
-    Ok(match decoded {
-        Some(text) => ReadText {
+    Ok(match encoding.decode_owned(bytes)? {
+        OwnedText::Bytes(text) => ReadText {
+            text,
+            bytes: ReadBytes::Text,
+        },
+        OwnedText::Decoded { text, bytes } => ReadText {
             text,
             bytes: ReadBytes::Raw(bytes),
-        },
-        None => ReadText {
-            text: String::from_utf8(bytes).map_err(|error| {
-                StorageError::Io(std::io::Error::new(std::io::ErrorKind::InvalidData, error))
-            })?,
-            bytes: ReadBytes::Text,
         },
     })
 }
@@ -1595,11 +1670,45 @@ pub fn read_doc_text(doc: &BufferDocument) -> StorageResult<ReadText> {
 /// Reads whatever file `doc` names: [`BufferStore::reindex_target`] is what
 /// says whether the index takes it.
 pub fn read_indexable_text(doc: &BufferDocument) -> String {
-    let encoding = doc.encoding.unwrap_or_else(TextEncoding::utf8);
     doc.source_path
         .as_deref()
         .and_then(|path| std::fs::read(path).ok())
-        .and_then(|bytes| encoding.decode(&bytes).ok().map(|text| text.into_owned()))
+        .map(|bytes| decode_indexable(doc, &bytes))
+        .unwrap_or_default()
+}
+
+/// The text the index records for `doc` from `bytes`, its file's bytes: empty
+/// for a read-only row, one over [`THRESHOLD_NORMAL_BYTES`], and bytes that
+/// are not text in its encoding.
+pub fn indexable_text_of(doc: &BufferDocument, bytes: &[u8]) -> String {
+    match holds_text(doc) {
+        true => decode_indexable(doc, bytes),
+        false => String::new(),
+    }
+}
+
+/// [`indexable_text_of`] the file at `path`, read only for a row whose text
+/// the index can hold.
+pub fn indexable_text_at(doc: &BufferDocument, path: &Path) -> String {
+    if !holds_text(doc) {
+        return String::new();
+    }
+    std::fs::read(path)
+        .map(|bytes| decode_indexable(doc, &bytes))
+        .unwrap_or_default()
+}
+
+/// Whether the index can hold `doc`'s text, wherever its file is.
+fn holds_text(doc: &BufferDocument) -> bool {
+    !doc.read_only && doc.size_bytes <= THRESHOLD_NORMAL_BYTES
+}
+
+fn decode_indexable(doc: &BufferDocument, bytes: &[u8]) -> String {
+    doc.encoding
+        .unwrap_or_else(TextEncoding::utf8)
+        .decode(bytes)
+        .ok()
+        .map(|text| text.into_owned())
         .unwrap_or_default()
 }
 

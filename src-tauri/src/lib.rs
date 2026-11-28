@@ -76,31 +76,30 @@ pub(crate) fn finish_shutdown(app_handle: &tauri::AppHandle) {
 
     let pending = state.fts_scheduler.drain_pending();
     if !pending.is_empty() {
-        if let Ok(store) = state.store.lock() {
-            for id in pending {
-                if let Err(e) = store.reindex_buffer(&id) {
-                    tracing::debug!(buffer_id = %id, error = %e, "shutdown fts reindex failed");
-                }
+        let store = state.lock_store();
+        for id in pending {
+            if let Err(e) = store.reindex_buffer(&id) {
+                tracing::debug!(buffer_id = %id, error = %e, "shutdown fts reindex failed");
             }
         }
     }
 
-    let marked = state.store.lock().ok().map(|store| {
+    let marked = {
+        let store = state.lock_store();
         let kept = store.unsaved_text_count();
         store.mark_session_clean().map(|()| kept)
-    });
+    };
     match marked {
-        Some(Ok(Ok(kept))) if kept > 0 => {
+        Ok(Ok(kept)) if kept > 0 => {
             info!(
                 notes = kept,
                 "clean-shutdown marker written; unsaved text stays in the journal"
             )
         }
-        Some(Ok(_)) => info!("clean-shutdown marker written"),
-        Some(Err(e)) => {
+        Ok(_) => info!("clean-shutdown marker written"),
+        Err(e) => {
             tracing::warn!(error = %e, "the clean-shutdown marker could not be written")
         }
-        None => {}
     }
 }
 
@@ -571,6 +570,7 @@ pub fn run() {
             commands::buffer::create_buffer,
             commands::buffer::get_buffer,
             commands::buffer::save_buffer_content,
+            commands::buffer::save_buffer_as_utf8,
             commands::buffer::save_buffer_changes,
             commands::buffer::restore_note_file,
             commands::buffer::save_note_to,

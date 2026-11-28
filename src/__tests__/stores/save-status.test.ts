@@ -48,6 +48,7 @@ import {
   flushAutosave,
   cancelAutosave,
   resetAutosave,
+  saveNow,
 } from "../../services/autosave";
 import { saveBufferContent } from "../../services/tauri";
 
@@ -129,6 +130,36 @@ describe("saveStatusStore", () => {
 
     await vi.advanceTimersByTimeAsync(1);
     expect(saveStatusStore.forNote("one").state).toBe("clean");
+  });
+
+  it("shows saved for a requested write only once that write lands, not the autosave it waited behind", async () => {
+    vi.useFakeTimers();
+    let landAutosave = (_: null) => {};
+    let landRequested = (_: null) => {};
+    mockedSave
+      .mockImplementationOnce(
+        () => new Promise<null>((resolve) => (landAutosave = resolve)),
+      )
+      .mockImplementationOnce(
+        () => new Promise<null>((resolve) => (landRequested = resolve)),
+      );
+
+    debouncedSave("one", "typed", 0);
+    const autosave = flushAutosave("one");
+    await vi.advanceTimersByTimeAsync(0);
+    saveStatusStore.noteRequestedSave("one");
+    const requested = saveNow("one", "typed, then saved");
+
+    landAutosave(null);
+    await autosave;
+    await vi.advanceTimersByTimeAsync(0);
+    expect(mockedSave).toHaveBeenLastCalledWith("one", "typed, then saved");
+    expect(saveStatusStore.forNote("one").state).toBe("saving");
+    await vi.advanceTimersByTimeAsync(1200);
+
+    landRequested(null);
+    await requested;
+    expect(saveStatusStore.forNote("one").state).toBe("saved");
   });
 
   it("never reads saved over a document that differs from its file", async () => {

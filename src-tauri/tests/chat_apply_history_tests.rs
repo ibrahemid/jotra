@@ -198,6 +198,49 @@ fn undo_after_apply_puts_back_what_the_note_held() {
 }
 
 #[test]
+fn undo_puts_back_a_note_in_another_encoding_in_its_own_bytes() {
+    let seeded = b"Le caf\xe9 est ouvert. Une r\xe9union demain.\n";
+    let (_dir, notes, jotra, store) = versioned("");
+    std::fs::write(notes.join("Launch.md"), seeded).expect("seed a note");
+    let before = jotra_core::hash::sha256_hex(seeded);
+
+    let applied = apply_proposal_inner(
+        &notes,
+        &NoOpenNotes,
+        &jotra,
+        "probe-host",
+        "Launch.md",
+        "Le caf\u{e9} est ferm\u{e9}.\n",
+        &before,
+        Some(&store),
+        |_, _, _| unreachable!("a note in the folder is not written through a tab"),
+    )
+    .expect("applied");
+    assert_eq!(
+        std::fs::read(notes.join("Launch.md")).expect("read"),
+        b"Le caf\xe9 est ferm\xe9.\n".to_vec()
+    );
+
+    let undone = undo_proposal_inner(
+        &notes,
+        &NoOpenNotes,
+        &jotra,
+        "probe-host",
+        "Launch.md",
+        &before,
+        &applied.hash,
+        Some(&store),
+    )
+    .expect("undone");
+
+    assert!(undone.changed);
+    assert_eq!(
+        std::fs::read(notes.join("Launch.md")).expect("read"),
+        seeded.to_vec()
+    );
+}
+
+#[test]
 fn undo_refuses_a_note_that_changed_after_the_apply() {
     let (_dir, notes, jotra, store) = versioned("before\n");
     let applied = apply_over(&notes, &jotra, &store, "before\n", "after\n");

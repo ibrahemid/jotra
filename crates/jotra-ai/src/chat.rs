@@ -49,6 +49,7 @@ use jotra_core::polish;
 use jotra_storage::chat_store::{ChatStore, ChatStoreError};
 use jotra_storage::note_host::NoteHostImpl;
 use jotra_storage::paths::{file_name_only, relative_slug, strip_verbatim_prefix};
+use jotra_storage::write_lock::WriteLock;
 use serde::{Deserialize, Serialize};
 use tokio_util::sync::CancellationToken;
 
@@ -1250,25 +1251,37 @@ fn read_context(
         ContextScope::Notes => context_host(notes_root, &context.key)?
             .read_note(given)
             .map_err(|error| unattachable(&context.key, &error)),
-        ContextScope::OpenTab { .. } => {
-            let name = context_name(context);
-            let bytes = std::fs::metadata(&context.file)
-                .map_err(|_| format!("{name} could not be read."))?
-                .len();
-            if bytes > jotra_core::notes::host::MAX_NOTE_BYTES {
-                return Err(format!("{name} is too large to attach."));
-            }
-            let read =
-                std::fs::read(&context.file).map_err(|_| format!("{name} could not be read."))?;
-            let text = String::from_utf8(read).map_err(|_| format!("{name} is not text."))?;
-            Ok(jotra_core::notes::host::NoteContent {
-                path: context.key.clone(),
-                bytes,
-                hash: jotra_core::hash::sha256_hex(text.as_bytes()),
-                text,
-            })
-        }
+        ContextScope::OpenTab { .. } => read_open_tab_file(context).map(|(content, _)| content),
     }
+}
+
+/// What a file only an open tab reaches holds now, and the bytes it was read
+/// from.
+///
+/// The text is read in the file's own encoding and the digest is of its
+/// bytes, as the host reads and digests a note.
+fn read_open_tab_file(
+    context: &ContextFile,
+) -> Result<(jotra_core::notes::host::NoteContent, Vec<u8>), String> {
+    let name = context_name(context);
+    let bytes = std::fs::metadata(&context.file)
+        .map_err(|_| format!("{name} could not be read."))?
+        .len();
+    if bytes > jotra_core::notes::host::MAX_NOTE_BYTES {
+        return Err(format!("{name} is too large to attach."));
+    }
+    let read = std::fs::read(&context.file).map_err(|_| format!("{name} could not be read."))?;
+    let text = jotra_core::text_encoding::decode_file(&read)
+        .ok_or_else(|| format!("{name} is not text."))?
+        .text
+        .into_owned();
+    let content = jotra_core::notes::host::NoteContent {
+        path: context.key.clone(),
+        bytes,
+        hash: jotra_core::hash::sha256_hex(&read),
+        text,
+    };
+    Ok((content, read))
 }
 
 /// What one context file weighs, which is what the send dialog states.
@@ -1423,11 +1436,9 @@ pub fn apply_proposal_inner(
     if let ContextScope::OpenTab { tab_id } = &context.scope {
         let tab_id = tab_id.clone();
         return apply_to_open_tab(
-            notes_root,
             &context,
             jotra_dir,
             host,
-            path,
             new_content,
             before_hash,
             &tab_id,
@@ -1492,7 +1503,11 @@ pub fn undo_proposal_inner(
     let earlier = history
         .content(version)
         .ok()
-        .and_then(|bytes| String::from_utf8(bytes).ok())
+        .and_then(|bytes| {
+            jotra_core::text_encoding::decode_file(&bytes)
+                .filter(|decoded| !decoded.replaced)
+                .map(|decoded| decoded.text.into_owned())
+        })
         .ok_or_else(not_kept)?;
     write_through_host(
         notes_root,
@@ -1540,7 +1555,11 @@ pub fn apply_proposal_in_session(
         },
     )?;
     let kept = replaced
-        .and_then(|bytes| String::from_utf8(bytes).ok())
+        .and_then(|bytes| {
+            jotra_core::text_encoding::decode_file(&bytes)
+                .filter(|decoded| !decoded.replaced)
+                .map(|decoded| decoded.text.into_owned())
+        })
         .is_some_and(|text| earlier.keep(&outcome.path, before_hash, text));
     Ok(ProposalOutcome {
         undoable: outcome.undoable || kept,
@@ -1596,13 +1615,13 @@ pub fn undo_proposal_in_session(
         );
         Err(sentence)
     };
-    let current = read_context(notes_root, &context, path)?;
+    let (current, read) = read_open_tab_file(&context)?;
     if !current.hash.eq_ignore_ascii_case(applied_hash) {
         return refuse(format!(
             "{name} changed since the change was applied and was not written."
         ));
     }
-    if let Err(error) = write_tab(tab_id, &text, current.text.as_bytes()) {
+    if let Err(error) = write_tab(tab_id, &text, &read) {
         return refuse(error);
     }
     earlier.forget(&context.key, before_hash);
@@ -1690,7 +1709,8 @@ fn write_through_host(
         PANE_MINTS_NOTHING,
     )
     .map_err(|_| format!("{note_key} was not written."))?
-    .with_history(history);
+    .with_history(history)
+    .with_write_lock(Some(WriteLock::in_data_folder(jotra_dir)));
     let outcome = applier.write_note(path, content, LastKnown::Hash(digest), WriteOrigin::Chat);
 
     match outcome {
@@ -1740,11 +1760,9 @@ fn write_through_host(
 /// whatever a second read would find.
 #[allow(clippy::too_many_arguments)]
 fn apply_to_open_tab(
-    notes_root: &Path,
     context: &ContextFile,
     jotra_dir: &Path,
     host: &str,
-    path: &str,
     new_content: &str,
     before_hash: &str,
     tab_id: &str,
@@ -1753,7 +1771,7 @@ fn apply_to_open_tab(
     let name = context_name(context);
     // A file that grew past the ceiling or stopped being text since the offer
     // was made is refused in the words the attach would have used.
-    let current = read_context(notes_root, context, path)?;
+    let (current, read) = read_open_tab_file(context)?;
     if current.hash != before_hash {
         record_proposal(
             jotra_dir,
@@ -1777,7 +1795,7 @@ fn apply_to_open_tab(
         // on these, and a second read taken inside the write is a read a change
         // Jotra never saw can land in: recording that as the tab's disk state is
         // the one thing the buffer store's guard exists to catch.
-        write_tab(tab_id, new_content, current.text.as_bytes()).inspect_err(|_| {
+        write_tab(tab_id, new_content, &read).inspect_err(|_| {
             record_proposal(
                 jotra_dir,
                 host,
@@ -2740,7 +2758,8 @@ mod tests {
 
     #[test]
     fn outside_open_tab_that_is_not_text_is_refused() {
-        let (_dir, notes, given) = notes_and_an_outside_file(&[0xff, 0xfe, 0x00]);
+        let (_dir, notes, given) =
+            notes_and_an_outside_file(b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR\x00\x00\x00\x01");
         let tabs = StubTabs::open(Path::new(&given), "tab-1");
 
         assert_eq!(
@@ -2777,6 +2796,48 @@ mod tests {
             b"the readme text\n".to_vec(),
             "the tab's disk state is recorded from the bytes the digest passed on, \
              never from a second read a write could land inside"
+        );
+    }
+
+    #[test]
+    fn an_outside_open_tab_in_another_encoding_applies_against_its_own_bytes() {
+        let seeded = b"Le caf\xe9 est ouvert. Une r\xe9union demain.\n";
+        let (_dir, notes, given) = notes_and_an_outside_file(seeded);
+        let jotra = tempfile::TempDir::new().expect("temp dir");
+        let tabs = StubTabs::open(Path::new(&given), "tab-1");
+        let seen: std::cell::RefCell<Vec<u8>> = std::cell::RefCell::new(Vec::new());
+
+        let attached = read_attached_in(&notes, &tabs, std::slice::from_ref(&given))
+            .expect("the open tab is context");
+        assert_eq!(
+            attached[0].text,
+            "Le caf\u{e9} est ouvert. Une r\u{e9}union demain.\n"
+        );
+        assert_eq!(
+            attached[0].before_hash,
+            jotra_core::hash::sha256_hex(seeded)
+        );
+
+        apply_proposal_inner(
+            &notes,
+            &tabs,
+            jotra.path(),
+            "api.example.com",
+            &given,
+            "Le caf\u{e9} est ferm\u{e9}.\n",
+            &attached[0].before_hash,
+            None,
+            |_tab_id, _content, verified| {
+                *seen.borrow_mut() = verified.to_vec();
+                Ok(())
+            },
+        )
+        .expect("the proposal applies");
+
+        assert_eq!(
+            seen.into_inner(),
+            seeded.to_vec(),
+            "the tab's disk state is recorded from the file's own bytes"
         );
     }
 

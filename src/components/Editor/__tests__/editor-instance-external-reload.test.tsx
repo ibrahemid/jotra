@@ -133,6 +133,30 @@ describe("EditorInstance: reloading after a change outside Jotra", () => {
     expect(container.textContent).not.toContain("as Jotra opened it");
   });
 
+  it("lands a change reported while the open is reading after the open, so the view and its digest describe one file", async () => {
+    fileOnDisk.set("note", "as Jotra opened it\n");
+    let finishOpen = () => {};
+    readBufferContent.mockImplementationOnce(async (id: string) => {
+      const read = fileOnDisk.get(id) ?? "";
+      await new Promise<void>((resolve) => (finishOpen = resolve));
+      return read;
+    });
+    const { container, win } = await mount(mockBuffer("note"));
+
+    fileOnDisk.set("note", "rewritten by another program\n");
+    win.editor.requestExternalReload("note");
+    await flushMicrotasks();
+    finishOpen();
+
+    await waitFor(() =>
+      expect(container.textContent).toContain("rewritten by another program"),
+    );
+    await waitFor(() =>
+      expect(win.editor.lastKnownDiskHash("note")).toBe(digestOf("rewritten by another program\n")),
+    );
+    expect(container.textContent).not.toContain("as Jotra opened it");
+  });
+
   it("goes back to the file for every change, not once", async () => {
     fileOnDisk.set("note", "first\n");
     const { container, win } = await mount(mockBuffer("note"));

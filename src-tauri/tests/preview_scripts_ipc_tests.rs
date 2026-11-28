@@ -27,9 +27,9 @@ use jotra_storage::database::migrations::run_migrations;
 use jotra_storage::layout_state::LayoutStateStore;
 use jotra_storage::notes_index::NotesIndexStore;
 use jotra_tauri_lib::commands::preview::{
-    preview_get_scripts_inner, preview_inline_image_download_inner, preview_inline_image_inner,
-    preview_set_scripts_inner, preview_url_prefix, render_into_cache, CachedRender,
-    InlineImageResult,
+    preview_force_render, preview_get_scripts_inner, preview_inline_image_download_inner,
+    preview_inline_image_inner, preview_set_scripts_inner, preview_url_prefix, render_into_cache,
+    CachedRender, InlineImageResult,
 };
 use jotra_tauri_lib::preview::csp::build_document_csp;
 use jotra_tauri_lib::preview::handler::{resolve_cached, RenderCache};
@@ -38,6 +38,7 @@ use jotra_tauri_lib::quit::QuitState;
 use jotra_tauri_lib::security::AuthorizedPaths;
 use jotra_tauri_lib::state::AppState;
 use jotra_tauri_lib::watcher::handler::create_ignore_set;
+use tauri::Manager;
 use tempfile::TempDir;
 
 const LIB_RS: &str = include_str!("../src/lib.rs");
@@ -314,6 +315,98 @@ fn a_render_after_a_panic_poisoned_the_store_is_served_with_scripts_off() {
         served_csp(&state.preview_render_cache, "buf-1"),
         build_document_csp(false)
     );
+}
+
+/// Poisons the store the way a command that panicked while it held it does.
+fn panic_while_holding_the_store(state: &AppState) {
+    let poisoned = std::thread::scope(|scope| {
+        scope
+            .spawn(|| {
+                let _store = state.store.lock().expect("store");
+                panic!("a holder of the store lock panicked");
+            })
+            .join()
+    });
+    assert!(poisoned.is_err() && state.store.is_poisoned());
+}
+
+#[test]
+fn the_preview_keeps_its_scripts_off_after_a_save_takes_the_poisoned_store_back() {
+    let dir = TempDir::new().expect("temp dir");
+    let state = state_with(&dir, "buf-1", None);
+    preview_set_scripts_inner(&state, "buf-1", true).expect("on");
+    panic_while_holding_the_store(&state);
+
+    drop(state.lock_store());
+    assert!(!state.store.is_poisoned(), "the store was taken back");
+
+    assert_eq!(preview_get_scripts_inner(&state, "buf-1"), Ok(false));
+    for _ in 0..2 {
+        assert!(!rendered_with_scripts(render_into_cache(
+            &state,
+            "buf-1",
+            html_request()
+        )));
+        assert_eq!(
+            served_csp(&state.preview_render_cache, "buf-1"),
+            build_document_csp(false)
+        );
+    }
+    assert!(
+        preview_set_scripts_inner(&state, "buf-1", true).is_err(),
+        "an opt-in is not taken after the panic"
+    );
+    assert!(!rendered_with_scripts(render_into_cache(
+        &state,
+        "buf-1",
+        html_request()
+    )));
+    preview_set_scripts_inner(&state, "buf-1", false).expect("turning them off still works");
+}
+
+#[test]
+fn a_render_after_a_panic_was_held_through_the_store_reads_no_embedded_files() {
+    let dir = TempDir::new().expect("temp dir");
+    let file = image_beside_a_file(&dir);
+    let app = tauri::test::mock_builder()
+        .manage(state_with(&dir, "buf-1", Some(&file)))
+        .build(tauri::test::mock_context(tauri::test::noop_assets()))
+        .expect("mock app");
+    let render = || {
+        tauri::async_runtime::block_on(preview_force_render(
+            app.handle().clone(),
+            "buf-1".to_string(),
+            HtmlRenderer::content_type_id().as_str().to_string(),
+            "<p><img src=\"pic.png\"></p>".to_string(),
+            Default::default(),
+            1.0,
+        ))
+        .expect("rendered");
+        app.state::<AppState>()
+            .preview_render_cache
+            .get("buf-1")
+            .expect("a cached render")
+            .assets
+            .is_some()
+    };
+    assert!(render(), "the render reads files beside the file it shows");
+
+    let state = app.state::<AppState>();
+    panic_while_holding_the_store(&state);
+    drop(state.lock_store());
+
+    assert!(!render(), "the render after the panic reads none");
+}
+
+#[test]
+fn an_inline_image_after_a_panic_was_held_through_the_store_is_not_read() {
+    let dir = TempDir::new().expect("temp dir");
+    let file = image_beside_a_file(&dir);
+    let state = state_with(&dir, "buf-1", Some(&file));
+    panic_while_holding_the_store(&state);
+    drop(state.lock_store());
+
+    assert!(preview_inline_image_inner(&state, "buf-1", "pic.png", &never_dataless).is_err());
 }
 
 #[test]
