@@ -37,6 +37,9 @@ use crate::paths::file_name_only;
 pub struct MoveOutcome {
     /// Entries moved out of the old folder.
     pub moved: usize,
+    /// The names of the entries moved, sorted: what a move that has to be
+    /// undone takes back, and nothing the destination held before it.
+    pub entries: Vec<String>,
     /// Names the destination already held, sorted.
     pub collided: Vec<String>,
     /// Entries copied to another volume whose originals could not all be
@@ -94,19 +97,40 @@ pub fn move_notes_folder_renaming(
     move_with(from, to, rename, &Probes::FILESYSTEM)
 }
 
-/// What a copy to another volume asks before it writes anything, handed in so
-/// a placeholder and a full disk can be exercised where neither exists.
+/// Moves the entries `names` of `from` into `to`, the way
+/// [`move_notes_folder`] moves all of them: what undoes a move is the same
+/// move of its [`MoveOutcome::entries`] in the other direction.
+///
+/// # Errors
+///
+/// As [`move_notes_folder`].
+pub fn move_entries(from: &Path, to: &Path, names: &[String]) -> StorageResult<MoveOutcome> {
+    move_named(
+        from,
+        to,
+        names,
+        &|from, to| std::fs::rename(from, to),
+        &Probes::FILESYSTEM,
+    )
+}
+
+/// What a copy to another volume asks of the filesystem, handed in so a
+/// placeholder, a full disk and a flush that fails can be exercised where none
+/// of them happens.
 struct Probes<'a> {
     /// Whether the entry at a path has no bytes on this machine.
     is_dataless: &'a dyn Fn(&Path) -> bool,
     /// The bytes the volume holding a folder has free, when it will say.
     available: &'a dyn Fn(&Path) -> Option<u64>,
+    /// Flushes a folder's entries to the disk.
+    flush_folder: &'a dyn Fn(&Path) -> std::io::Result<()>,
 }
 
 impl Probes<'static> {
     const FILESYSTEM: Self = Self {
         is_dataless: &crate::notes_index::is_dataless,
         available: &available_bytes,
+        flush_folder: &sync_dir,
     };
 }
 
@@ -116,9 +140,21 @@ fn move_with(
     rename: Rename<'_>,
     probes: &Probes<'_>,
 ) -> StorageResult<MoveOutcome> {
+    let entries = entry_names(from)?;
+    move_named(from, to, &entries, rename, probes)
+}
+
+fn move_named(
+    from: &Path,
+    to: &Path,
+    entries: &[String],
+    rename: Rename<'_>,
+    probes: &Probes<'_>,
+) -> StorageResult<MoveOutcome> {
     std::fs::create_dir_all(to)?;
 
-    let entries = entry_names(from)?;
+    let mut entries = entries.to_vec();
+    entries.sort();
     let taken = lowercased_names(to);
     let mut collided: Vec<String> = entries
         .iter()
@@ -144,6 +180,7 @@ fn move_with(
                 return match copy_across(from, to, rest, probes) {
                     Ok(left_behind) => Ok(MoveOutcome {
                         moved: done.len() + rest.len(),
+                        entries,
                         collided: Vec::new(),
                         left_behind,
                     }),
@@ -162,6 +199,7 @@ fn move_with(
 
     Ok(MoveOutcome {
         moved: done.len(),
+        entries,
         ..MoveOutcome::default()
     })
 }
@@ -192,7 +230,8 @@ fn put_back(rename: Rename<'_>, done: &[(PathBuf, PathBuf)]) {
 /// staging folder inside `to`, each file and folder synced; each staged entry
 /// is renamed to its name, refusing a name something took in between; `to`
 /// is synced; and only then are the originals removed. A failure before the
-/// last rename leaves `from` as it was and clears the staging folder. A
+/// originals are removed, the sync of `to` included, leaves `from` as it was,
+/// takes every placed entry back and clears the staging folder. A
 /// removal that fails afterwards is not a failed move: the notes are whole at
 /// the destination, and what is left in `from` is reported.
 ///
@@ -229,28 +268,21 @@ fn copy_across(
     for name in names {
         copy_entry(&from.join(name), &staging.path().join(name))?;
     }
-    sync_dir(staging.path())?;
+    (probes.flush_folder)(staging.path())?;
 
     let mut placed: Vec<&String> = Vec::new();
     for name in names {
         let staged = staging.path().join(name);
         if let Err(error) = crate::note_ops::rename_no_replace(&staged, &to.join(name)) {
-            for name in placed.iter().rev() {
-                if let Err(error) =
-                    crate::note_ops::rename_no_replace(&to.join(name), &staging.path().join(name))
-                {
-                    warn!(
-                        path = %file_name_only(name),
-                        %error,
-                        "a copied entry could not be taken back after a failed move"
-                    );
-                }
-            }
+            take_back(to, staging.path(), &placed);
             return Err(error.into());
         }
         placed.push(name);
     }
-    sync_dir(to)?;
+    if let Err(error) = (probes.flush_folder)(to) {
+        take_back(to, staging.path(), &placed);
+        return Err(error.into());
+    }
     drop(staging);
 
     let mut left_behind = Vec::new();
@@ -266,6 +298,22 @@ fn copy_across(
     }
     left_behind.sort();
     Ok(left_behind)
+}
+
+/// Takes every entry a failed copy across had already placed in `to` back
+/// into the staging folder, which clears them with it. Best effort, as
+/// [`put_back`] is.
+fn take_back(to: &Path, staging: &Path, placed: &[&String]) {
+    for name in placed.iter().rev() {
+        if let Err(error) = crate::note_ops::rename_no_replace(&to.join(name), &staging.join(name))
+        {
+            warn!(
+                path = %file_name_only(name),
+                %error,
+                "a copied entry could not be taken back after a failed move"
+            );
+        }
+    }
 }
 
 /// Adds up what copying `path` would write and names what under it has no
@@ -914,6 +962,7 @@ mod tests {
         let probes = Probes {
             is_dataless: &|path: &Path| path.ends_with("Deep.md"),
             available: &|_: &Path| None,
+            flush_folder: &sync_dir,
         };
 
         let error = move_with(&from, &to, &refuse_rename, &probes).unwrap_err();
@@ -935,6 +984,7 @@ mod tests {
         let probes = Probes {
             is_dataless: &|_: &Path| false,
             available: &|_: &Path| Some(1),
+            flush_folder: &sync_dir,
         };
 
         let error = move_with(&from, &to, &refuse_rename, &probes).unwrap_err();
@@ -944,6 +994,52 @@ mod tests {
             "{error}"
         );
         untouched(&from, &to);
+    }
+
+    #[test]
+    fn a_destination_that_cannot_be_flushed_once_every_entry_is_placed_keeps_none_of_them() {
+        let dir = tempfile::tempdir().unwrap();
+        let (from, to) = two_notes(dir.path());
+        std::fs::create_dir_all(&to).unwrap();
+        let flush_folder = |path: &Path| {
+            if path == to {
+                Err(std::io::Error::other("the flush failed"))
+            } else {
+                Ok(())
+            }
+        };
+        let probes = Probes {
+            is_dataless: &|_: &Path| false,
+            available: &|_: &Path| None,
+            flush_folder: &flush_folder,
+        };
+
+        let error = move_with(&from, &to, &refuse_rename, &probes).unwrap_err();
+
+        assert!(matches!(error, StorageError::Io(_)), "{error}");
+        untouched(&from, &to);
+    }
+
+    #[test]
+    fn a_move_is_undone_by_moving_its_entries_back() {
+        let dir = tempfile::tempdir().unwrap();
+        let (from, to) = two_notes(dir.path());
+        std::fs::create_dir_all(&to).unwrap();
+        std::fs::write(to.join("Theirs.md"), "theirs").unwrap();
+
+        let moved = move_notes_folder(&from, &to).unwrap();
+        assert_eq!(
+            moved.entries,
+            vec!["Notes.md".to_string(), "projects".to_string()]
+        );
+        let back = move_entries(&to, &from, &moved.entries).unwrap();
+
+        assert_eq!(back.entries, moved.entries);
+        assert_eq!(
+            std::fs::read_to_string(from.join("projects").join("Deep.md")).unwrap(),
+            "two"
+        );
+        assert_eq!(entry_names(&to).unwrap(), vec!["Theirs.md".to_string()]);
     }
 
     #[cfg(unix)]

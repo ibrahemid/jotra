@@ -169,7 +169,7 @@ pub fn answer_ask(app: &AppHandle, ask: &ContextAsk) {
 /// A tab that is not open, or holds no file yet, answers no path.
 pub fn resolve_answer(state: &AppState, reply: WindowContext) -> OpenContext {
     let path = reply.buffer_id.as_deref().and_then(|id| {
-        let store = recover_poison(state.store.lock(), "open_context::resolve_answer");
+        let store = state.lock_store();
         store
             .get(id)
             .ok()

@@ -279,6 +279,19 @@ export function createBufferCommands(state: DemoState): CommandTable {
       doc.updated_at = stampNow();
       return digestText(content);
     },
+    // commands::buffer::save_buffer_as_utf8: the save in UTF-8, which the note
+    // keeps once the write has landed.
+    save_buffer_as_utf8: async (args) => {
+      const doc = state.getBuffer(args.id);
+      const kept = doc.encoding;
+      doc.encoding = UTF_8;
+      try {
+        return await commands.save_buffer_content({ id: args.id, content: args.content });
+      } catch (error) {
+        doc.encoding = kept;
+        throw error;
+      }
+    },
     auto_retitle_note: (args): Answer<"autoRetitleNote"> => {
       const doc = state.getBuffer(args.id);
       if (!renameable.has(doc.id) || !doc.source_path) return { kind: "skipped" };

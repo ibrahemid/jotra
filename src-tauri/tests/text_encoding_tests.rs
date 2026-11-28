@@ -26,7 +26,8 @@ use jotra_storage::layout_state::LayoutStateStore;
 use jotra_storage::notes_index::NotesIndexStore;
 use jotra_tauri_lib::commands::buffer::{
     close_buffer_inner, note_disk_state_inner, read_buffer_content_inner,
-    reopen_with_encoding_inner, save_buffer_content_inner, NoteDiskAnswer,
+    reopen_with_encoding_inner, save_buffer_as_utf8_inner, save_buffer_content_inner,
+    NoteDiskAnswer,
 };
 use jotra_tauri_lib::commands::file::open_file_from_path;
 use jotra_tauri_lib::preview::handler::RenderCache;
@@ -253,6 +254,64 @@ fn a_lossy_save_is_refused_with_the_characters_named() {
         std::fs::read(&file).unwrap(),
         CP1252_CSV,
         "nothing was written"
+    );
+}
+
+#[test]
+fn a_save_its_encoding_refuses_lands_as_utf8_and_the_note_stays_utf8() {
+    let dir = TempDir::new().unwrap();
+    let state = make_state(&dir);
+    let file = dir.path().join("menu.csv");
+    std::fs::write(&file, CP1252_CSV).unwrap();
+    let id = open(&state, &file);
+    read(&state, &id);
+    let mine = "name,note\nCafé 😀,中\n";
+    save_buffer_content_inner(&state, &id, mine).expect_err("Windows-1252 cannot hold these");
+
+    let digest = save_buffer_as_utf8_inner(&state, &id, mine).expect("UTF-8 holds them");
+
+    assert_eq!(digest, Some(comparison_digest_hex(mine.as_bytes())));
+    assert_eq!(
+        std::fs::read(&file).unwrap(),
+        "name,note\r\nCafé 😀,中\r\n".as_bytes(),
+        "the file keeps its line endings"
+    );
+    assert_eq!(encoding_of(&state, &id).as_deref(), Some("UTF-8"));
+    assert_eq!(read(&state, &id), "name,note\r\nCafé 😀,中\r\n");
+    save_buffer_content_inner(&state, &id, "name,note\nCafé 😀,中,¥\n")
+        .expect("the next save writes UTF-8 too");
+    assert_eq!(
+        std::fs::read(&file).unwrap(),
+        "name,note\r\nCafé 😀,中,¥\r\n".as_bytes()
+    );
+}
+
+#[test]
+fn a_save_as_utf8_the_guard_stops_leaves_the_encoding_as_it_was() {
+    let dir = TempDir::new().unwrap();
+    let state = make_state(&dir);
+    let file = dir.path().join("menu.csv");
+    std::fs::write(&file, CP1252_CSV).unwrap();
+    let id = open(&state, &file);
+    read(&state, &id);
+    std::fs::write(
+        &file,
+        b"name,note\r\nCaf\xe9 Nord,cr\xe8me br\xfbl\xe9e et plus\r\n",
+    )
+    .unwrap();
+
+    let error = save_buffer_as_utf8_inner(&state, &id, "name,note\nCafé 😀\n")
+        .expect_err("the file changed outside Jotra");
+
+    assert!(
+        error.starts_with("ERR_FILE_CHANGED_ON_DISK"),
+        "the refusal is the guard's: {}",
+        error
+    );
+    assert_eq!(
+        encoding_of(&state, &id).as_deref(),
+        Some("windows-1252"),
+        "the file is still read the way it is written"
     );
 }
 

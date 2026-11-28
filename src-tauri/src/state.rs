@@ -22,7 +22,7 @@ use jotra_storage::database::migrations::run_migrations;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64};
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, Mutex, MutexGuard, RwLock};
 use tracing::{info, warn};
 
 use jotra_storage::layout_state::LayoutStateStore;
@@ -620,29 +620,31 @@ impl AppState {
     /// note versions past what is kept: once per launch, after the window has
     /// shown (TS-35).
     ///
-    /// A `VACUUM` needs the database to itself and can take seconds on a large
-    /// file, so it runs behind the store and with the notes index's writer
-    /// held: a command that needs either waits on its worker thread for it, as
-    /// does the notes walk at its next file, rather than meeting a busy
-    /// database. Nothing here is fatal; a database left unvacuumed is still a
-    /// working one. The version store has a file and a lock of its own, kept on
-    /// the same schedule and for the same reason: a table written on every save
-    /// and pruned on a timer leaves a file of free pages behind, and a prune is
-    /// never what a person is waiting on (`jotra_core::maintenance`).
+    /// A `VACUUM` holds the database's write lock and can take seconds on a
+    /// large file, so it runs on a connection of its own with the notes
+    /// index's writer held, and the store stays free: a read of the store's
+    /// rows answers at once, a row write that meets the `VACUUM` cuts it short
+    /// and lands, and the notes walk waits at its next file. Nothing here is
+    /// fatal; a database left unvacuumed is still a working one. The version
+    /// store has a file and a lock of its own, kept on the same schedule and
+    /// for the same reason: a table written on every save and pruned on a
+    /// timer leaves a file of free pages behind, and a prune is never what a
+    /// person is waiting on (`jotra_core::maintenance`).
     pub fn run_startup_maintenance(&self) {
-        // The store before the index's writer: the order a save takes them in.
-        let maintained = {
-            let store = recover_poison(self.store.lock(), "state::run_startup_maintenance");
-            self.notes_index.holding_writes(|| store.run_maintenance())
-        };
-        match maintained {
-            Ok(outcome) if outcome.vacuumed => info!(
-                before_bytes = outcome.before.file_bytes(),
-                after_bytes = outcome.after.file_bytes(),
-                "reclaimed database free space"
-            ),
-            Ok(_) => {}
-            Err(e) => warn!(error = %e, "database maintenance failed"),
+        let database = self.lock_store().database_path();
+        if let Some(database) = database {
+            let maintained = self
+                .notes_index
+                .holding_writes(|| jotra_storage::maintenance::run_maintenance_at(&database));
+            match maintained {
+                Ok(outcome) if outcome.vacuumed => info!(
+                    before_bytes = outcome.before.file_bytes(),
+                    after_bytes = outcome.after.file_bytes(),
+                    "reclaimed database free space"
+                ),
+                Ok(_) => {}
+                Err(e) => warn!(error = %e, "database maintenance failed"),
+            }
         }
         match self.note_history.prune(std::time::SystemTime::now()) {
             Ok(outcome) if outcome.retired > 0 => info!(
@@ -653,6 +655,30 @@ impl AppState {
             Ok(_) => {}
             Err(e) => warn!(error = %e, "note version retention failed"),
         }
+    }
+
+    /// The buffer store, held until the guard drops.
+    ///
+    /// A thread that panicked while it held the store leaves the lock
+    /// poisoned; the store is taken back and the poison cleared, since a
+    /// SQLite transaction the panic dropped has rolled back, so saves and
+    /// closes keep working rather than failing until a restart. The store is
+    /// marked as held through a panic first, so the preview keeps the closed
+    /// answer the poison gave it ([`BufferStore::mark_held_through_a_panic`]).
+    #[track_caller]
+    pub fn lock_store(&self) -> MutexGuard<'_, BufferStore> {
+        let caller = std::panic::Location::caller();
+        self.store.lock().unwrap_or_else(|poisoned| {
+            tracing::error!(
+                file = caller.file(),
+                line = caller.line(),
+                "recovered the poisoned buffer store"
+            );
+            let mut store = poisoned.into_inner();
+            store.mark_held_through_a_panic();
+            self.store.clear_poison();
+            store
+        })
     }
 
     /// The notes folder as it stands now.
@@ -1386,7 +1412,7 @@ impl OpenNotes for OpenTabs<'_> {
         // and a row holds the spelling the tab was opened under, so the row's
         // path goes through the same resolution before the two are compared.
         let wanted = path.to_string_lossy().into_owned();
-        let store = recover_poison(self.0.store.lock(), "state::OpenTabs::note_at");
+        let store = self.0.lock_store();
         let rows = store
             .list_by_status(jotra_core::buffer::document::BufferStatus::Active)
             .ok()?;

@@ -21,7 +21,7 @@ use jotra_storage::database::migrations::run_migrations;
 use jotra_storage::layout_state::LayoutStateStore;
 use jotra_storage::notes_index::NotesIndexStore;
 use jotra_tauri_lib::commands::chat::{
-    announce_applied_note, apply_proposal_inner, undo_proposal_to_state,
+    announce_applied_note, apply_proposal_inner, apply_proposal_to_state, undo_proposal_to_state,
 };
 use jotra_tauri_lib::preview::handler::RenderCache;
 use jotra_tauri_lib::quit::QuitState;
@@ -382,4 +382,60 @@ fn an_applied_edit_is_not_reverted_by_recovery() {
         "the launch would write something back over the applied edit"
     );
     assert_eq!(std::fs::read_to_string(&file).expect("read"), "after\n");
+}
+
+#[test]
+fn an_apply_to_an_open_note_in_the_folder_waits_for_its_tabs_turn() {
+    let dir = TempDir::new().expect("temp dir");
+    let state = make_state(&dir);
+    let (file, hash) = seed_note(&state, "Launch.md", "before\n");
+    open_row(&state, "note-1", &file, "before\n");
+
+    let held = state.buffer_writes.turn("note-1");
+    std::thread::scope(|scope| {
+        let apply = scope
+            .spawn(|| apply_proposal_to_state(&state, "probe-host", "Launch.md", "after\n", &hash));
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        assert!(
+            !apply.is_finished(),
+            "the apply wrote while a save of the tab held its turn"
+        );
+        assert_eq!(std::fs::read_to_string(&file).expect("read"), "before\n");
+        drop(held);
+        let outcome = apply
+            .join()
+            .expect("the apply thread")
+            .expect("the apply lands once the turn is free");
+        assert!(outcome.changed);
+    });
+    assert_eq!(std::fs::read_to_string(&file).expect("read"), "after\n");
+}
+
+#[test]
+fn an_undo_of_an_open_note_in_the_folder_waits_for_its_tabs_turn() {
+    let dir = TempDir::new().expect("temp dir");
+    let state = make_state(&dir);
+    state.note_history.set_notes_root(state.notes_root());
+    let (file, before) = seed_note(&state, "Launch.md", "before\n");
+    open_row(&state, "note-1", &file, "before\n");
+    let applied = apply_proposal_to_state(&state, "probe-host", "Launch.md", "after\n", &before)
+        .expect("applied");
+
+    let held = state.buffer_writes.turn("note-1");
+    std::thread::scope(|scope| {
+        let undo = scope.spawn(|| {
+            undo_proposal_to_state(&state, "probe-host", "Launch.md", &before, &applied.hash)
+        });
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        assert!(
+            !undo.is_finished(),
+            "the undo wrote while a save of the tab held its turn"
+        );
+        assert_eq!(std::fs::read_to_string(&file).expect("read"), "after\n");
+        drop(held);
+        undo.join()
+            .expect("the undo thread")
+            .expect("the undo lands once the turn is free");
+    });
+    assert_eq!(std::fs::read_to_string(&file).expect("read"), "before\n");
 }

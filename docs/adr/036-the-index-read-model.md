@@ -225,6 +225,12 @@ brought it back left. A folder move re-keys every row, so it counts as a write
 of every path, and a walk that started before it writes nothing more. A rename
 leaves the walk under way running.
 
+The buffer store writes the index under its own lock, so its writes never wait
+for the writer. One that finds the writer held, by a walk's file or by the
+startup `VACUUM`, is left with the index, newest per path, and counts as
+written then; the write holding the writer makes it before letting go, and the
+buffer store's lock is let go at once (ADR-047).
+
 Before this, one connection served both, and the walk held it from its first
 file to its last. Every one of those commands waited for the walk to end: the
 first command issued during a walk of 5,000 notes took 6,976 ms on a release

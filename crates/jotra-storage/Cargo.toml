@@ -35,6 +35,7 @@ zip = { version = "9.0.3", default-features = false }
 
 [features]
 bundled = ["rusqlite/bundled"]
+test-hooks = []
 
 [dev-dependencies]
 rusqlite = { version = "0.41", features = ["bundled"] }

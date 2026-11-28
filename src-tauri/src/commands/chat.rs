@@ -12,6 +12,7 @@ use jotra_ai::chat::{self, PaneFrame, TabLookup};
 use jotra_core::chat::{ChatError, ProposalStatus};
 use jotra_core::config::AiConfig;
 use jotra_core::polish;
+use jotra_core::serial::Turn;
 use jotra_storage::chat_store::{ChatStore, ConversationSummary};
 use jotra_storage::paths::file_name_only;
 use tauri::{AppHandle, Manager, State};
@@ -493,14 +494,51 @@ fn apply_proposal_blocking(
     outcome
 }
 
+/// The file `path` names, and the turn ([`AppState::buffer_writes`]) of the
+/// tab holding it when one does.
+///
+/// The file is resolved again once the turn is held: a write that landed
+/// while the turn was awaited can have moved the tab, and the write is judged
+/// against the file as the tabs hold it now. A tab that changed hands in that
+/// wait is waited for in its turn.
+fn context_in_turn(
+    state: &AppState,
+    notes_root: &Path,
+    path: &str,
+) -> (Option<chat::ContextFile>, Option<Turn>) {
+    let open_tabs = state.open_tabs();
+    let resolve = || chat::resolve_context_file(notes_root, &Tabs(&open_tabs), path).ok();
+    let holder = |context: &chat::ContextFile| match &context.scope {
+        chat::ContextScope::OpenTab { tab_id } => Some(tab_id.clone()),
+        chat::ContextScope::Notes => open_tabs.note_at(&context.file),
+    };
+    let mut wanted = resolve().as_ref().and_then(holder);
+    for _ in 0..CONTEXT_TURN_ATTEMPTS {
+        let turn = wanted.as_deref().map(|id| state.buffer_writes.turn(id));
+        let context = resolve();
+        let holding = context.as_ref().and_then(holder);
+        if holding == wanted {
+            return (context, turn);
+        }
+        drop(turn);
+        wanted = holding;
+    }
+    (None, None)
+}
+
+/// How many times [`context_in_turn`] follows a file from tab to tab before
+/// it gives up on writing it.
+const CONTEXT_TURN_ATTEMPTS: usize = 3;
+
 /// Writes one proposal against the app's state, and tells the tab holding the
 /// file what it now holds.
 ///
-/// A file only an open tab reaches is written through that tab's save, and the
-/// tab's turn ([`AppState::buffer_writes`]) is held from the read that checks
-/// the offer to the notice that follows the write. A save of the tab is then
-/// either landed before the check, which refuses the offer, or waits until the
-/// write is told.
+/// The turn of the tab holding the file ([`AppState::buffer_writes`]) is held
+/// from the read that checks the offer to the notice that follows the write,
+/// for a file only that tab reaches and for a note in the folder alike. A save
+/// of the tab is then either landed before the check, which refuses the
+/// offer, or waits until the write is told. A file only an open tab reaches is
+/// written through that tab's save.
 pub fn apply_proposal_to_state(
     state: &AppState,
     host: &str,
@@ -509,12 +547,8 @@ pub fn apply_proposal_to_state(
     before_hash: &str,
 ) -> Result<ProposalOutcome, String> {
     let notes_root = state.notes_root();
+    let (context, tab_turn) = context_in_turn(state, &notes_root, path);
     let open_tabs = state.open_tabs();
-    let context = chat::resolve_context_file(&notes_root, &Tabs(&open_tabs), path).ok();
-    let tab_turn = match context.as_ref().map(|context| &context.scope) {
-        Some(chat::ContextScope::OpenTab { tab_id }) => Some(state.buffer_writes.turn(tab_id)),
-        _ => None,
-    };
     let write_file = context.as_ref().map(|context| context.file.clone());
     let write_name = context
         .as_ref()
@@ -551,15 +585,11 @@ pub fn apply_proposal_to_state(
     // it, so an event about it would be a notice about nothing.
     if outcome.as_ref().is_ok_and(|applied| applied.changed) {
         if let Some(context) = context.as_ref() {
-            let bytes = match context.scope {
-                // The buffer store keeps the line ending the file keeps, so
-                // what landed is not always the string that was offered. The
-                // tab is told what the file holds.
-                chat::ContextScope::OpenTab { .. } => {
-                    std::fs::read(&context.file).unwrap_or_else(|_| new_content.as_bytes().to_vec())
-                }
-                chat::ContextScope::Notes => new_content.as_bytes().to_vec(),
-            };
+            // The write keeps the line ending and the encoding the file keeps,
+            // so what landed is not always the string that was offered. The
+            // tab is told what the file holds.
+            let bytes =
+                std::fs::read(&context.file).unwrap_or_else(|_| new_content.as_bytes().to_vec());
             match &context.scope {
                 chat::ContextScope::OpenTab { tab_id } => {
                     announce_note_change(state, tab_id, &context.file, &bytes)
@@ -615,6 +645,7 @@ pub fn undo_proposal_to_state(
     applied_hash: &str,
 ) -> Result<ProposalOutcome, String> {
     let notes_root = state.notes_root();
+    let (_, tab_turn) = context_in_turn(state, &notes_root, path);
     let open_tabs = state.open_tabs();
     let outcome = undo_proposal_inner(
         &notes_root,
@@ -633,6 +664,7 @@ pub fn undo_proposal_to_state(
             }
         }
     }
+    drop(tab_turn);
     outcome
 }
 

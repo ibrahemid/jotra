@@ -314,3 +314,60 @@ fn a_heading_is_found_on_its_line_without_counting_as_a_read() {
         "{unread:?}"
     );
 }
+
+#[test]
+fn a_write_keeps_the_notes_own_encoding() {
+    let fixture = fixture();
+    let file = fixture.notes.join("Latin.txt");
+    let seeded = b"Le caf\xe9 est ouvert. Le caf\xe9 est ferm\xe9.\nUne r\xe9union.\n".to_vec();
+    std::fs::write(&file, &seeded).expect("seed");
+    let host = host(&fixture);
+    let read = host.read_note("Latin.txt").expect("read");
+    let hash = digest_from_hex(&read.hash).expect("hash");
+    host.write_note(
+        "Latin.txt",
+        "Le caf\u{e9} est ferm\u{e9}.\nUne r\u{e9}union demain.\n",
+        LastKnown::Hash(hash),
+        cli(),
+    )
+    .expect("write");
+    assert_eq!(
+        std::fs::read(&file).expect("read"),
+        b"Le caf\xe9 est ferm\xe9.\nUne r\xe9union demain.\n"
+    );
+}
+
+#[test]
+fn a_write_the_notes_encoding_cannot_hold_writes_nothing() {
+    let fixture = fixture();
+    let file = fixture.notes.join("Latin.txt");
+    let seeded = b"Le caf\xe9 est ouvert. Le caf\xe9 est ferm\xe9.\nUne r\xe9union.\n".to_vec();
+    std::fs::write(&file, &seeded).expect("seed");
+    let host = host(&fixture);
+    let read = host.read_note("Latin.txt").expect("read");
+    let hash = digest_from_hex(&read.hash).expect("hash");
+    let error = host
+        .write_note("Latin.txt", "\u{1F600}\n", LastKnown::Hash(hash), cli())
+        .expect_err("refused");
+    assert!(
+        matches!(&error, HostError::EncodingLossy { characters, .. } if characters.contains("U+1F600")),
+        "{error}"
+    );
+    assert_eq!(std::fs::read(&file).expect("read"), seeded);
+}
+
+#[test]
+fn an_edit_of_a_note_with_damaged_bytes_writes_nothing() {
+    let fixture = fixture();
+    let file = fixture.notes.join("Damaged.txt");
+    let mut seeded = "Grüße aus Köln, schöne Straße.\n".as_bytes().to_vec();
+    seeded.extend_from_slice(b"one bad byte: \xff\n");
+    std::fs::write(&file, &seeded).expect("seed");
+    let host = host(&fixture);
+
+    let appended = host.append_note("Damaged.txt", "more", cli());
+    assert!(matches!(appended, Err(HostError::NotInEncoding { .. })));
+    let replaced = host.replace_in_note("Damaged.txt", "Köln", "Bonn", cli());
+    assert!(matches!(replaced, Err(HostError::NotInEncoding { .. })));
+    assert_eq!(std::fs::read(&file).expect("read"), seeded);
+}

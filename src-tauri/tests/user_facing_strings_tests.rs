@@ -175,7 +175,7 @@ const RUST_ALLOWLIST: &[AllowedString] = &[
     },
     AllowedString {
         file: "crates/jotra-ai/src/chat.rs",
-        line: 987,
+        line: 988,
         word: "note",
         note: "debug_assert text, never rendered",
     },
@@ -187,7 +187,7 @@ const RUST_ALLOWLIST: &[AllowedString] = &[
     },
     AllowedString {
         file: "src-tauri/src/state.rs",
-        line: 651,
+        line: 653,
         word: "note",
         note: "log line the prefix test misses inside a multi-line macro",
     },

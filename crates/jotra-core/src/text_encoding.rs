@@ -171,6 +171,37 @@ impl TextEncoding {
             .ok_or(NotInEncoding { encoding: self })
     }
 
+    /// [`Self::decode`] for bytes the caller is done with.
+    ///
+    /// UTF-8 bytes with no mark are the text: they are validated once and
+    /// handed over as it, with no copy. Any other bytes are decoded into new
+    /// text and handed back beside it.
+    ///
+    /// # Errors
+    ///
+    /// [`NotInEncoding`], as [`Self::decode`] answers it.
+    pub fn decode_owned(self, bytes: Vec<u8>) -> Result<OwnedText, NotInEncoding> {
+        if self.encoding == UTF_8 && !bytes.starts_with(UTF_8_BOM) {
+            return String::from_utf8(bytes)
+                .map(OwnedText::Bytes)
+                .map_err(|_| NotInEncoding { encoding: self });
+        }
+        let text = self.decode(&bytes)?.into_owned();
+        Ok(OwnedText::Decoded { text, bytes })
+    }
+
+    /// Whether the text `prefix` declares in this encoding, after its byte
+    /// order mark, holds no NUL character and, for UTF-16, no surrogate
+    /// without its pair short of one cut off at the end.
+    fn declared_body_is_text(self, prefix: &[u8]) -> bool {
+        let body = self.body(prefix);
+        if self.encoding != UTF_16LE && self.encoding != UTF_16BE {
+            return !body.contains(&0);
+        }
+        let little = self.encoding == UTF_16LE;
+        utf16_reads_as_text(body, little, |character| character != '\0')
+    }
+
     /// Reads `bytes` as text in this encoding, with U+FFFD for any sequence
     /// that has no character. Only for a digest or a display, never for text
     /// that may be saved.
@@ -339,6 +370,40 @@ pub struct DecodedText<'a> {
     pub encoding: TextEncoding,
     /// The text, without the byte order mark.
     pub text: Cow<'a, str>,
+    /// `true` when U+FFFD stands in the text for bytes that are not text in
+    /// `encoding`: a UTF-8 file with a damaged sequence. Such text is for
+    /// reading and indexing only; written back, it would replace those bytes.
+    pub replaced: bool,
+}
+
+/// Text decoded from bytes the caller handed over ([`TextEncoding::decode_owned`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum OwnedText {
+    /// The bytes were UTF-8 with no mark, and are the text.
+    Bytes(String),
+    /// The text decoded from `bytes`, which differ from it.
+    Decoded {
+        /// The text, without the byte order mark.
+        text: String,
+        /// The bytes it was decoded from.
+        bytes: Vec<u8>,
+    },
+}
+
+/// Whether a file whose first bytes are `prefix` is binary: a NUL byte when
+/// they declare no encoding, a NUL character or a broken surrogate in the text
+/// after the mark when they declare one ([`declared`]).
+///
+/// A byte order mark says how to read what follows it, not that what follows
+/// is text. UTF-16 without a mark is only declared when its prefix already
+/// reads as text.
+#[must_use]
+pub fn sniffs_binary(prefix: &[u8]) -> bool {
+    match declared(prefix) {
+        None => prefix.contains(&0),
+        Some(encoding) if encoding.bom => !encoding.declared_body_is_text(prefix),
+        Some(_) => false,
+    }
 }
 
 /// The encoding the first bytes of a file declare: a byte order mark, or the
@@ -389,6 +454,18 @@ fn utf16_without_bom(prefix: &[u8]) -> Option<&'static Encoding> {
     } else {
         return None;
     };
+    utf16_reads_as_text(sample, little, is_text_character).then_some(if little {
+        UTF_16LE
+    } else {
+        UTF_16BE
+    })
+}
+
+/// Whether `sample` decodes as UTF-16 in the byte order `little` names into
+/// characters `is_text` accepts, with no surrogate missing its pair short of a
+/// high one cut off at the end.
+fn utf16_reads_as_text(sample: &[u8], little: bool, is_text: impl Fn(char) -> bool) -> bool {
+    let (pairs, _) = sample.as_chunks::<2>();
     let code_units = pairs.iter().map(|pair| {
         if little {
             u16::from_le_bytes(*pair)
@@ -396,17 +473,16 @@ fn utf16_without_bom(prefix: &[u8]) -> Option<&'static Encoding> {
             u16::from_be_bytes(*pair)
         }
     });
-    let decoded: Vec<_> = char::decode_utf16(code_units).collect();
-    let last = decoded.len() - 1;
-    for (index, unit) in decoded.iter().enumerate() {
+    let mut decoded = char::decode_utf16(code_units).peekable();
+    while let Some(unit) = decoded.next() {
+        let is_last = decoded.peek().is_none();
         match unit {
-            Ok(character) if is_text_character(*character) => {}
-            Err(error)
-                if index == last && (0xD800..0xDC00).contains(&error.unpaired_surrogate()) => {}
-            _ => return None,
+            Ok(character) if is_text(character) => {}
+            Err(error) if is_last && (0xD800..0xDC00).contains(&error.unpaired_surrogate()) => {}
+            _ => return false,
         }
     }
-    Some(if little { UTF_16LE } else { UTF_16BE })
+    true
 }
 
 fn is_text_character(character: char) -> bool {
@@ -414,16 +490,22 @@ fn is_text_character(character: char) -> bool {
 }
 
 /// The encoding a file that is not binary is in: what its first bytes
-/// declare, else UTF-8 when the whole of it is UTF-8, else chardetng's guess.
+/// declare, else UTF-8 when the whole of it is UTF-8 or it holds more UTF-8
+/// sequences of two or more bytes than damaged ones ([`reads_as_damaged_utf8`]),
+/// else chardetng's guess.
 #[must_use]
 pub fn detect(bytes: &[u8]) -> TextEncoding {
     if let Some(declared) = declared(bytes) {
         return declared;
     }
-    if Encoding::utf8_valid_up_to(bytes) == bytes.len() {
+    let valid_up_to = Encoding::utf8_valid_up_to(bytes);
+    if valid_up_to == bytes.len() {
         return TextEncoding::utf8();
     }
     let sample = &bytes[..bytes.len().min(DETECTION_SAMPLE_BYTES)];
+    if reads_as_damaged_utf8(sample, valid_up_to.min(sample.len())) {
+        return TextEncoding::utf8();
+    }
     let mut detector = chardetng::EncodingDetector::new(chardetng::Iso2022JpDetection::Deny);
     detector.feed(sample, sample.len() == bytes.len());
     TextEncoding {
@@ -432,23 +514,68 @@ pub fn detect(bytes: &[u8]) -> TextEncoding {
     }
 }
 
+/// Whether `sample`, which is UTF-8 up to `valid_up_to` and not at it, is a
+/// UTF-8 file with damage rather than a file in another encoding: more of its
+/// sequences of two or more bytes are UTF-8 than are broken.
+///
+/// The accented letters of a legacy encoding are single high bytes, each a
+/// broken UTF-8 sequence, and they almost never fall into a whole one. A UTF-8
+/// file with one bad byte keeps the rest of its non-ASCII text whole.
+fn reads_as_damaged_utf8(sample: &[u8], valid_up_to: usize) -> bool {
+    let leads = |valid: &[u8]| valid.iter().filter(|byte| **byte >= 0xC0).count();
+    let mut sequences = leads(&sample[..valid_up_to]);
+    let mut broken = 0usize;
+    let mut rest = &sample[valid_up_to..];
+    loop {
+        match std::str::from_utf8(rest) {
+            Ok(valid) => {
+                sequences += leads(valid.as_bytes());
+                break;
+            }
+            Err(error) => {
+                let (valid, after) = rest.split_at(error.valid_up_to());
+                sequences += leads(valid);
+                let Some(length) = error.error_len() else {
+                    break;
+                };
+                broken += 1;
+                rest = &after[length..];
+            }
+        }
+    }
+    sequences > broken
+}
+
 /// Reads a file's bytes as text in the encoding [`detect`] finds.
 ///
-/// A guess that cannot decode every byte gives way to Windows-1252, which can,
-/// so the text is never read with a character standing in for bytes and a
-/// save never writes one over them. The open reads through here, and so does
-/// every reader of a file Jotra has no row for ([`decode_file`]), so they all
-/// see the same text.
+/// A legacy guess that cannot decode every byte gives way to Windows-1252,
+/// which can, so the text is never read with a character standing in for
+/// bytes and a save never writes one over them. A UTF-8 file with damaged
+/// sequences stays UTF-8, read with U+FFFD for them and marked
+/// [`DecodedText::replaced`]: the open records it as UTF-8, so the tab's
+/// strict read refuses it rather than showing it in a guessed encoding. The
+/// open reads through here, and so does every reader of a file Jotra has no
+/// row for ([`decode_file`]), so they all see the same text.
 #[must_use]
 pub fn decode_detected(bytes: &[u8]) -> DecodedText<'_> {
     let encoding = detect(bytes);
     match encoding.decode(bytes) {
-        Ok(text) => DecodedText { encoding, text },
+        Ok(text) => DecodedText {
+            encoding,
+            text,
+            replaced: false,
+        },
+        Err(_) if encoding.encoding == UTF_8 => DecodedText {
+            encoding,
+            text: encoding.decode_lossy(bytes),
+            replaced: true,
+        },
         Err(_) => {
             let fallback = TextEncoding::windows_1252();
             DecodedText {
                 encoding: fallback,
                 text: fallback.decode_lossy(bytes),
+                replaced: false,
             }
         }
     }

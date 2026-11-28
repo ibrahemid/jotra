@@ -916,6 +916,46 @@ fn a_move_that_does_not_happen_leaves_the_old_folder_watched() {
 }
 
 #[test]
+fn a_move_whose_folder_cannot_be_recorded_puts_the_files_back() {
+    let dir = TempDir::new().expect("temp");
+    let state = make_state(&dir);
+    let from = state.notes_root();
+    std::fs::create_dir_all(from.join("projects")).expect("subfolder");
+    std::fs::write(from.join("Notes.md"), "mine").expect("seed");
+    std::fs::write(from.join("projects").join("Deep.md"), "deep").expect("seed");
+    let to = dir.path().join("Elsewhere");
+    std::fs::create_dir_all(&to).expect("destination");
+    std::fs::write(to.join("Theirs.md"), "theirs").expect("seed");
+    // A folder where config.toml belongs takes no write, on every platform.
+    std::fs::create_dir_all(state.config_store.path()).expect("config in the way");
+
+    move_notes_folder_to(&state, &to).expect_err("the folder could not be recorded");
+
+    assert_eq!(state.notes_root(), from, "Jotra still uses the old folder");
+    assert_eq!(
+        std::fs::read_to_string(from.join("Notes.md")).expect("back"),
+        "mine"
+    );
+    assert_eq!(
+        std::fs::read_to_string(from.join("projects").join("Deep.md")).expect("back"),
+        "deep"
+    );
+    assert!(
+        !to.join("Notes.md").exists(),
+        "nothing stays at the destination"
+    );
+    assert!(
+        !to.join("projects").exists(),
+        "nothing stays at the destination"
+    );
+    assert!(to.join("Theirs.md").exists(), "what was there before stays");
+    assert!(
+        state.notes_watcher.lock().expect("lock").is_some(),
+        "the old folder is watched again"
+    );
+}
+
+#[test]
 fn a_move_asks_for_its_walk_the_way_every_other_walk_is_asked_for() {
     use jotra_core::events::bus::JotraEvent;
     use std::sync::{Arc, Mutex};

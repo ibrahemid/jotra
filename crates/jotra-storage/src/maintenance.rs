@@ -1,7 +1,10 @@
+use std::path::Path;
+
 use jotra_core::maintenance::needs_vacuum;
 use rusqlite::Connection;
 use tracing::{info, warn};
 
+use crate::database::connection::{open_database_for_maintenance, yielding_to_writes};
 use crate::errors::StorageResult;
 
 /// Page accounting for a database file, read from SQLite's pragmas.
@@ -78,6 +81,10 @@ pub fn run_maintenance(conn: &Connection) -> StorageResult<MaintenanceOutcome> {
             free_bytes = before.free_bytes(),
             "database is mostly free pages; vacuuming"
         );
+        #[cfg(feature = "test-hooks")]
+        if let Some(hook) = BEFORE_VACUUM.with(|slot| slot.borrow_mut().take()) {
+            hook();
+        }
         match conn.execute_batch("VACUUM") {
             Ok(()) => vacuumed = true,
             Err(e) => warn!(error = %e, "vacuum failed; leaving the database as is"),
@@ -101,4 +108,28 @@ pub fn run_maintenance(conn: &Connection) -> StorageResult<MaintenanceOutcome> {
         after,
         vacuumed,
     })
+}
+
+/// [`run_maintenance`] on a connection of its own to the database at `path`,
+/// so no lock around the app's connection is held while it runs.
+///
+/// A write on an app connection that meets the `VACUUM` cuts it short rather
+/// than waiting for it ([`yielding_to_writes`]): the `VACUUM` rolls back and
+/// the database stays as it was until the next pass.
+pub fn run_maintenance_at(path: &Path) -> StorageResult<MaintenanceOutcome> {
+    let conn = open_database_for_maintenance(path)?;
+    yielding_to_writes(&conn, || run_maintenance(&conn))
+}
+
+#[cfg(feature = "test-hooks")]
+thread_local! {
+    static BEFORE_VACUUM: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Runs `hook` on this thread at the next `VACUUM` it reaches, before the
+/// statement starts, so a test can hold the maintenance there.
+#[cfg(feature = "test-hooks")]
+pub fn before_next_vacuum(hook: impl FnOnce() + 'static) {
+    BEFORE_VACUUM.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
 }

@@ -17,6 +17,7 @@ import {
   flushAutosave,
   hasPendingAutosave,
   saveNow,
+  saveNowInPlace,
   resetAutosave,
   materializePendingSave,
   peekUnsavedContent,
@@ -247,6 +248,40 @@ describe("autosave", () => {
         source: "content",
         generation: currentSaveGeneration("buf-back"),
       });
+      unsubscribe();
+    });
+
+    it("tells a success listener a write in place put no file back", async () => {
+      const listener = vi.fn();
+      const unsubscribe = onAutosaveSuccess(listener);
+      const inPlace = vi.fn(async () => "aaa111");
+
+      await saveNowInPlace("buf-place", "content", inPlace);
+
+      expect(inPlace).toHaveBeenCalledWith("buf-place", "content");
+      expect(mockedSave).not.toHaveBeenCalled();
+      expect(listener).toHaveBeenCalledWith("buf-place", "aaa111", false, {
+        source: "content",
+        generation: currentSaveGeneration("buf-place"),
+      });
+      unsubscribe();
+    });
+
+    it("writes a failed write in place again through the same writer", async () => {
+      const listener = vi.fn();
+      const unsubscribe = onAutosaveSuccess(listener);
+      const inPlace = vi
+        .fn<(id: string, content: string) => Promise<string | null>>()
+        .mockRejectedValueOnce(new Error("ERR_WRITE_TIMED_OUT"))
+        .mockResolvedValueOnce("bbb222");
+
+      const first = await saveNowInPlace("buf-again", "content", inPlace);
+      expect(first.ok).toBe(false);
+      await flushAutosave("buf-again");
+
+      expect(inPlace).toHaveBeenCalledTimes(2);
+      expect(mockedSave).not.toHaveBeenCalled();
+      expect(listener).toHaveBeenCalledWith("buf-again", "bbb222", false, expect.anything());
       unsubscribe();
     });
 

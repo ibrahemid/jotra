@@ -146,6 +146,9 @@ toml = "1.1"
 # dispatched the way the webview dispatches it, and the time the dispatching
 # thread is held is measured. The feature adds a module and no package.
 tauri = { version = "2", features = ["test"] }
+# The hook that holds the startup maintenance at its `VACUUM`
+# (tests/off_main_thread_tests.rs).
+jotra-storage = { path = "../crates/jotra-storage", features = ["bundled", "test-hooks"] }
 # Test-only. The write half of the harness runs in the client's own process,
 # and the one thing a unit test cannot prove is that a write from there reaches
 # a tab in this one. Not a runtime dependency: nothing in `src/` names it, and
