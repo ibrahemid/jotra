@@ -68,7 +68,7 @@ function Row(props: { row: ActivityRow }) {
       <span class="activity-what">
         <span class="activity-program">{actorName(record())}</span>
         <span class="activity-action">
-          {describeCall(record().action, record().path !== null, record().decision)}
+          {describeCall(record().action, record().path !== null, record().decision, record().bytes)}
         </span>
         <Show when={record().path}>
           {(path) => <span class="activity-note">{path()}</span>}

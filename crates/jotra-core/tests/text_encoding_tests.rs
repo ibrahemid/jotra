@@ -5,7 +5,7 @@ use jotra_core::hash::{comparison_digest_hex, sha256_bytes};
 use jotra_core::notes::line_ending::LineEnding;
 use jotra_core::text_encoding::{
     code_points, declared, decode_detected, decode_detected_owned, decode_file, detect,
-    EncodingLossy, TextEncoding,
+    EncodingLossy, OwnedText, TextEncoding,
 };
 
 // A CSV as Excel on Windows writes it: Windows-1252, CRLF.
@@ -342,12 +342,95 @@ fn a_detected_file_is_never_read_with_a_replacement_character() {
             })
             .collect();
         let decoded = decode_detected(&bytes);
+        if decoded.replaced {
+            assert_eq!(decoded.encoding, TextEncoding::utf8());
+            assert!(decoded.encoding.decode(&bytes).is_err());
+            continue;
+        }
         let strict = decoded
             .encoding
             .decode(&bytes)
             .expect("the encoding read decodes every byte");
         assert_eq!(strict, decoded.text);
     }
+}
+
+#[test]
+fn a_mark_followed_by_nul_characters_is_binary() {
+    let mut utf8_marked = b"\xef\xbb\xbf".to_vec();
+    utf8_marked.extend_from_slice(b"\x00\x01\x02\x03\x00\x00header");
+    assert!(is_binary_bytes(&utf8_marked));
+
+    let mut utf16_marked = b"\xff\xfe".to_vec();
+    utf16_marked.extend((0u16..64).flat_map(|unit| (unit % 3).to_le_bytes()));
+    assert!(is_binary_bytes(&utf16_marked));
+
+    let mut lone_surrogates = b"\xfe\xff".to_vec();
+    lone_surrogates.extend([0xDCu8, 0x00, 0x00, 0x41, 0xDC, 0x01, 0x00, 0x42]);
+    assert!(is_binary_bytes(&lone_surrogates));
+
+    assert!(!is_binary_bytes(b"\xef\xbb\xbfplain text\n"));
+    assert!(!is_binary_bytes(&utf16(POWERSHELL_TEXT, false, true)));
+    assert!(!is_binary_bytes(b"\xff\xfe"));
+    let cut = utf16("text \u{1F600}", true, true);
+    assert!(!is_binary_bytes(&cut[..cut.len() - 2]));
+}
+
+#[test]
+fn utf8_with_one_bad_byte_stays_utf8() {
+    let mut bytes = "Grüße aus Köln, schöne Straße.\n".as_bytes().to_vec();
+    bytes.extend_from_slice(b"one bad byte: \xff\n");
+    bytes.extend_from_slice("und noch ein Ölfass.\n".as_bytes());
+
+    assert_eq!(detect(&bytes), TextEncoding::utf8());
+    let decoded = decode_detected(&bytes);
+    assert_eq!(decoded.encoding, TextEncoding::utf8());
+    assert!(decoded.replaced);
+    assert!(decoded.text.contains("Köln"));
+    assert!(decoded.text.contains('\u{FFFD}'));
+    assert!(TextEncoding::utf8().decode(&bytes).is_err());
+
+    let (encoding, text) = decode_detected_owned(bytes);
+    assert_eq!(encoding, TextEncoding::utf8());
+    assert!(text.contains("Ölfass"));
+
+    // A legacy file has a broken sequence for every accented letter and no
+    // whole one, so it is still guessed.
+    assert_eq!(detect(LATIN_1), TextEncoding::windows_1252());
+    assert!(!decode_detected(WINDOWS_1252_CSV).replaced);
+}
+
+#[test]
+fn an_owned_decode_hands_utf8_over_and_keeps_other_bytes() {
+    let plain = "caf\u{e9}\n".as_bytes().to_vec();
+    assert_eq!(
+        TextEncoding::utf8().decode_owned(plain.clone()),
+        Ok(OwnedText::Bytes("caf\u{e9}\n".to_string()))
+    );
+
+    let marked = b"\xef\xbb\xbfmarked\n".to_vec();
+    assert_eq!(
+        TextEncoding::utf8().decode_owned(marked.clone()),
+        Ok(OwnedText::Decoded {
+            text: "marked\n".to_string(),
+            bytes: marked,
+        })
+    );
+
+    assert_eq!(
+        TextEncoding::windows_1252().decode_owned(WINDOWS_1252_CSV.to_vec()),
+        Ok(OwnedText::Decoded {
+            text: TextEncoding::windows_1252()
+                .decode(WINDOWS_1252_CSV)
+                .expect("decodes")
+                .into_owned(),
+            bytes: WINDOWS_1252_CSV.to_vec(),
+        })
+    );
+
+    assert!(TextEncoding::utf8()
+        .decode_owned(b"bad \xff byte".to_vec())
+        .is_err());
 }
 
 #[test]

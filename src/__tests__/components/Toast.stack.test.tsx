@@ -33,6 +33,18 @@ describe("the toast stack under a run of failures", () => {
     expect(container.textContent).not.toContain("Could not save note 0");
   });
 
+  it("lets an older notice go before an error that is still waiting to be read", () => {
+    const { container } = render(() => <ToastContainer />);
+    raise("Could not save note 0");
+    for (let i = 1; i <= 4; i += 1) raise(`Moved note ${i}`, "info");
+
+    const toasts = container.querySelectorAll(".toast");
+    expect(toasts.length).toBe(4);
+    expect(container.textContent).toContain("Could not save note 0");
+    expect(container.textContent).not.toContain("Moved note 1");
+    expect(toasts[3].textContent).toContain("Moved note 4");
+  });
+
   it("collapses the same line into a count rather than a column", () => {
     const { container } = render(() => <ToastContainer />);
     for (let i = 0; i < 5; i += 1) raise("Could not save the change");

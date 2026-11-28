@@ -14,7 +14,7 @@ use tauri::{AppHandle, Runtime, State};
 use tauri_plugin_dialog::DialogExt;
 use tracing::warn;
 
-use crate::commands::config::persist_config;
+use crate::commands::config::mutate_config;
 use crate::commands::offload::{run_blocking, ERR_COMMAND_STOPPED};
 use crate::state::AppState;
 use crate::watcher::handler::start_workspace_watcher;
@@ -30,11 +30,10 @@ pub fn set_workspace_root_from_path(state: &AppState, raw: &Path) -> Result<Stri
         return Err(format!("not a directory: {}", canonical.display()));
     }
 
-    {
-        let mut config = state.config.lock().map_err(|e| e.to_string())?;
+    mutate_config(state, |config| {
         config.workspace.root = Some(canonical.to_string_lossy().into_owned());
-        persist_config(state, &config)?;
-    }
+        true
+    })?;
 
     {
         let mut root = state.workspace_root.lock().map_err(|e| e.to_string())?;
@@ -96,11 +95,10 @@ pub(crate) fn rewatch_workspace(state: &AppState) {
 }
 
 pub fn clear_workspace_root_inner(state: &AppState) -> Result<(), String> {
-    {
-        let mut config = state.config.lock().map_err(|e| e.to_string())?;
+    mutate_config(state, |config| {
         config.workspace.root = None;
-        persist_config(state, &config)?;
-    }
+        true
+    })?;
 
     {
         let mut root = state.workspace_root.lock().map_err(|e| e.to_string())?;

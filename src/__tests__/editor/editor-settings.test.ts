@@ -1,4 +1,6 @@
 import { afterEach, beforeEach, describe, it, expect } from "vitest";
+import { readFileSync } from "node:fs";
+import { resolve } from "node:path";
 import { EditorState } from "@codemirror/state";
 import { EditorView } from "@codemirror/view";
 import { indentUnit } from "@codemirror/language";
@@ -13,6 +15,7 @@ import {
 } from "../../editor/editor-settings";
 import { featuresFor } from "../../editor/large-file";
 import type { FileOpenMode } from "../../types/buffer";
+import type { ReadingMeasure } from "../../types/config";
 
 function wrapsIn(mode: FileOpenMode, wordWrap: boolean, longest = 0): boolean {
   const allowed = featuresFor(mode, longest).wrap;
@@ -86,11 +89,11 @@ describe("readingWidthFor", () => {
   beforeEach(() => document.documentElement.style.setProperty("--jotra-prose-measure", MEASURE));
   afterEach(() => document.documentElement.style.removeProperty("--jotra-prose-measure"));
 
-  function measureOf(enabled: boolean, code: boolean): string {
+  function measureOf(enabled: boolean, code: boolean, measure?: ReadingMeasure): string {
     const parent = document.body.appendChild(document.createElement("div"));
     const view = new EditorView({
       parent,
-      state: EditorState.create({ doc: "x", extensions: [readingWidthFor(enabled, code)] }),
+      state: EditorState.create({ doc: "x", extensions: [readingWidthFor(enabled, code, measure)] }),
     });
     const width = getComputedStyle(view.contentDOM).maxWidth;
     view.destroy();
@@ -110,5 +113,36 @@ describe("readingWidthFor", () => {
 
   it("leaves a source file at the pane's width either way", () => {
     expect(readingWidthFor(true, true)).toEqual([]);
+    expect(readingWidthFor(true, true, "wide")).toEqual([]);
+  });
+
+  it.each([
+    ["narrow", "--jotra-prose-measure-narrow"],
+    ["medium", "--jotra-prose-measure"],
+    ["wide", "--jotra-prose-measure-wide"],
+  ] as const)("holds prose to the %s line length at its own token", (measure, token) => {
+    document.documentElement.style.setProperty("--jotra-prose-measure-narrow", "480px");
+    document.documentElement.style.setProperty("--jotra-prose-measure-wide", "960px");
+    try {
+      const expected = getComputedStyle(document.documentElement).getPropertyValue(token).trim();
+      expect(measureOf(true, false, measure)).toBe(expected);
+      expect(measureOf(false, false, measure)).not.toBe(expected);
+    } finally {
+      document.documentElement.style.removeProperty("--jotra-prose-measure-narrow");
+      document.documentElement.style.removeProperty("--jotra-prose-measure-wide");
+    }
+  });
+
+  it("declares a token for each line length in the generated sheet", () => {
+    const sheet = readFileSync(resolve(process.cwd(), "src/styles/generated/theme.css"), "utf8");
+    const px = (token: string) => Number(new RegExp(`${token}: (\\d+)px;`).exec(sheet)?.[1]);
+    const widths = [
+      px("--jotra-prose-measure-narrow"),
+      px("--jotra-prose-measure"),
+      px("--jotra-prose-measure-wide"),
+    ];
+    expect(widths.every(Number.isFinite)).toBe(true);
+    expect([...widths].sort((a, b) => a - b)).toEqual(widths);
+    expect(new Set(widths).size).toBe(3);
   });
 });

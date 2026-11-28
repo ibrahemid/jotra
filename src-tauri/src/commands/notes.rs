@@ -12,10 +12,9 @@ use chrono::{DateTime, Utc};
 use jotra_core::buffer::document::BufferDocument;
 use jotra_core::buffer::manager::BufferManager;
 use jotra_core::config::FileExtension;
-use jotra_core::notes::guard::DiskState;
 use jotra_core::notes::links;
 use jotra_core::notes::{name_is_taken, rename_stem, NotesRootRefusal, WriteOrigin, NAME_IS_EMPTY};
-use jotra_storage::buffer_store::BufferStore;
+use jotra_storage::buffer_store::{indexable_text_of, BufferStore};
 use jotra_storage::errors::{StorageError, StorageResult};
 use jotra_storage::note_ops::{self, LinkRewrite};
 use jotra_storage::notes_index;
@@ -23,6 +22,7 @@ use jotra_storage::notes_migration::{self, MigrationReport};
 use jotra_storage::notes_move;
 use jotra_storage::paths::file_name_only;
 use jotra_storage::workspace_store;
+use jotra_storage::write_lock::WriteLock;
 use serde::Serialize;
 use tauri::{AppHandle, Runtime, State};
 use tracing::{info, warn};
@@ -332,16 +332,24 @@ fn create_note_at_in(
     stem: &str,
     extension: &str,
 ) -> Result<BufferDocument, String> {
-    let store = state.store.lock().map_err(|e| e.to_string())?;
     let stamp = ignore_stamper(state);
-    let path = note_ops::create_note(folder, stem, extension, WriteOrigin::Editor, Some(&stamp))
-        .map_err(|e| note_failure_message(&e))?;
+    let lock = WriteLock::in_data_folder(&state.jotra_dir);
+    let path = note_ops::create_note(
+        folder,
+        stem,
+        extension,
+        WriteOrigin::Editor,
+        Some(&stamp),
+        Some(&lock),
+    )
+    .map_err(|e| note_failure_message(&e))?;
     let canonical = canonicalize_for_authorization(&path).map_err(|e| e.to_string())?;
 
     let mut mgr = BufferManager::new().with_event_bus(state.event_bus.clone());
     let doc = mgr
         .open_external(canonical.clone())
         .map_err(|e| e.to_string())?;
+    let store = state.lock_store();
     store.open_from_path(&doc, "").map_err(|e| e.to_string())?;
 
     state.authorized_paths.record_blessed_source(canonical);
@@ -429,8 +437,10 @@ pub fn rename_note_inner(
 ///
 /// A seam, so the compensating rename-back can be exercised: the failure it
 /// answers is a database write failing between the file moving and the row
-/// following it, which nothing else can provoke.
-pub type RecordRename<'a> = &'a dyn Fn(&BufferStore, &str, &str, &str) -> StorageResult<()>;
+/// following it, which nothing else can provoke. Its arguments are the row,
+/// the file's new path, the new title and the text the index records for the
+/// file ([`BufferStore::rename_to_file`]).
+pub type RecordRename<'a> = &'a dyn Fn(&BufferStore, &str, &str, &str, &str) -> StorageResult<()>;
 
 /// The real recording: the row's file and title in one write.
 fn record_rename(
@@ -438,8 +448,9 @@ fn record_rename(
     id: &str,
     source_path: &str,
     title: &str,
+    text: &str,
 ) -> StorageResult<()> {
-    store.rename_to_file(id, source_path, title)
+    store.rename_to_file(id, source_path, title, text)
 }
 
 /// [`rename_note_inner`] with the row write handed in.
@@ -453,9 +464,11 @@ fn record_rename(
 /// which is right.
 ///
 /// Runs in the note's turn ([`AppState::buffer_writes`]): a save of the note
-/// still landing finishes at the old path before the file moves. The guard
-/// and the stamps read the whole file before the store is taken; only the
-/// move and the row write run under it (ADR-047).
+/// still landing finishes at the old path before the file moves. The guard,
+/// the stamps and the index's text share one read of the file, before the
+/// store is taken; only the move and the row write run under it (ADR-047). A
+/// wait for the store can outlast the stamps, so both names are stamped again
+/// under it with the digest already taken.
 pub fn rename_note_recording(
     state: &AppState,
     id: &str,
@@ -463,10 +476,8 @@ pub fn rename_note_recording(
     record: RecordRename<'_>,
 ) -> Result<BufferDocument, String> {
     let _turn = state.buffer_writes.turn(id);
-    let from = {
-        let store = state.store.lock().map_err(|e| e.to_string())?;
-        note_path(&store.get(id).map_err(|e| e.to_string())?)?
-    };
+    let doc = state.lock_store().get(id).map_err(|e| e.to_string())?;
+    let from = note_path(&doc)?;
     // A rename rewrites where the file is, so it passes the gate a save does:
     // a file in the notes folder, or one an open tab holds. The id comes from
     // the webview, and a closed tab's file is not one it may move.
@@ -484,13 +495,23 @@ pub fn rename_note_recording(
         Some(&stamp),
     )
     .map_err(|e| note_failure_message(&e))?;
-    let store = state.store.lock().map_err(|e| e.to_string())?;
+    let text = prepared
+        .bytes()
+        .map(|bytes| indexable_text_of(&doc, bytes))
+        .unwrap_or_default();
+    let restamp = prepared
+        .stamped_digest()
+        .map(|digest| (digest, [ignore_key(from), ignore_key(prepared.to())]));
+    let store = state.lock_store();
+    if let Some((digest, keys)) = restamp {
+        stamp_digest(state, keys, digest);
+    }
     let to = prepared.commit().map_err(|e| note_failure_message(&e))?;
     let to_text = to
         .to_str()
         .ok_or_else(|| format!("the file name {} cannot be recorded", to.display()))?;
 
-    if let Err(error) = record(&store, id, to_text, &note_name(&to)) {
+    if let Err(error) = record(&store, id, to_text, &note_name(&to), &text) {
         drop(store);
         return Err(undo_rename(&to, from, &stamp, error));
     }
@@ -509,8 +530,30 @@ pub fn rename_note_recording(
     // tab, and a later note taking the old name has them delivered to this
     // one instead.
     state.follow_note_path(id, &to);
+    let renamed = store.get(id).map_err(|e| e.to_string());
+    drop(store);
+    crate::instance::tab_moved(state, from, &to);
+    renamed
+}
 
-    store.get(id).map_err(|e| e.to_string())
+/// The watcher's key for the file at `path`.
+fn ignore_key(path: &Path) -> String {
+    jotra_core::watcher::ignore::source_key(&crate::watcher::handler::ignore_key_path(path))
+}
+
+/// Stamps `keys` with `digest` now: no read and no hash, so it may run under
+/// the store.
+fn stamp_digest(
+    state: &AppState,
+    keys: impl IntoIterator<Item = String>,
+    digest: jotra_core::hash::Sha256Digest,
+) {
+    let now = std::time::Instant::now();
+    let mut ignore =
+        crate::poison::recover_poison(state.watcher_ignore.lock(), "commands::notes::stamp_digest");
+    for key in keys {
+        ignore.record_digest(key, digest, now);
+    }
 }
 
 /// Puts a renamed file back under the name its row still holds.
@@ -840,6 +883,7 @@ fn rename_and_propagate(
     let new_name = jotra_core::notes::note_display_name(&path_text(&renamed));
 
     let stamp = ignore_stamper(state);
+    let lock = WriteLock::in_data_folder(&state.jotra_dir);
     let mut updated_paths = Vec::new();
     let mut skipped = Vec::new();
     for file in linking {
@@ -850,7 +894,9 @@ fn rename_and_propagate(
             true => renamed.clone(),
             false => file,
         };
-        let last_known = recorded_disk_state(state, &file);
+        let tab = open_note_id(state, &file);
+        let _turn = tab.as_deref().map(|id| state.buffer_writes.turn(id));
+        let last_known = tab.as_deref().and_then(|id| state.disk_state(id));
         match note_ops::rewrite_links_in_file(
             &file,
             &note_ops::RewriteTarget {
@@ -863,6 +909,7 @@ fn rename_and_propagate(
             None,
             Some(&stamp),
             Some(&state.note_history),
+            Some(&lock),
         ) {
             Ok(LinkRewrite::Written) => updated_paths.push(path_text(&file)),
             // The index named the file, its text did not: a link that reads
@@ -921,7 +968,7 @@ fn rename_and_propagate(
 /// the notes it rewrote, as one event.
 fn rename_note_at(state: &AppState, from: &Path, new_name: &str) -> Result<PathBuf, String> {
     let existing = {
-        let store = state.store.lock().map_err(|e| e.to_string())?;
+        let store = state.lock_store();
         store
             .find_active_by_source_path(&path_text(from))
             .map_err(|e| e.to_string())?
@@ -937,15 +984,15 @@ fn rename_note_at(state: &AppState, from: &Path, new_name: &str) -> Result<PathB
         .map_err(|e| note_failure_message(&e))
 }
 
-/// What Jotra last saw `path` hold, for a note it has open.
+/// The tab holding `path`, when one has it open.
 ///
-/// A file nothing has opened has no record, and "has this changed since Jotra
-/// last looked" has no answer for a file Jotra has not looked at.
-fn recorded_disk_state(state: &AppState, path: &Path) -> Option<DiskState> {
-    let store = state.store.lock().ok()?;
+/// A file nothing has opened has no record of what Jotra last saw it hold,
+/// and "has this changed since Jotra last looked" has no answer for a file
+/// Jotra has not looked at.
+fn open_note_id(state: &AppState, path: &Path) -> Option<String> {
+    let store = state.lock_store();
     let doc = store.find_active_by_source_path(&path_text(path)).ok()??;
-    drop(store);
-    state.disk_state(&doc.id)
+    Some(doc.id)
 }
 
 /// Puts the index back in step with what the rename wrote.
@@ -1005,6 +1052,10 @@ const NOT_YOURS_TO_DELETE: &str = "Only files in your folder can be moved to the
 const NOTHING_TO_PUT_BACK: &str = "There is nothing to put back.";
 const FOLDER_MOVED_SINCE: &str = "Your folder has moved since, so the file stays in the Trash.";
 
+/// The largest file the Undo after Move to Trash keeps the bytes of. A note is
+/// text; a file past this goes to the Trash without an Undo.
+pub const TRASH_UNDO_MAX_BYTES: u64 = 8 * 1024 * 1024;
+
 /// Moves a note to the operating system's trash and drops its row.
 ///
 /// Only a file inside the notes folder. A tab can hold a file opened from
@@ -1014,10 +1065,6 @@ const FOLDER_MOVED_SINCE: &str = "Your folder has moved since, so the file stays
 /// closed rather than deleted; the containment check is the same resolution
 /// the write gate runs, so a symlink cannot carry a delete out of the folder.
 ///
-/// The largest file the Undo after Move to Trash keeps the bytes of. A note is
-/// text; a file past this goes to the Trash without an Undo.
-pub const TRASH_UNDO_MAX_BYTES: u64 = 8 * 1024 * 1024;
-
 /// The row goes only after the file has gone, so a platform that will not take
 /// the file leaves the note both on disk and in Jotra rather than leaving a row
 /// pointing at a file nobody can reach. A note with no file yet has nothing to
@@ -1033,7 +1080,7 @@ pub const TRASH_UNDO_MAX_BYTES: u64 = 8 * 1024 * 1024;
 pub fn delete_note_inner(state: &AppState, id: &str) -> Result<Option<String>, String> {
     let turn = state.buffer_writes.turn(id);
     let source_path = {
-        let store = state.store.lock().map_err(|e| e.to_string())?;
+        let store = state.lock_store();
         let doc = store.get(id).map_err(|e| e.to_string())?;
         doc.source_path
     };
@@ -1112,7 +1159,8 @@ pub fn undo_delete_note_inner(state: &AppState, token: &str) -> Result<String, S
         return Err(FOLDER_MOVED_SINCE.to_string());
     }
     let stamp = ignore_stamper(state);
-    note_ops::restore_trashed(&undo.path, &undo.bytes, Some(&stamp))
+    let lock = WriteLock::in_data_folder(&state.jotra_dir);
+    note_ops::restore_trashed(&undo.path, &undo.bytes, Some(&stamp), Some(&lock))
         .map_err(|error| note_failure_message(&error))?;
     announce_indexed(&state.event_bus, index_copy(state, &undo.path));
     Ok(text)
@@ -1141,12 +1189,15 @@ pub fn save_note_copy_inner(state: &AppState, id: &str, content: &str) -> Result
     // store lock, and a copy of a note with no file of its own is the only
     // case that reads it.
     let default_extension = state.default_extension();
-    let store = state.store.lock().map_err(|e| e.to_string())?;
-    let doc = store.get(id).map_err(|e| e.to_string())?;
+    let doc = {
+        let store = state.lock_store();
+        store.get(id).map_err(|e| e.to_string())?
+    };
     let stem = jotra_core::notes::note_file_stem(&copy_stem(&doc), chrono::Utc::now());
     let extension = copy_extension(&doc, default_extension);
 
     let stamp = ignore_stamper(state);
+    let lock = WriteLock::in_data_folder(&state.jotra_dir);
     let path = note_ops::save_copy(
         &state.notes_root(),
         &stem,
@@ -1154,9 +1205,9 @@ pub fn save_note_copy_inner(state: &AppState, id: &str, content: &str) -> Result
         content,
         WriteOrigin::Editor,
         Some(&stamp),
+        Some(&lock),
     )
     .map_err(|e| note_failure_message(&e))?;
-    drop(store);
     announce_indexed(&state.event_bus, index_copy(state, &path));
     path.to_str()
         .map(str::to_string)
@@ -1245,7 +1296,7 @@ pub async fn list_notes_dir<R: Runtime>(
 
 /// The file note `id` lives in, as its row records it.
 pub fn note_path_for_id(state: &AppState, id: &str) -> Result<String, String> {
-    let store = state.store.lock().map_err(|e| e.to_string())?;
+    let store = state.lock_store();
     let doc = store.get(id).map_err(|e| e.to_string())?;
     note_path(&doc)
 }
@@ -1416,7 +1467,8 @@ fn refuse_destination(state: &AppState, from: &Path, candidate: &Path) -> Result
 /// While the files move, every open note's turn is held, so no save lands in
 /// the old folder behind the move, and the old folder's watcher is stopped, so
 /// the notes leaving it are not read as notes somebody deleted. A move that
-/// does not happen starts that watcher again on the old folder.
+/// does not happen starts that watcher again on the old folder; one whose new
+/// folder cannot be recorded moves the files back first.
 ///
 /// What is re-recorded is the write guard's memory of each open note: its key
 /// is the note, but the record describes a file at a path that no longer
@@ -1475,7 +1527,10 @@ pub fn move_notes_folder_to(
     state.notes_index.bump_generation();
 
     let text = path_text(&to);
-    adopt_notes_root(state, &to, &text)?;
+    if let Err(error) = adopt_notes_root(state, &to, &text) {
+        put_notes_back(&from, &to, &outcome);
+        return Err(error);
+    }
     watcher.moved();
     repoint_notes(state, &from, &to)?;
     follow_notes_root(state, &from, &to);
@@ -1486,6 +1541,31 @@ pub fn move_notes_folder_to(
         collided: Vec::new(),
         left_behind: outcome.left_behind,
     })
+}
+
+/// Moves the files of a move Jotra could not adopt back to the folder it still
+/// uses, while the turns and the stopped watcher of the move are still held.
+///
+/// An entry whose original could not all be removed stays where it is at both
+/// ends: the copy left in `to` is whole and is not moved over what is left of
+/// the original.
+fn put_notes_back(from: &Path, to: &Path, outcome: &notes_move::MoveOutcome) {
+    let back: Vec<String> = outcome
+        .entries
+        .iter()
+        .filter(|name| !outcome.left_behind.contains(name))
+        .cloned()
+        .collect();
+    match notes_move::move_entries(to, from, &back) {
+        Ok(undone) if undone.collided.is_empty() => {
+            info!(moved = undone.moved, "a move that was not adopted was put back");
+        }
+        Ok(undone) => warn!(
+            collided = undone.collided.len(),
+            "a move that was not adopted could not be put back: the old folder took names in between"
+        ),
+        Err(error) => warn!(%error, "a move that was not adopted could not be put back"),
+    }
 }
 
 /// One move of the notes folder at a time: two would each hold open notes'
@@ -1511,7 +1591,7 @@ fn move_failure(error: &StorageError) -> String {
 /// with the store let go first.
 fn open_note_turns(state: &AppState) -> Result<Vec<jotra_core::serial::Turn>, String> {
     let mut ids: Vec<String> = {
-        let store = state.store.lock().map_err(|e| e.to_string())?;
+        let store = state.lock_store();
         store
             .list_by_status(jotra_core::buffer::document::BufferStatus::Active)
             .map_err(|e| e.to_string())?
@@ -1591,10 +1671,9 @@ fn start_notes_watcher_at(state: &AppState, root: &Path) {
 /// Jotra's own. Only notes Jotra holds a record of: reading a file to stamp it
 /// would download it.
 fn stamp_moving_notes(state: &AppState, from: &Path, to: &Path) {
-    let docs = match state.store.lock() {
-        Ok(store) => store.list_by_status(jotra_core::buffer::document::BufferStatus::Active),
-        Err(_) => return,
-    };
+    let docs = state
+        .lock_store()
+        .list_by_status(jotra_core::buffer::document::BufferStatus::Active);
     let Ok(docs) = docs else {
         return;
     };
@@ -1642,11 +1721,7 @@ fn adopt_notes_root(state: &AppState, root: &Path, text: &str) -> Result<(), Str
     // The store decides on its own whether a save belongs to the notes folder,
     // so it needs the same answer as the state: a root captured at startup
     // would stop indexing the moment the folder moved.
-    state
-        .store
-        .lock()
-        .map_err(|e| e.to_string())?
-        .set_notes_root(root.to_path_buf());
+    state.lock_store().set_notes_root(root.to_path_buf());
     Ok(())
 }
 
@@ -1693,11 +1768,9 @@ fn follow_notes_root(state: &AppState, from: &Path, to: &Path) {
 /// have no tab close to release it.
 fn refollow_open_tabs(state: &AppState) {
     let docs = {
-        let Ok(store) = state.store.lock() else {
-            warn!("open tabs could not follow the folder: the store is unreachable");
-            return;
-        };
-        store.list_by_status(jotra_core::buffer::document::BufferStatus::Active)
+        state
+            .lock_store()
+            .list_by_status(jotra_core::buffer::document::BufferStatus::Active)
     };
     match docs {
         Ok(docs) => {
@@ -1712,7 +1785,7 @@ fn refollow_open_tabs(state: &AppState) {
 /// Points every row and every disk-state record at the moved files.
 fn repoint_notes(state: &AppState, from: &Path, to: &Path) -> Result<(), String> {
     let moved = {
-        let store = state.store.lock().map_err(|e| e.to_string())?;
+        let store = state.lock_store();
         notes_move::repoint_rows(&store, from, to).map_err(|e| e.to_string())?
     };
 
@@ -1721,6 +1794,7 @@ fn repoint_notes(state: &AppState, from: &Path, to: &Path) -> Result<(), String>
         if let Ok(canonical) = canonicalize_for_authorization(&path) {
             state.authorized_paths.record_blessed_source(canonical);
         }
+        crate::instance::tab_moved(state, Path::new(&row.from), &path);
         // Only a note Jotra has read or written this launch has a record to
         // move. Reading every file in the folder to make one would be the one
         // thing this operation must not do: in a sync folder it pulls down
@@ -1773,7 +1847,7 @@ pub async fn pick_notes_folder(app: tauri::AppHandle) -> Result<Option<MoveNotes
 
 /// [`get_notes_migration_report`] without the IPC wrapper.
 pub fn notes_migration_report(state: &AppState) -> Result<Option<MigrationReport>, String> {
-    let store = state.store.lock().map_err(|e| e.to_string())?;
+    let store = state.lock_store();
     notes_migration::report_to_show(&store).map_err(|e| e.to_string())
 }
 
@@ -1787,7 +1861,7 @@ pub fn get_notes_migration_report(
 
 /// [`dismiss_notes_migration_report`] without the IPC wrapper.
 pub fn dismiss_notes_migration_report_inner(state: &AppState) -> Result<(), String> {
-    let store = state.store.lock().map_err(|e| e.to_string())?;
+    let store = state.lock_store();
     notes_migration::dismiss_report(&store, chrono::Utc::now()).map_err(|e| e.to_string())
 }
 
@@ -1812,7 +1886,7 @@ pub fn move_archived_notes_inner(state: &AppState) -> Result<MoveArchiveOutcome,
     let archive = state.jotra_dir.join("archive");
     let notes = state.notes_root();
 
-    let store = state.store.lock().map_err(|e| e.to_string())?;
+    let store = state.lock_store();
     let outcome = notes_move::move_archive_into_notes(&store, &archive, &notes, chrono::Utc::now())
         .map_err(|e| e.to_string())?;
     drop(store);

@@ -2,10 +2,11 @@ import type { RecorderOutcome } from "./recorder";
 import { sameChord, worksFromAnyApp } from "../../lib/chord";
 import type { Platform } from "../../lib/platform";
 import { configStore } from "../../stores/global/config";
+import { settingTitle } from "../../settings";
 import { captureHotkeyStore, SHIPPED_CAPTURE_CHORD } from "../../stores/global/hotkey";
 
 /** The window's chord, as its rows in Settings name it. */
-export const GLOBAL_ROW_LABEL = "Show and hide Jotra";
+export const GLOBAL_ROW_LABEL = settingTitle("hotkey.toggle");
 
 /** The quick capture chord (ADR-055), as its row names it. */
 export const CAPTURE_ROW_LABEL = "Quick capture";
@@ -54,7 +55,7 @@ export function readAnyAppChord(
   if (!worksFromAnyApp(outcome.binding)) {
     return { kind: "refuse", text: windowChordRule(platform), resetRecorder: true };
   }
-  if (sameChord(outcome.binding, other.chord)) {
+  if (sameChord(outcome.binding, other.chord, platform)) {
     return { kind: "refuse", text: `${other.label} uses this shortcut.`, resetRecorder: true };
   }
   return { kind: "take", binding: outcome.binding };

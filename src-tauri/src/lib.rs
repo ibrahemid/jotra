@@ -4,6 +4,7 @@ mod bundle_rename;
 pub mod bus_subscribers;
 pub mod capture;
 pub mod commands;
+pub mod devtools;
 pub mod dictation;
 pub mod events;
 pub mod first_run;
@@ -74,33 +75,34 @@ pub(crate) fn finish_shutdown(app_handle: &tauri::AppHandle) {
         commands::chat::CHAT_SHUTDOWN_BUDGET,
     );
 
+    capture::write_draft(app_handle);
+
     let pending = state.fts_scheduler.drain_pending();
     if !pending.is_empty() {
-        if let Ok(store) = state.store.lock() {
-            for id in pending {
-                if let Err(e) = store.reindex_buffer(&id) {
-                    tracing::debug!(buffer_id = %id, error = %e, "shutdown fts reindex failed");
-                }
+        let store = state.lock_store();
+        for id in pending {
+            if let Err(e) = store.reindex_buffer(&id) {
+                tracing::debug!(buffer_id = %id, error = %e, "shutdown fts reindex failed");
             }
         }
     }
 
-    let marked = state.store.lock().ok().map(|store| {
+    let marked = {
+        let store = state.lock_store();
         let kept = store.unsaved_text_count();
         store.mark_session_clean().map(|()| kept)
-    });
+    };
     match marked {
-        Some(Ok(Ok(kept))) if kept > 0 => {
+        Ok(Ok(kept)) if kept > 0 => {
             info!(
                 notes = kept,
                 "clean-shutdown marker written; unsaved text stays in the journal"
             )
         }
-        Some(Ok(_)) => info!("clean-shutdown marker written"),
-        Some(Err(e)) => {
+        Ok(_) => info!("clean-shutdown marker written"),
+        Err(e) => {
             tracing::warn!(error = %e, "the clean-shutdown marker could not be written")
         }
-        None => {}
     }
 }
 
@@ -404,8 +406,8 @@ fn restore_main_window_geometry(
 pub fn run() {
     #[cfg(target_os = "windows")]
     let app_user_model_id = windows_rename::set_app_user_model_id();
-    let jotra_dir = match state::locate_data_folder() {
-        Ok(data_folder) => data_folder.folder,
+    let (jotra_dir, data_folder_origin) = match state::locate_data_folder() {
+        Ok(data_folder) => (data_folder.folder, data_folder.origin),
         Err(error) => startup_failure::abort_with_report(
             &StartupFailure::new(
                 StartupStage::DataDirectory,
@@ -436,7 +438,10 @@ pub fn run() {
     // Before the logs, the database or anything else in the folder is
     // touched: a launch that finds another Jotra on this folder hands its
     // paths over and ends here, so two processes never write the same notes.
-    let instance_lock = instance::claim_or_hand_over(&jotra_dir);
+    let instance::LaunchClaim {
+        lock: instance_lock,
+        context,
+    } = instance::claim_for_launch(&jotra_dir, data_folder_origin, tauri::generate_context!());
 
     let logs_dir = jotra_dir.join("logs");
     // Installed first: setting the hook touches nothing, while opening the
@@ -571,6 +576,7 @@ pub fn run() {
             commands::buffer::create_buffer,
             commands::buffer::get_buffer,
             commands::buffer::save_buffer_content,
+            commands::buffer::save_buffer_as_utf8,
             commands::buffer::save_buffer_changes,
             commands::buffer::restore_note_file,
             commands::buffer::save_note_to,
@@ -631,6 +637,7 @@ pub fn run() {
             commands::note_history::compare_note_version,
             commands::file::open_file,
             commands::file::open_file_confirmed,
+            commands::file::files_not_opened,
             commands::file::pick_files_to_open,
             commands::file::pick_note_save_path,
             commands::materialise::materialise_note,
@@ -668,7 +675,6 @@ pub fn run() {
             commands::update::restart_app,
             commands::preview::preview_list_renderers,
             commands::preview::preview_close,
-            commands::preview::preview_render,
             commands::preview::preview_force_render,
             commands::preview::preview_set_layout,
             commands::preview::preview_get_layout,
@@ -693,6 +699,7 @@ pub fn run() {
             commands::cli::install_cli,
             commands::default_app::list_default_app_types,
             commands::default_app::get_default_app_status,
+            commands::default_app::get_default_app_support,
             commands::default_app::set_default_app,
             commands::inbox::pick_inbox_folder,
             commands::inbox::clear_inbox,
@@ -709,6 +716,8 @@ pub fn run() {
             commands::capture::capture_append,
             commands::capture::capture_target,
             commands::capture::capture_close,
+            commands::capture::capture_draft,
+            commands::capture::capture_keep_draft,
             commands::login_item::launch_at_login_status,
             commands::login_item::set_launch_at_login,
             commands::notices::open_third_party_notices,
@@ -782,6 +791,7 @@ pub fn run() {
             windows_rename::spawn_rename_step(&handle, windows_rename::CurrentUserRegistry);
             #[cfg(target_os = "linux")]
             linux_rename::spawn_rename_steps(&handle);
+            commands::login_item::spawn_reconcile(&handle);
 
             // Started by the login item: the window stays hidden until the
             // chord, the Dock or a second launch asks for it, so neither
@@ -819,6 +829,9 @@ pub fn run() {
                 let state = maintenance_handle.state::<AppState>();
                 state.wait_for_reveal(FIRST_PAINT_FALLBACK * 2);
                 state.run_startup_maintenance();
+                if let Err(error) = commands::notices::retire_old_notices(&state) {
+                    tracing::warn!(%error, "the earlier licence listing could not be removed");
+                }
             });
 
             let fallback_handle = handle.clone();
@@ -895,6 +908,11 @@ pub fn run() {
 
             if let Err(e) = hotkey::setup_global_hotkey(&handle) {
                 tracing::warn!(error = %e, "failed to register global hotkey");
+            }
+
+            #[cfg(debug_assertions)]
+            if let Err(e) = app.add_capability(devtools::devtools_toggle_capability()) {
+                tracing::warn!(error = %e, "failed to grant the devtools toggle");
             }
 
             {
@@ -1079,11 +1097,10 @@ pub fn run() {
 
     // A missing or broken system web view fails here, before any window exists
     // to show it in.
-    let app = startup_failure::build_window(|| builder.build(tauri::generate_context!()))
-        .unwrap_or_else(|failure| {
-            log_guard.flush();
-            startup_failure::abort_with_report(&failure, Some(logs_dir.as_path()))
-        });
+    let app = startup_failure::build_window(|| builder.build(context)).unwrap_or_else(|failure| {
+        log_guard.flush();
+        startup_failure::abort_with_report(&failure, Some(logs_dir.as_path()))
+    });
 
     app.run(move |app_handle, event| {
         // Held by the loop for the life of the process: the event loop ends it

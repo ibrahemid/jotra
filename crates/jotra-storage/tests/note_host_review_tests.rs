@@ -321,6 +321,52 @@ fn an_applied_write_over_a_file_that_changed_meanwhile_sets_nothing_beside_it() 
 }
 
 #[test]
+fn an_applied_write_to_a_file_removed_meanwhile_does_not_bring_it_back() {
+    let fixture = fixture();
+    let file = fixture.notes.join("Plan.md");
+    let gone = Err(HostError::NotFound {
+        path: "Plan.md".to_string(),
+    });
+
+    for verb in ["write", "replace", "append", "passage"] {
+        std::fs::write(&file, "one\n").expect("seed");
+        let removed = file.clone();
+        let person = Person {
+            meanwhile: Box::new(move || std::fs::remove_file(&removed).expect("remove")),
+            ..Person::answering(Ok(ReviewAnswer::Apply))
+        };
+        let reviewed = host(&fixture).with_review(Some(&person), "claude-code");
+
+        let refused = match verb {
+            "write" => reviewed
+                .write_note(
+                    "Plan.md",
+                    "agent rewrite\n",
+                    LastKnown::Overwrite,
+                    program(),
+                )
+                .map(drop),
+            "replace" => reviewed
+                .replace_note(
+                    "Plan.md",
+                    "agent rewrite\n",
+                    LastKnown::Overwrite,
+                    program(),
+                )
+                .map(drop),
+            "append" => reviewed.append_note("Plan.md", "two", program()).map(drop),
+            _ => reviewed
+                .replace_in_note("Plan.md", "one", "uno", program())
+                .map(drop),
+        };
+
+        assert_eq!(refused, gone, "{verb}");
+        assert_eq!(person.shown().len(), 1, "{verb}");
+        assert!(files_in(&fixture.notes).is_empty(), "{verb}");
+    }
+}
+
+#[test]
 fn a_new_file_and_a_rename_are_held_too() {
     let fixture = fixture();
     std::fs::write(fixture.notes.join("Plan.md"), "one\n").expect("seed");

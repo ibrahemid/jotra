@@ -424,6 +424,52 @@ fn a_save_that_ran_out_of_tries_says_the_file_is_in_use() {
     assert_eq!(untouched.raw_os_error(), Some(13));
 }
 
+#[test]
+fn a_move_refused_as_in_use_is_tried_again() {
+    use jotra_storage::atomic::{retry_while_in_use, PERSIST_ATTEMPTS};
+    use std::io::{Error, ErrorKind};
+
+    let mut calls = 0;
+    let mut waits = Vec::new();
+    let moved = retry_while_in_use(
+        || {
+            calls += 1;
+            if calls < 3 {
+                Err(Error::from_raw_os_error(32))
+            } else {
+                Ok("moved")
+            }
+        },
+        |attempt| waits.push(attempt),
+    );
+    assert_eq!(moved.expect("moved"), "moved");
+    assert_eq!(waits, [0, 1]);
+
+    let mut calls = 0;
+    let refused = retry_while_in_use::<()>(
+        || {
+            calls += 1;
+            Err(Error::from_raw_os_error(13))
+        },
+        |_| {},
+    )
+    .expect_err("refused");
+    assert_eq!(calls, 1);
+    assert_eq!(refused.raw_os_error(), Some(13));
+
+    let mut calls = 0;
+    let busy = retry_while_in_use::<()>(
+        || {
+            calls += 1;
+            Err(Error::from_raw_os_error(5))
+        },
+        |_| {},
+    )
+    .expect_err("busy");
+    assert_eq!(calls, PERSIST_ATTEMPTS);
+    assert_eq!(busy.kind(), ErrorKind::ResourceBusy);
+}
+
 /// A save has to land while another program is holding the file, because on
 /// Windows that program is often Jotra's own watcher reading the note back.
 #[cfg(windows)]
@@ -914,6 +960,39 @@ fn a_save_that_carries_metadata_still_goes_through_the_retrying_rename() {
         Some(&b"Red"[..]),
         "the rename dropped the file's tags"
     );
+}
+
+#[test]
+fn a_private_file_is_its_owners_alone_and_never_replaces_one_that_took_its_name() {
+    let dir = TempDir::new().expect("temp dir");
+    let target = dir.path().join("answer.json");
+
+    jotra_storage::atomic::write_new_private(&target, b"first").expect("a free name is written");
+    assert_eq!(fs::read(&target).expect("read"), b"first");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = fs::metadata(&target)
+            .expect("metadata")
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o777, 0o600);
+    }
+
+    let error = jotra_storage::atomic::write_new_private(&target, b"second")
+        .expect_err("the name is taken");
+    match error {
+        jotra_storage::atomic::AtomicWriteError::Io(error) => {
+            assert_eq!(error.kind(), std::io::ErrorKind::AlreadyExists)
+        }
+        other => panic!("expected a taken name, got {other:?}"),
+    }
+    assert_eq!(fs::read(&target).expect("read"), b"first");
+    let names: Vec<_> = fs::read_dir(dir.path())
+        .expect("list")
+        .map(|entry| entry.expect("entry").file_name())
+        .collect();
+    assert_eq!(names.len(), 1, "no temp file is left behind: {names:?}");
 }
 
 #[test]

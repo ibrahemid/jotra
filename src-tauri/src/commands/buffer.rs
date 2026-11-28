@@ -112,6 +112,9 @@ pub const ERR_FILE_MISSING: &str = "ERR_FILE_MISSING";
 /// disconnected network volume looks like.
 pub const ERR_WRITE_TIMED_OUT: &str = "ERR_WRITE_TIMED_OUT";
 
+/// Code a save carries when the disk has no room for the write.
+pub const ERR_DISK_FULL: &str = "ERR_DISK_FULL";
+
 /// Code a save carries when the write failed for a reason with no sentence of
 /// its own.
 ///
@@ -157,6 +160,12 @@ pub fn failure_code(error: &StorageError) -> &'static str {
         StorageError::DestinationFolderNotWritable { .. } => ERR_FOLDER_NOT_WRITABLE,
         StorageError::EncodingLossy { .. } => ERR_ENCODING_LOSSY,
         StorageError::Io(io) => io_failure_code(io.kind()),
+        StorageError::AtomicWrite(atomic) => match atomic {
+            jotra_storage::atomic::AtomicWriteError::HardLinked { .. } => ERR_HARD_LINKED,
+            jotra_storage::atomic::AtomicWriteError::ReadOnly => ERR_READ_ONLY_DESTINATION,
+            jotra_storage::atomic::AtomicWriteError::FolderNotWritable => ERR_FOLDER_NOT_WRITABLE,
+            jotra_storage::atomic::AtomicWriteError::Io(io) => io_failure_code(io.kind()),
+        },
         _ => ERR_WRITE_FAILED,
     }
 }
@@ -172,6 +181,7 @@ fn io_failure_code(kind: std::io::ErrorKind) -> &'static str {
         std::io::ErrorKind::ResourceBusy => ERR_FILE_IN_USE,
         std::io::ErrorKind::NotFound => ERR_FILE_MISSING,
         std::io::ErrorKind::TimedOut => ERR_WRITE_TIMED_OUT,
+        std::io::ErrorKind::StorageFull => ERR_DISK_FULL,
         _ => ERR_WRITE_FAILED,
     }
 }
@@ -284,7 +294,7 @@ pub fn create_buffer(
     title: Option<String>,
 ) -> Result<BufferDocument, String> {
     let mut mgr = BufferManager::new().with_event_bus(state.event_bus.clone());
-    let store = state.store.lock().map_err(|e| e.to_string())?;
+    let store = state.lock_store();
     match decide_create_buffer(&store, &mut mgr, title)? {
         CreateDecision::Reuse(doc) => Ok(doc),
         CreateDecision::Create(doc) => {
@@ -299,7 +309,7 @@ pub fn create_buffer(
 
 #[tauri::command]
 pub fn get_buffer(state: State<'_, AppState>, id: String) -> Result<BufferDocument, String> {
-    let store = state.store.lock().map_err(|e| e.to_string())?;
+    let store = state.lock_store();
     store.get(&id).map_err(|e| e.to_string())
 }
 
@@ -353,6 +363,38 @@ pub fn save_in_turn(
     content: &str,
 ) -> Result<Option<String>, String> {
     write_note_source(state, turn, content, RemovedFile::Refuse)
+}
+
+/// Writes `content` for note `id` in UTF-8, whatever encoding its file is in,
+/// and records UTF-8 as the encoding its saves and reads use from then on
+/// (ADR-049).
+///
+/// The way out of a save the file's own encoding refuses
+/// (`ERR_ENCODING_LOSSY`), since UTF-8 has bytes for every character. The
+/// encoding moves only once the write has landed, so a write the guard stops
+/// leaves the note reading its file as it did. Everything else is
+/// [`save_buffer_content_inner`]'s: the turn, the guard and the journal.
+pub fn save_buffer_as_utf8_inner(
+    state: &AppState,
+    id: &str,
+    content: &str,
+) -> Result<Option<String>, String> {
+    let turn = state.buffer_writes.turn(id);
+    save_as_utf8_in_turn(state, &turn, content)
+}
+
+fn save_as_utf8_in_turn(
+    state: &AppState,
+    turn: &Turn,
+    content: &str,
+) -> Result<Option<String>, String> {
+    write_note_source_in(
+        state,
+        turn,
+        content,
+        RemovedFile::Refuse,
+        Some(TextEncoding::utf8()),
+    )
 }
 
 /// What a write does about a note whose file was deleted outside Jotra.
@@ -419,8 +461,21 @@ fn write_note_source(
     content: &str,
     removed: RemovedFile,
 ) -> Result<Option<String>, String> {
+    write_note_source_in(state, turn, content, removed, None)
+}
+
+/// [`write_note_source`] in `encoding` rather than the row's, which the row
+/// takes once the write lands. `None` is the row's own.
+fn write_note_source_in(
+    state: &AppState,
+    turn: &Turn,
+    content: &str,
+    removed: RemovedFile,
+    encoding: Option<TextEncoding>,
+) -> Result<Option<String>, String> {
     let mut set_aside = Vec::new();
-    let written = write_note_source_unannounced(state, turn, content, removed, &mut set_aside);
+    let written =
+        write_note_source_unannounced(state, turn, content, removed, encoding, &mut set_aside);
     announce_indexed(&state.event_bus, set_aside);
     written.map_err(|refused| refused.message)
 }
@@ -443,10 +498,11 @@ fn write_note_source_unannounced(
     turn: &Turn,
     content: &str,
     removed: RemovedFile,
+    encoding: Option<TextEncoding>,
     set_aside: &mut Vec<String>,
 ) -> Result<Option<String>, SaveRefused> {
     let id = turn.key();
-    let written = land_note_source(state, id, content, removed, set_aside);
+    let written = land_note_source(state, id, content, removed, encoding, set_aside);
     let (landing, minted) = match &written {
         Ok(_) => (SaveLanding::Landed, None),
         Err(refused) => (refused.landing, refused.minted.as_deref()),
@@ -489,7 +545,7 @@ pub(crate) fn keep_unsaved_text(
     if step == JournalStep::Leave {
         return;
     }
-    let mut store = recover_poison(state.store.lock(), "commands::buffer::keep_unsaved_text");
+    let mut store = state.lock_store();
     if landing == SaveLanding::WrittenBeside {
         store.remember_text_written_beside(id, content);
     }
@@ -544,6 +600,7 @@ fn land_note_source(
     id: &str,
     content: &str,
     removed: RemovedFile,
+    encoding: Option<TextEncoding>,
     set_aside: &mut Vec<String>,
 ) -> Result<Option<String>, SaveRefused> {
     wait_out_a_held_removal(state, id, removed).map_err(SaveRefused::not_landed)?;
@@ -555,7 +612,7 @@ fn land_note_source(
         write,
         source_path,
         minted,
-    }) = plan_note_write(state, id, content, removed, default_extension)?
+    }) = plan_note_write(state, id, content, removed, encoding, default_extension)?
     else {
         return Ok(None);
     };
@@ -588,8 +645,13 @@ fn land_note_source(
     // render's scripts check takes too: it never sees the new bytes recorded
     // beside an opt-in that has not followed them yet.
     let settled = {
-        let store = recover_poison(state.store.lock(), "commands::buffer::land_note_source");
-        let settled = store.settle_source_write(id, &outcome);
+        let store = state.lock_store();
+        let settled = store
+            .settle_source_write(id, &outcome)
+            .and_then(|()| match encoding {
+                Some(encoding) => store.set_encoding(id, Some(encoding)),
+                None => Ok(()),
+            });
         state.set_disk_state(id, outcome.disk_state);
         settled
     };
@@ -625,12 +687,10 @@ fn plan_note_write<'a>(
     id: &str,
     content: &'a str,
     removed: RemovedFile,
+    encoding: Option<TextEncoding>,
     default_extension: jotra_core::config::FileExtension,
 ) -> Result<Option<PlannedNoteWrite<'a>>, SaveRefused> {
-    let store = state
-        .store
-        .lock()
-        .map_err(|e| SaveRefused::not_landed(e.to_string()))?;
+    let store = state.lock_store();
     let doc = store
         .get(id)
         .map_err(|e| SaveRefused::not_landed(e.to_string()))?;
@@ -670,9 +730,11 @@ fn plan_note_write<'a>(
     };
     crate::commands::file::authorize_source_write(state, &source_path)
         .map_err(|message| carry_minted(SaveRefused::not_landed(message)))?;
-    let write = store
-        .plan_source_write(id, content)
-        .map_err(|error| carry_minted(SaveRefused::storage(&error)))?;
+    let write = match encoding {
+        Some(encoding) => store.plan_source_write_in(id, content, encoding),
+        None => store.plan_source_write(id, content),
+    }
+    .map_err(|error| carry_minted(SaveRefused::storage(&error)))?;
     Ok(Some(PlannedNoteWrite {
         write,
         source_path,
@@ -864,6 +926,26 @@ pub async fn save_buffer_content<R: Runtime>(
     .await
 }
 
+/// IPC: [`save_buffer_as_utf8_inner`], sent the way [`save_buffer_content`]
+/// is: the text as the raw body and the note in [`NOTE_ID_HEADER`].
+#[tauri::command]
+pub async fn save_buffer_as_utf8<R: Runtime>(
+    app: AppHandle<R>,
+    request: tauri::ipc::Request<'_>,
+) -> Result<Option<String>, String> {
+    let id = note_id_of(request.headers()).map_err(|e| e.to_string())?;
+    let ticket = note_ticket(&app, &id);
+    let bytes = body_bytes(request.body()).map_err(|e| e.to_string())?;
+    let reindex = app.clone();
+    run_in_turn(app, ticket, ERR_WRITE_FAILED, move |state, turn| {
+        let content = String::from_utf8(bytes).map_err(|_| SaveBodyError::NotUtf8.to_string())?;
+        let disk_hash = save_as_utf8_in_turn(state, turn, &content)?;
+        schedule_reindex(&reindex, state, turn.key());
+        Ok(disk_hash)
+    })
+    .await
+}
+
 /// Code a change-set save carries when the note's file no longer holds the
 /// text the changes were made against, or holds none Jotra can read without
 /// asking. The editor sends the whole text instead.
@@ -950,9 +1032,7 @@ fn save_changes_in_turn(
 /// save that follows is the one that says what is wrong with them.
 fn base_text_of_file(state: &AppState, id: &str, base: &str) -> Result<String, ChangesRefused> {
     let doc = state
-        .store
-        .lock()
-        .map_err(|_| ChangesRefused::Stale)?
+        .lock_store()
         .get(id)
         .map_err(|_| ChangesRefused::Stale)?;
     let Some(path) = doc.source_path.as_deref() else {
@@ -1005,10 +1085,7 @@ pub async fn save_buffer_changes<R: Runtime>(
 /// index takes nothing from its file: a file over the normal tier, or a
 /// read-only one, is never read for it (EP-15).
 fn schedule_reindex<R: Runtime>(app: &AppHandle<R>, state: &AppState, id: &str) {
-    let indexed = match state.store.lock() {
-        Ok(store) => matches!(store.reindex_target(id), Ok(Some(_))),
-        Err(_) => false,
-    };
+    let indexed = matches!(state.lock_store().reindex_target(id), Ok(Some(_)));
     if !indexed {
         return;
     }
@@ -1044,7 +1121,7 @@ fn restore_in_turn(state: &AppState, turn: &Turn, content: &str) -> Result<Optio
     let id = turn.key();
     let disk_hash = write_note_source(state, turn, content, RemovedFile::WriteBack)?;
     let source_path = {
-        let store = state.store.lock().map_err(|e| e.to_string())?;
+        let store = state.lock_store();
         store.get(id).map_err(|e| e.to_string())?.source_path
     };
     if let Some(path) = source_path {
@@ -1117,7 +1194,7 @@ fn save_note_to_in_turn(
     let path = resolved.as_str();
     crate::commands::file::authorize_source_write(state, path)?;
     {
-        let store = state.store.lock().map_err(|e| e.to_string())?;
+        let store = state.lock_store();
         let open_elsewhere = store
             .find_active_by_source_path(path)
             .map_err(|e| format!("{ERR_WRITE_FAILED}: {e}"))?
@@ -1132,7 +1209,7 @@ fn save_note_to_in_turn(
     let target = Path::new(path);
     state.follow_note_path(id, target);
     restore_in_turn(state, turn, content).inspect_err(|_| {
-        let store = recover_poison(state.store.lock(), "commands::buffer::save_note_to_inner");
+        let store = state.lock_store();
         match store.detach_source_path(id, path) {
             Ok(true) => {
                 state.stop_following_note(id);
@@ -1232,22 +1309,16 @@ pub fn reindex_settled_buffer(state: &AppState, id: &str) {
 /// file read at all (EP-15), and one whose file moved while it was read is
 /// left to whatever moved it.
 fn reindex_buffer_now(state: &AppState, id: &str) -> Option<String> {
-    let target = match state.store.lock() {
-        Ok(store) => match store.reindex_target(id) {
-            Ok(target) => target,
-            Err(e) => {
-                tracing::debug!(buffer_id = %id, error = %e, "fts reindex failed");
-                None
-            }
-        },
-        Err(_) => {
-            tracing::debug!(buffer_id = %id, "store poisoned; skipping reindex");
+    let target = match state.lock_store().reindex_target(id) {
+        Ok(target) => target,
+        Err(e) => {
+            tracing::debug!(buffer_id = %id, error = %e, "fts reindex failed");
             None
         }
     }?;
     let content = jotra_storage::buffer_store::read_indexable_text(&target);
     let indexed = {
-        let store = state.store.lock().ok()?;
+        let store = state.lock_store();
         match store.get(id) {
             Ok(now) if now.source_path == target.source_path => {}
             _ => return None,
@@ -1302,16 +1373,14 @@ fn read_note_text(
     id: &str,
 ) -> Result<(BufferDocument, jotra_storage::buffer_store::ReadText), String> {
     let doc = state
-        .store
-        .lock()
-        .map_err(|e| format!("{ERR_READ_FAILED}: {e}"))?
+        .lock_store()
         .get(id)
         .map_err(|e| read_failure_message(&e))?;
     match jotra_storage::buffer_store::read_doc_text(&doc) {
         Ok(read) => Ok((doc, read)),
         Err(error) => {
             if let StorageError::FileTooLarge { size_bytes } = error {
-                let store = recover_poison(state.store.lock(), "commands::buffer::read_note_text");
+                let store = state.lock_store();
                 if let Err(e) = store.record_size(id, size_bytes) {
                     tracing::debug!(buffer_id = %id, error = %e, "the measured size was not recorded");
                 }
@@ -1333,7 +1402,7 @@ pub fn read_in_turn(state: &AppState, turn: &Turn) -> Result<Vec<u8>, String> {
         if doc.read_only {
             state.record_disk_state(id, path, digest, size);
         } else {
-            let store = recover_poison(state.store.lock(), "commands::buffer::read_in_turn");
+            let store = state.lock_store();
             // What is recorded and kept is the file's bytes, which for a file
             // that is not UTF-8 are not the text handed to the tab: the next
             // save is guarded against them, and the history keeps them as
@@ -1548,7 +1617,7 @@ pub fn note_disk_state_inner(state: &AppState, id: &str) -> Result<NoteDiskAnswe
 fn note_disk_state_in_turn(state: &AppState, turn: &Turn) -> Result<NoteDiskAnswer, String> {
     let id = turn.key();
     let (source_path, read_only, encoding) = {
-        let store = state.store.lock().map_err(|e| e.to_string())?;
+        let store = state.lock_store();
         let doc = store.get(id).map_err(|e| e.to_string())?;
         let Some(source_path) = doc.source_path else {
             return Ok(NoteDiskAnswer::NoFile);
@@ -1613,7 +1682,7 @@ pub fn note_file_unchanged_inner(state: &AppState, id: &str) -> bool {
 fn note_file_unchanged_in_turn(state: &AppState, turn: &Turn) -> bool {
     let id = turn.key();
     let source_path = {
-        let store = recover_poison(state.store.lock(), "commands::buffer::note_file_unchanged");
+        let store = state.lock_store();
         match store.get(id) {
             Ok(doc) if !doc.read_only => doc.source_path,
             _ => return false,
@@ -1727,10 +1796,7 @@ fn answer_external_change(
     // store lock, which answering a hold needs.
     wait_out_a_held_removal(state, id, RemovedFile::Refuse).map_err(SaveRefused::not_landed)?;
     let (source_path, line_ending, encoding) = {
-        let store = state
-            .store
-            .lock()
-            .map_err(|e| SaveRefused::not_landed(e.to_string()))?;
+        let store = state.lock_store();
         let doc = store
             .get(id)
             .map_err(|e| SaveRefused::not_landed(e.to_string()))?;
@@ -1884,11 +1950,7 @@ fn answer_external_change_at(
     let conflict_copy_path = Some(copy.to_string_lossy().into_owned());
     let copy_key = index_copy(state, &copy);
     if outcome.write_conflict_copy_of == Side::Mine {
-        recover_poison(
-            state.store.lock(),
-            "commands::buffer::resolve_external_change_at",
-        )
-        .remember_text_written_beside(id, content);
+        state.lock_store().remember_text_written_beside(id, content);
     }
 
     let mut rewritten = None;
@@ -1899,15 +1961,22 @@ fn answer_external_change_at(
             // has nothing left to protect and the save may land. Recording it
             // is also what makes the record true: Jotra has read this file.
             state.record_disk_state_bytes(id, path, &disk_bytes);
-            write_note_source_unannounced(state, turn, content, RemovedFile::Refuse, &mut set_aside)
-                .map(|written| {
-                    rewritten = reindex_buffer_now(state, id);
-                    ResolveOutcome {
-                        conflict_copy_path,
-                        content: None,
-                        disk_hash: written.unwrap_or(mine_hash),
-                    }
-                })
+            write_note_source_unannounced(
+                state,
+                turn,
+                content,
+                RemovedFile::Refuse,
+                None,
+                &mut set_aside,
+            )
+            .map(|written| {
+                rewritten = reindex_buffer_now(state, id);
+                ResolveOutcome {
+                    conflict_copy_path,
+                    content: None,
+                    disk_hash: written.unwrap_or(mine_hash),
+                }
+            })
         }
         Action::TakeDisk | Action::TakeDiskAndShowCopy => {
             // The file is left exactly as the other program wrote it. The tab
@@ -1977,7 +2046,7 @@ pub fn record_unsaved_notes(
 /// the call fails once the rest are written, so the editor keeps its own copy
 /// of that text rather than drop it.
 pub fn record_unsaved_notes_inner(state: &AppState, notes: Vec<UnsavedNote>) -> Result<(), String> {
-    let store = recover_poison(state.store.lock(), "commands::buffer::record_unsaved_notes");
+    let store = state.lock_store();
     let now = chrono::Utc::now();
     let total = notes.len();
     let mut unkept = 0usize;
@@ -2013,7 +2082,7 @@ pub fn discard_unsaved_text(state: State<'_, AppState>, ids: Vec<String>) -> Res
 
 /// [`discard_unsaved_text`] as everything but the IPC boundary sees it.
 pub fn discard_unsaved_text_inner(state: &AppState, ids: &[String]) -> Result<(), String> {
-    let store = state.store.lock().map_err(|e| e.to_string())?;
+    let store = state.lock_store();
     for id in ids {
         store.clear_unsaved_text(id).map_err(|e| e.to_string())?;
     }
@@ -2047,7 +2116,7 @@ pub async fn list_active_buffers<R: Runtime>(
 /// restored session unwatched.
 pub fn list_active_buffers_inner(state: &AppState) -> Result<Vec<BufferDocument>, String> {
     let mut docs = {
-        let store = state.store.lock().map_err(|e| e.to_string())?;
+        let store = state.lock_store();
         store
             .list_by_status(BufferStatus::Active)
             .map_err(|e| e.to_string())?
@@ -2064,7 +2133,7 @@ pub fn list_active_buffers_inner(state: &AppState) -> Result<Vec<BufferDocument>
         }
     }
     if !moved.is_empty() {
-        let store = state.store.lock().map_err(|e| e.to_string())?;
+        let store = state.lock_store();
         for (id, size) in moved {
             if let Err(e) = store.record_size(&id, size) {
                 tracing::debug!(buffer_id = %id, error = %e, "the measured size was not recorded");
@@ -2142,7 +2211,7 @@ pub(crate) fn revoke_released(state: &AppState, released: &[String]) {
 pub fn close_buffer_inner(state: &AppState, id: &str) -> Result<(), String> {
     let _turn = state.buffer_writes.turn(id);
     let released = {
-        let store = state.store.lock().map_err(|e| e.to_string())?;
+        let store = state.lock_store();
         let doc = store.get(id).map_err(|e| e.to_string())?;
         forget_ignore_stamp(state, &doc, "commands::buffer::close_buffer");
         // A note whose tab has been closed is one the person has already put
@@ -2157,7 +2226,7 @@ pub fn close_buffer_inner(state: &AppState, id: &str) -> Result<(), String> {
     state.forget_disk_state(id);
     state.forget_source_record(id);
     state.stop_following_note(id);
-    state.preview_render_cache.release_remote_images(id);
+    state.preview_render_cache.release_buffer(id);
     Ok(())
 }
 
@@ -2182,7 +2251,7 @@ pub fn close_buffers_inner(state: &AppState, ids: &[String]) -> Result<(), Strin
         .map(|id| state.buffer_writes.turn(id))
         .collect();
     let released: Vec<String> = {
-        let store = state.store.lock().map_err(|e| e.to_string())?;
+        let store = state.lock_store();
         let mut sources = Vec::new();
         for id in ids {
             if let Ok(doc) = store.get(id) {
@@ -2203,7 +2272,7 @@ pub fn close_buffers_inner(state: &AppState, ids: &[String]) -> Result<(), Strin
         state.forget_disk_state(id);
         state.forget_source_record(id);
         state.stop_following_note(id);
-        state.preview_render_cache.release_remote_images(id);
+        state.preview_render_cache.release_buffer(id);
     }
     Ok(())
 }
@@ -2225,7 +2294,7 @@ pub fn delete_buffer_inner(state: &AppState, id: &str) -> Result<(), String> {
 pub(crate) fn delete_buffer_in_turn(state: &AppState, turn: &Turn) -> Result<(), String> {
     let id = turn.key();
     let released = {
-        let store = state.store.lock().map_err(|e| e.to_string())?;
+        let store = state.lock_store();
         let doc = store.get(id).ok();
         if let Some(doc) = doc.as_ref() {
             forget_ignore_stamp(state, doc, "commands::buffer::delete_buffer");
@@ -2237,7 +2306,7 @@ pub(crate) fn delete_buffer_in_turn(state: &AppState, turn: &Turn) -> Result<(),
     state.forget_disk_state(id);
     state.forget_source_record(id);
     state.stop_following_note(id);
-    state.preview_render_cache.release_remote_images(id);
+    state.preview_render_cache.release_buffer(id);
     Ok(())
 }
 
@@ -2251,7 +2320,7 @@ pub async fn delete_buffer<R: Runtime>(app: AppHandle<R>, id: String) -> Result<
 
 #[tauri::command]
 pub fn rename_buffer(state: State<'_, AppState>, id: String, title: String) -> Result<(), String> {
-    let store = state.store.lock().map_err(|e| e.to_string())?;
+    let store = state.lock_store();
     store.rename(&id, &title).map_err(|e| e.to_string())
 }
 
@@ -2263,7 +2332,7 @@ pub fn set_buffer_language_inner(
     language: Option<&str>,
 ) -> Result<BufferDocument, String> {
     jotra_core::buffer::language::validate_language_choice(language).map_err(|e| e.to_string())?;
-    let store = state.store.lock().map_err(|e| e.to_string())?;
+    let store = state.lock_store();
     store
         .update_language(id, language)
         .map_err(|e| e.to_string())?;
@@ -2288,7 +2357,7 @@ pub fn set_buffer_view_position_inner(
     cursor_pos: u64,
     scroll_pos: u64,
 ) -> Result<(), String> {
-    let store = state.store.lock().map_err(|e| e.to_string())?;
+    let store = state.lock_store();
     store
         .set_view_position(id, cursor_pos, scroll_pos)
         .map_err(|e| e.to_string())
@@ -2334,10 +2403,7 @@ pub fn reopen_with_encoding_inner(
     let chosen = TextEncoding::from_label(encoding)
         .ok_or_else(|| format!("{ERR_UNKNOWN_ENCODING}: {encoding:?} is not an encoding"))?;
     let source_path = {
-        let store = state
-            .store
-            .lock()
-            .map_err(|e| format!("{ERR_READ_FAILED}: {e}"))?;
+        let store = state.lock_store();
         let doc = store.get(id).map_err(|e| read_failure_message(&e))?;
         if doc.read_only {
             return Err(format!("{ERR_NOTE_READ_ONLY}: file {id} is read-only"));
@@ -2363,10 +2429,7 @@ pub fn reopen_with_encoding_inner(
         .map_err(|e| read_failure_message(&StorageError::from(e)))?;
     let ending = LineEnding::detect(&text);
 
-    let store = state
-        .store
-        .lock()
-        .map_err(|e| format!("{ERR_READ_FAILED}: {e}"))?;
+    let store = state.lock_store();
     store
         .set_encoding(id, Some(chosen))
         .map_err(|e| read_failure_message(&e))?;

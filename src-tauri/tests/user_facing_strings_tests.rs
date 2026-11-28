@@ -10,10 +10,9 @@
 //! reason to add one: the walk is `std::fs::read_dir` recursion over declared
 //! roots and the match is a `str::find` with its own word boundaries.
 //!
-//! Known limits. A message assembled from a `const` or a variable escapes the
+//! Known limit. A message assembled from a `const` or a variable escapes the
 //! scan, because only the literal is read and the literal is where the word
-//! would be. The scan of a file stops at the first line-leading
-//! `#[cfg(test)]`, so a declaration written after the test module is invisible.
+//! would be.
 
 use std::path::{Path, PathBuf};
 
@@ -62,16 +61,19 @@ const SCANNED_ROOTS: &[(&str, &str)] = &[
 /// Directories inside a scanned root that hold no user message.
 const SKIPPED_DIRS: &[&str] = &["tests", "benches", "target", "fixtures"];
 
-/// A test module kept in a file of its own: its strings are fixtures, such as
-/// the British spellings jotra-lint's dictionary tests feed it.
-const SKIPPED_FILES: &[&str] = &["tests.rs"];
-
-/// One string that already says a retired word. The file can only shrink: a
-/// record whose string is gone fails the staleness test, so a rename deletes
-/// its record in the same change.
+/// One string that already says a retired word, named by the item it is
+/// written in and a piece of its text rather than by a line, so an edit
+/// elsewhere in the file leaves the record standing. The list can only
+/// shrink: a record whose string is gone fails the staleness test, so a
+/// rename deletes its record in the same change. A record answers for exactly
+/// one string: a second string in the same item that carries the same text
+/// and word is a new violation, not a listed one.
 struct AllowedString {
     file: &'static str,
-    line: usize,
+    /// The innermost item around the string, as `Type::function` or `NAME`.
+    item: &'static str,
+    /// A piece of the string's text, as written in the source.
+    text: &'static str,
     word: &'static str,
     note: &'static str,
 }
@@ -79,117 +81,143 @@ struct AllowedString {
 const RUST_ALLOWLIST: &[AllowedString] = &[
     AllowedString {
         file: "crates/jotra-core/src/default_app.rs",
-        line: 80,
+        item: "claimable_types::TYPES",
+        text: "Source code",
         word: "source",
         note: "file-association group label, release 0.6",
     },
     AllowedString {
         file: "crates/jotra-core/src/errors.rs",
-        line: 12,
+        item: "JotraError",
+        text: "buffer not found",
         word: "buffer",
         note: "BufferNotFound message, release 0.6",
     },
     AllowedString {
         file: "crates/jotra-core/src/errors.rs",
-        line: 19,
+        item: "JotraError",
+        text: "buffer already exists",
         word: "buffer",
         note: "BufferAlreadyExists message, release 0.6",
     },
     AllowedString {
         file: "crates/jotra-core/src/errors.rs",
-        line: 37,
+        item: "JotraError",
+        text: "invalid buffer title",
         word: "buffer",
         note: "InvalidTitle message, release 0.6",
     },
     AllowedString {
         file: "crates/jotra-core/src/file_ops.rs",
-        line: 205,
+        item: "format_bytes",
+        text: " MiB",
         word: "MiB",
         note: "size formatter unit, release 0.6",
     },
     AllowedString {
         file: "crates/jotra-storage/src/database/queries.rs",
-        line: 108,
+        item: "get_buffer",
+        text: "buffer not found",
         word: "buffer",
         note: "row lookup error, release 0.6",
     },
     AllowedString {
         file: "crates/jotra-core/src/chat/prompt.rs",
-        line: 30,
+        item: "SYSTEM_PROMPT_HEAD",
+        text: "a notes editor",
         word: "note",
         note: "model-facing system prompt, not app copy",
     },
     AllowedString {
         file: "crates/jotra-core/src/chat/prompt.rs",
-        line: 39,
+        item: "BODY_PLACEHOLDER",
+        text: "the note's full text",
         word: "note",
         note: "model-facing body placeholder, not app copy",
     },
     AllowedString {
         file: "crates/jotra-core/src/chat/prompt.rs",
-        line: 43,
+        item: "LEGACY_BODY_PLACEHOLDER",
+        text: "new text of the note",
         word: "note",
         note: "the body placeholder older conversations were written with",
     },
     AllowedString {
         file: "crates/jotra-core/src/chat/prompt.rs",
-        line: 46,
+        item: "EXAMPLE_PATH",
+        text: "Notes/Example.md",
         word: "note",
         note: "example path inside the model-facing prompt",
     },
     AllowedString {
         file: "crates/jotra-core/src/chat/prompt.rs",
-        line: 60,
+        item: "system_prompt",
+        text: "To offer a change to an attached note",
         word: "note",
         note: "model-facing offer instructions, not app copy",
     },
     AllowedString {
         file: "crates/jotra-core/src/chat/prompt.rs",
-        line: 64,
+        item: "system_prompt",
+        text: "No note is attached",
         word: "note",
         note: "model-facing offer instructions, not app copy",
     },
     AllowedString {
         file: "crates/jotra-core/src/chat/prompt.rs",
-        line: 78,
+        item: "system_prompt",
+        text: "The block holds the note's entire text",
         word: "note",
         note: "model-facing offer instructions, not app copy",
     },
     AllowedString {
         file: "crates/jotra-core/src/chat/prompt.rs",
-        line: 105,
+        item: "context_block",
+        text: "<note{suffix} path=",
         word: "note",
         note: "attachment tag the model reads; renaming it breaks parsing",
     },
     AllowedString {
         file: "crates/jotra-core/src/polish.rs",
-        line: 247,
+        item: "RETURN_ONLY",
+        text: "explanation, notes, or code",
         word: "note",
         note: "model-facing rewrite prompt: \"notes\" means asides in the answer",
     },
     AllowedString {
         file: "crates/jotra-mcp/src/server.rs",
-        line: 53,
+        item: "INSTRUCTIONS",
+        text: "Reads and writes the notes",
         word: "note",
         note: "MCP server instructions, out of the copy sweep (decision C1)",
     },
     AllowedString {
         file: "crates/jotra-ai/src/chat.rs",
-        line: 1185,
+        item: "mints_nothing",
+        text: "may not create notes",
         word: "note",
         note: "debug_assert text, never rendered",
     },
     AllowedString {
         file: "src-tauri/src/state.rs",
-        line: 461,
+        item: "AppState::initialize",
+        text: "notes migration finished",
         word: "note",
         note: "log line the prefix test misses inside a multi-line macro",
     },
     AllowedString {
         file: "src-tauri/src/state.rs",
-        line: 657,
+        item: "AppState::run_startup_maintenance",
+        text: "retired versions of notes",
         word: "note",
         note: "log line the prefix test misses inside a multi-line macro",
+    },
+    AllowedString {
+        file: "src-tauri/src/commands/notices.rs",
+        item: "RETIRED_NOTICES_TITLE",
+        text: "Third-party licences",
+        word: "licence",
+        note: "the title earlier builds wrote, kept to find and remove their file",
     },
 ];
 
@@ -246,19 +274,6 @@ fn delimiter_balance(line: &str) -> i32 {
     depth
 }
 
-/// The source up to the first line-leading `#[cfg(test)]`. A test module is
-/// test code and by convention it closes the file.
-fn without_test_module(src: &str) -> &str {
-    let mut offset = 0usize;
-    for line in src.split_inclusive('\n') {
-        if line.trim_start().starts_with("#[cfg(test)]") {
-            return &src[..offset];
-        }
-        offset += line.len();
-    }
-    src
-}
-
 fn line_starts(src: &str) -> Vec<usize> {
     let mut starts = vec![0usize];
     for (idx, byte) in src.bytes().enumerate() {
@@ -280,21 +295,26 @@ fn is_ident_byte(byte: Option<u8>) -> bool {
     matches!(byte, Some(b) if b.is_ascii_alphanumeric() || b == b'_')
 }
 
-/// A string literal, with the line it opens on and whatever its line says
-/// before it. The prefix is what tells a message from a log argument.
+/// A string literal, with the line it opens on, whatever its line says before
+/// it, and the item it is written in. The prefix is what tells a message from
+/// a log argument.
 struct Literal {
+    at: usize,
     line: usize,
     value: String,
     prefix: String,
+    item: String,
 }
 
 impl Literal {
     fn new(starts: &[usize], src: &str, open: usize, body_start: usize, body_end: usize) -> Self {
         let line = line_of(starts, open);
         Self {
+            at: open,
             line,
             value: src[body_start..body_end].to_string(),
             prefix: src[starts[line - 1]..open].to_string(),
+            item: String::new(),
         }
     }
 
@@ -315,14 +335,42 @@ impl Literal {
     }
 }
 
-/// The body of every string literal in a Rust source, with its line. Comments,
-/// char literals and lifetimes are stepped over; escapes are left as written,
-/// which is enough for a word match.
-fn string_literals(src: &str) -> Vec<Literal> {
+/// One token of a Rust source: enough of the grammar to read the string
+/// literals and the items they are written in.
+enum Token {
+    Ident { at: usize, name: String },
+    Str(Literal),
+    Punct { at: usize, ch: u8 },
+}
+
+impl Token {
+    fn at(&self) -> usize {
+        match self {
+            Token::Ident { at, .. } | Token::Punct { at, .. } => *at,
+            Token::Str(literal) => literal.at,
+        }
+    }
+
+    fn is_punct(&self, wanted: u8) -> bool {
+        matches!(self, Token::Punct { ch, .. } if *ch == wanted)
+    }
+
+    fn ident(&self) -> Option<&str> {
+        match self {
+            Token::Ident { name, .. } => Some(name),
+            _ => None,
+        }
+    }
+}
+
+/// The tokens of a Rust source. Comments are stepped over, a char literal
+/// is dropped and a lifetime is a `'` before its name; a string's escapes are
+/// left as written, which is enough for a word match.
+fn tokens(src: &str) -> Vec<Token> {
     let starts = line_starts(src);
     let bytes = src.as_bytes();
     let n = bytes.len();
-    let mut out: Vec<Literal> = Vec::new();
+    let mut out: Vec<Token> = Vec::new();
     let mut i = 0usize;
 
     while i < n {
@@ -371,13 +419,13 @@ fn string_literals(src: &str) -> Vec<Literal> {
                     }
                     k += 1;
                 };
-                out.push(Literal::new(&starts, src, i, body_start, end));
+                out.push(Token::Str(Literal::new(&starts, src, i, body_start, end)));
                 i = (end + 1 + hashes).min(n);
                 continue;
             }
         }
 
-        // A char literal, not a lifetime: 'x' or '\n'.
+        // A char literal, not a lifetime: 'x', '→' or '\n'.
         if byte == b'\'' {
             if i + 1 < n && bytes[i + 1] == b'\\' {
                 let mut j = i + 2;
@@ -387,10 +435,12 @@ fn string_literals(src: &str) -> Vec<Literal> {
                 i = (j + 1).min(n);
                 continue;
             }
-            if i + 2 < n && bytes[i + 2] == b'\'' {
-                i += 3;
+            let width = src[i + 1..].chars().next().map_or(1, char::len_utf8);
+            if bytes.get(i + 1 + width) == Some(&b'\'') {
+                i += 2 + width;
                 continue;
             }
+            out.push(Token::Punct { at: i, ch: byte });
             i += 1;
             continue;
         }
@@ -409,15 +459,290 @@ fn string_literals(src: &str) -> Vec<Literal> {
                 j += 1;
             }
             let end = j.min(n);
-            out.push(Literal::new(&starts, src, i, body_start, end));
+            out.push(Token::Str(Literal::new(&starts, src, i, body_start, end)));
             i = (end + 1).min(n);
             continue;
         }
 
+        if is_ident_byte(Some(byte)) {
+            let start = i;
+            while i < n && is_ident_byte(Some(bytes[i])) {
+                i += 1;
+            }
+            out.push(Token::Ident {
+                at: start,
+                name: src[start..i].to_string(),
+            });
+            continue;
+        }
+
+        if !byte.is_ascii_whitespace() {
+            out.push(Token::Punct { at: i, ch: byte });
+        }
         i += 1;
     }
 
     out
+}
+
+/// A declared item and the bytes it spans, its outer attributes included.
+struct ItemSpan {
+    path: String,
+    start: usize,
+    end: usize,
+    is_test: bool,
+}
+
+/// An item whose name has been read and whose body has not opened yet.
+struct Header {
+    name: String,
+    path: String,
+    start: usize,
+    depth: i32,
+    is_test: bool,
+    is_module: bool,
+}
+
+/// What a source declares: its items, and the modules it keeps in files of
+/// their own behind `#[cfg(test)]`.
+struct Items {
+    spans: Vec<ItemSpan>,
+    test_modules: Vec<String>,
+}
+
+/// Words that can stand between an outer attribute and the item keyword it
+/// belongs to (`#[cfg(test)] pub(crate) unsafe fn`).
+const ITEM_QUALIFIERS: &[&str] = &[
+    "pub", "crate", "super", "self", "in", "async", "unsafe", "extern", "default",
+];
+
+/// The index of the bracket that closes the one at `open`.
+fn matching_close(tokens: &[Token], open: usize) -> usize {
+    let mut depth = 0i32;
+    for (index, token) in tokens.iter().enumerate().skip(open) {
+        match token {
+            Token::Punct {
+                ch: b'(' | b'[' | b'{',
+                ..
+            } => depth += 1,
+            Token::Punct {
+                ch: b')' | b']' | b'}',
+                ..
+            } => {
+                depth -= 1;
+                if depth == 0 {
+                    return index;
+                }
+            }
+            _ => {}
+        }
+    }
+    tokens.len().saturating_sub(1)
+}
+
+fn is_cfg_test(attribute: &[Token]) -> bool {
+    let words: Vec<&str> = attribute.iter().filter_map(Token::ident).collect();
+    words == ["cfg", "test"]
+}
+
+/// The type an `impl` header is for: the last path segment after `for`, or of
+/// the first type when there is no `for`, generics left out.
+fn impl_target(tokens: &[Token], from: usize) -> Option<String> {
+    let mut angle = 0i32;
+    let mut name: Option<String> = None;
+    for (index, token) in tokens.iter().enumerate().skip(from) {
+        let previous = index.checked_sub(1).map(|p| &tokens[p]);
+        match token {
+            Token::Punct { ch: b'<', .. } => angle += 1,
+            Token::Punct { ch: b'>', .. } if !previous.is_some_and(|t| t.is_punct(b'-')) => {
+                angle -= 1;
+            }
+            Token::Punct {
+                ch: b'{' | b';', ..
+            } if angle == 0 => break,
+            Token::Ident { name: word, .. } if angle == 0 => match word.as_str() {
+                "for" => name = None,
+                "where" => break,
+                "dyn" | "mut" | "unsafe" | "const" => {}
+                _ if name.is_none() || previous.is_some_and(|t| t.is_punct(b':')) => {
+                    name = Some(word.clone());
+                }
+                _ => {}
+            },
+            _ => {}
+        }
+    }
+    name
+}
+
+/// The name an item keyword at `index` declares, or `None` when the word is
+/// not opening an item there (`'static`, `*const T`, `const fn`, `fn()`).
+fn declared_name(tokens: &[Token], index: usize, keyword: &str) -> Option<String> {
+    let next = tokens.get(index + 1).and_then(Token::ident);
+    let previous = index.checked_sub(1).map(|p| &tokens[p]);
+    match keyword {
+        "fn" | "mod" | "enum" | "struct" | "trait" => next.map(str::to_string),
+        "const" => {
+            if previous.is_some_and(|t| t.is_punct(b'*')) {
+                return None;
+            }
+            match next {
+                Some("fn" | "unsafe" | "async" | "extern") | None => None,
+                Some(name) => Some(name.to_string()),
+            }
+        }
+        "static" => {
+            if previous.is_some_and(|t| t.is_punct(b'\'')) {
+                return None;
+            }
+            match next {
+                Some("mut") => tokens
+                    .get(index + 2)
+                    .and_then(Token::ident)
+                    .map(str::to_string),
+                Some(name) => Some(name.to_string()),
+                None => None,
+            }
+        }
+        "impl" => impl_target(tokens, index + 1),
+        "macro_rules" if tokens.get(index + 1).is_some_and(|t| t.is_punct(b'!')) => tokens
+            .get(index + 2)
+            .and_then(Token::ident)
+            .map(str::to_string),
+        _ => None,
+    }
+}
+
+/// Every item a source declares, nested ones named by the path of the items
+/// around them, and whether each sits behind `#[cfg(test)]`.
+fn declared_items(tokens: &[Token]) -> Items {
+    let mut spans: Vec<ItemSpan> = Vec::new();
+    let mut test_modules: Vec<String> = Vec::new();
+    let mut open: Vec<Header> = Vec::new();
+    let mut header: Option<Header> = None;
+    // Where the attributes before the next item start, and whether one of
+    // them is `#[cfg(test)]`.
+    let mut attributes: Option<(usize, bool)> = None;
+    let mut depth = 0i32;
+    let mut index = 0usize;
+
+    while index < tokens.len() {
+        let token = &tokens[index];
+        if let Some(pending) = header.as_ref() {
+            if depth == pending.depth && (token.is_punct(b'{') || token.is_punct(b';')) {
+                let pending = header.take().expect("a pending item");
+                if token.is_punct(b'{') {
+                    open.push(pending);
+                    depth += 1;
+                } else {
+                    if pending.is_module && pending.is_test && depth == 0 {
+                        test_modules.push(pending.name.clone());
+                    }
+                    spans.push(ItemSpan {
+                        path: pending.path,
+                        start: pending.start,
+                        end: token.at() + 1,
+                        is_test: pending.is_test,
+                    });
+                }
+                index += 1;
+                continue;
+            }
+        } else if token.is_punct(b'#') {
+            let inner = tokens.get(index + 1).is_some_and(|t| t.is_punct(b'!'));
+            let bracket = if inner { index + 2 } else { index + 1 };
+            if tokens.get(bracket).is_some_and(|t| t.is_punct(b'[')) {
+                let close = matching_close(tokens, bracket);
+                if !inner {
+                    let is_test = is_cfg_test(&tokens[bracket + 1..close]);
+                    let (start, was_test) = attributes.unwrap_or((token.at(), false));
+                    attributes = Some((start, was_test || is_test));
+                }
+                index = close + 1;
+                continue;
+            }
+        } else if let Some(word) = token.ident() {
+            if let Some(name) = declared_name(tokens, index, word) {
+                let (start, attributed_test) = attributes.take().unwrap_or((token.at(), false));
+                let parent = open.last();
+                header = Some(Header {
+                    path: match parent {
+                        Some(parent) => format!("{}::{name}", parent.path),
+                        None => name.clone(),
+                    },
+                    name,
+                    start,
+                    depth,
+                    is_test: attributed_test || parent.is_some_and(|p| p.is_test),
+                    is_module: word == "mod",
+                });
+            } else if !ITEM_QUALIFIERS.contains(&word) {
+                attributes = None;
+            }
+        } else if !(token.is_punct(b'(') || token.is_punct(b')') || token.is_punct(b':')) {
+            attributes = None;
+        }
+
+        match token {
+            Token::Punct {
+                ch: b'(' | b'[' | b'{',
+                ..
+            } => depth += 1,
+            Token::Punct {
+                ch: b')' | b']' | b'}',
+                at,
+            } => {
+                depth -= 1;
+                if let Some(item) = open.pop_if(|item| item.depth == depth) {
+                    spans.push(ItemSpan {
+                        path: item.path,
+                        start: item.start,
+                        end: at + 1,
+                        is_test: item.is_test,
+                    });
+                }
+            }
+            _ => {}
+        }
+        index += 1;
+    }
+
+    Items {
+        spans,
+        test_modules,
+    }
+}
+
+/// What the scan reads of one source: its string literals outside test code,
+/// each with the item around it, and the test modules it keeps in other files.
+struct SourceScan {
+    literals: Vec<Literal>,
+    test_modules: Vec<String>,
+}
+
+fn scan_source(src: &str) -> SourceScan {
+    let tokens = tokens(src);
+    let items = declared_items(&tokens);
+    let mut literals = Vec::new();
+    for token in tokens {
+        let Token::Str(mut literal) = token else {
+            continue;
+        };
+        let innermost = items
+            .spans
+            .iter()
+            .filter(|span| span.start <= literal.at && literal.at < span.end)
+            .max_by_key(|span| span.start);
+        if innermost.is_some_and(|span| span.is_test) {
+            continue;
+        }
+        literal.item = innermost.map(|span| span.path.clone()).unwrap_or_default();
+        literals.push(literal);
+    }
+    SourceScan {
+        literals,
+        test_modules: items.test_modules,
+    }
 }
 
 /// SQL is written in upper case here, and a message never is.
@@ -578,7 +903,7 @@ fn collect_rust_files(root: &Path, display: &str, out: &mut Vec<(String, PathBuf
                 continue;
             }
             collect_rust_files(&path, &format!("{display}/{name}"), &mut found);
-        } else if name.ends_with(".rs") && !SKIPPED_FILES.contains(&name.as_str()) {
+        } else if name.ends_with(".rs") {
             found.push((format!("{display}/{name}"), path));
         }
     }
@@ -586,7 +911,35 @@ fn collect_rust_files(root: &Path, display: &str, out: &mut Vec<(String, PathBuf
     out.extend(found);
 }
 
-fn scanned_files() -> Vec<(String, PathBuf)> {
+/// The directory a file's child modules live in: its own directory for a
+/// crate root or a `mod.rs`, a directory named for it otherwise.
+fn module_dir(file: &Path) -> PathBuf {
+    let dir = file.parent().map(Path::to_path_buf).unwrap_or_default();
+    match file.file_stem().and_then(|stem| stem.to_str()) {
+        Some("lib" | "main" | "mod") | None => dir,
+        Some(stem) => dir.join(stem),
+    }
+}
+
+/// `true` when `file` is the module `#[cfg(test)] mod name;` in `parent`
+/// declares, or a module inside it.
+fn is_in_test_module(file: &Path, parent: &Path, name: &str) -> bool {
+    let base = module_dir(parent);
+    file == base.join(format!("{name}.rs")) || file.starts_with(base.join(name))
+}
+
+/// A source the scan reads, and what it found in it.
+struct ScannedFile {
+    display: String,
+    path: PathBuf,
+    scan: SourceScan,
+}
+
+/// Every scanned source, less the files that are test modules of another:
+/// their strings are fixtures, such as the British spellings jotra-lint's
+/// dictionary tests feed it. A file is a test module because its parent
+/// declares it behind `#[cfg(test)]`, never because of its name.
+fn scanned_sources() -> Vec<ScannedFile> {
     let mut files = Vec::new();
     for (relative, display) in SCANNED_ROOTS {
         let mut path = manifest_dir();
@@ -595,21 +948,83 @@ fn scanned_files() -> Vec<(String, PathBuf)> {
         }
         collect_rust_files(&path, display, &mut files);
     }
-    files
+    let scanned: Vec<ScannedFile> = files
+        .into_iter()
+        .map(|(display, path)| {
+            let src = std::fs::read_to_string(&path)
+                .unwrap_or_else(|err| panic!("read {}: {err}", path.display()));
+            ScannedFile {
+                display,
+                scan: scan_source(&src),
+                path,
+            }
+        })
+        .collect();
+    let test_modules: Vec<(PathBuf, String)> = scanned
+        .iter()
+        .flat_map(|file| {
+            file.scan
+                .test_modules
+                .iter()
+                .map(|name| (file.path.clone(), name.clone()))
+        })
+        .collect();
+    scanned
+        .into_iter()
+        .filter(|file| {
+            !test_modules
+                .iter()
+                .any(|(parent, name)| is_in_test_module(&file.path, parent, name))
+        })
+        .collect()
 }
 
-fn collect_offenders() -> Vec<(String, usize, &'static str)> {
+/// A user message that says one of the words a guard looks for.
+struct Offender {
+    file: String,
+    line: usize,
+    item: String,
+    value: String,
+    word: &'static str,
+}
+
+impl Offender {
+    fn describe(&self) -> String {
+        let excerpt: String = self.value.chars().take(80).collect();
+        format!(
+            "{}:{} in `{}` says {:?}: {excerpt:?}",
+            self.file, self.line, self.item, self.word
+        )
+    }
+}
+
+impl AllowedString {
+    fn answers_for(&self, offender: &Offender) -> bool {
+        self.file == offender.file
+            && self.item == offender.item
+            && self.word == offender.word
+            && offender.value.contains(self.text)
+    }
+
+    fn describe(&self) -> String {
+        format!(
+            "{} in `{}`, {:?} in {:?} ({})",
+            self.file, self.item, self.word, self.text, self.note
+        )
+    }
+}
+
+fn collect_offenders() -> Vec<Offender> {
     collect_matches(BANNED)
 }
 
-fn collect_matches(words: &[&'static str]) -> Vec<(String, usize, &'static str)> {
-    let mut offenders: Vec<(String, usize, &'static str)> = Vec::new();
-    for (display, path) in scanned_files() {
-        let src = std::fs::read_to_string(&path)
-            .unwrap_or_else(|err| panic!("read {}: {err}", path.display()));
-        let src = without_test_module(&src);
-        let skipped = skipped_lines(src);
-        for literal in string_literals(src) {
+fn collect_matches(words: &[&'static str]) -> Vec<Offender> {
+    let mut offenders = Vec::new();
+    for file in scanned_sources() {
+        let src = std::fs::read_to_string(&file.path)
+            .unwrap_or_else(|err| panic!("read {}: {err}", file.path.display()));
+        let skipped = skipped_lines(&src);
+        for literal in &file.scan.literals {
             if skipped.get(literal.line - 1).copied().unwrap_or(false) {
                 continue;
             }
@@ -617,32 +1032,55 @@ fn collect_matches(words: &[&'static str]) -> Vec<(String, usize, &'static str)>
                 continue;
             }
             for word in words {
-                let found = (display.clone(), literal.line, *word);
-                if contains_banned_word(&literal.value, word) && !offenders.contains(&found) {
-                    offenders.push(found);
+                if contains_banned_word(&literal.value, word) {
+                    offenders.push(Offender {
+                        file: file.display.clone(),
+                        line: literal.line,
+                        item: literal.item.clone(),
+                        value: literal.value.clone(),
+                        word,
+                    });
                 }
             }
         }
     }
-    offenders.sort();
     offenders
 }
 
-fn key(file: &str, line: usize, word: &str) -> String {
-    format!("{file}:{line}:{word}")
+/// The strings no record answers for, and each string a record answers for
+/// beside another, since a record answers for exactly one.
+fn unlisted(offenders: &[Offender]) -> Vec<String> {
+    let mut new_violations: Vec<String> = offenders
+        .iter()
+        .filter(|offender| {
+            !RUST_ALLOWLIST
+                .iter()
+                .any(|entry| entry.answers_for(offender))
+        })
+        .map(Offender::describe)
+        .collect();
+    for entry in RUST_ALLOWLIST {
+        let answered: Vec<&Offender> = offenders
+            .iter()
+            .filter(|offender| entry.answers_for(offender))
+            .collect();
+        if answered.len() > 1 {
+            new_violations.extend(answered.iter().map(|offender| {
+                format!(
+                    "{} (one record, {}, answers for {} strings)",
+                    offender.describe(),
+                    entry.describe(),
+                    answered.len()
+                )
+            }));
+        }
+    }
+    new_violations
 }
 
 #[test]
 fn banned_words_have_no_new_violations_in_rust_user_messages() {
-    let allowed: Vec<String> = RUST_ALLOWLIST
-        .iter()
-        .map(|entry| key(entry.file, entry.line, entry.word))
-        .collect();
-    let new_violations: Vec<String> = collect_offenders()
-        .into_iter()
-        .map(|(file, line, word)| key(&file, line, word))
-        .filter(|found| !allowed.contains(found))
-        .collect();
+    let new_violations = unlisted(&collect_offenders());
     assert!(
         new_violations.is_empty(),
         "ADR-028 §10 retires this vocabulary from user-visible messages: {}",
@@ -667,10 +1105,7 @@ const OTHER_LOCALE_AND_VOICE: &[&str] = &[
 
 #[test]
 fn rust_user_messages_use_one_locale_and_one_voice() {
-    let found: Vec<String> = collect_matches(OTHER_LOCALE_AND_VOICE)
-        .into_iter()
-        .map(|(file, line, word)| key(&file, line, word))
-        .collect();
+    let found = unlisted(&collect_matches(OTHER_LOCALE_AND_VOICE));
     assert!(
         found.is_empty(),
         "user messages spell in US English and say \"Could not\": {}",
@@ -680,24 +1115,123 @@ fn rust_user_messages_use_one_locale_and_one_voice() {
 
 #[test]
 fn rust_banned_words_allowlist_has_no_stale_entries() {
-    let live: Vec<String> = collect_offenders()
+    let live: Vec<Offender> = collect_offenders()
         .into_iter()
-        .map(|(file, line, word)| key(&file, line, word))
+        .chain(collect_matches(OTHER_LOCALE_AND_VOICE))
         .collect();
     let stale: Vec<String> = RUST_ALLOWLIST
         .iter()
-        .filter(|entry| !live.contains(&key(entry.file, entry.line, entry.word)))
-        .map(|entry| {
-            format!(
-                "{} ({})",
-                key(entry.file, entry.line, entry.word),
-                entry.note
-            )
-        })
+        .filter(|entry| !live.iter().any(|offender| entry.answers_for(offender)))
+        .map(AllowedString::describe)
         .collect();
     assert!(
         stale.is_empty(),
         "these allowlist records no longer match a live string; delete them in the same change: {}",
         stale.join(", ")
     );
+}
+
+/// The items and test code the scan sees in a source written to exercise
+/// each way an item is declared.
+const ITEM_FIXTURE: &str = r##"
+#![doc = "Crate docs"]
+use std::fmt;
+
+#[derive(Debug, thiserror::Error)]
+pub enum Failure {
+    #[error("Enum message")]
+    Gone,
+}
+
+#[derive(Debug, thiserror::Error)]
+#[error("Struct message")]
+pub(crate) struct Lone;
+
+pub const LABEL: &[(&str, &str)] = &[("Const message", "x")];
+static NAME: &'static str = "Static message";
+
+impl<'a, T: Clone> fmt::Display for Wrapper<'a, T> where T: Send {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let pointer: *const u8 = std::ptr::null();
+        let callback: fn() = || {};
+        let arrow = '→';
+        write!(f, "Impl message")
+    }
+}
+
+pub(crate) async unsafe fn outer(limit: [u8; 2]) -> Result<(), String> {
+    fn inner() -> &'static str {
+        "Inner message"
+    }
+    Err("Outer message".to_string())
+}
+
+#[cfg(test)]
+use std::path::Path;
+
+fn after_a_test_use() -> &'static str {
+    "After a test use"
+}
+
+#[cfg(test)]
+pub(crate) mod helpers;
+
+#[cfg(test)]
+mod tests {
+    fn fixture() -> &'static str {
+        "Test message"
+    }
+}
+
+fn after_the_tests() -> &'static str {
+    "After the tests"
+}
+"##;
+
+#[test]
+fn each_literal_is_named_by_the_innermost_item_around_it() {
+    let scan = scan_source(ITEM_FIXTURE);
+    let named: Vec<(&str, &str)> = scan
+        .literals
+        .iter()
+        .map(|literal| (literal.value.as_str(), literal.item.as_str()))
+        .filter(|(value, _)| value.ends_with("message") || value.starts_with("After"))
+        .collect();
+    assert_eq!(
+        named,
+        [
+            ("Enum message", "Failure"),
+            ("Struct message", "Lone"),
+            ("Const message", "LABEL"),
+            ("Static message", "NAME"),
+            ("Impl message", "Wrapper::fmt"),
+            ("Inner message", "outer::inner"),
+            ("Outer message", "outer"),
+            ("After a test use", "after_a_test_use"),
+            ("After the tests", "after_the_tests"),
+        ]
+    );
+    assert_eq!(scan.test_modules, ["helpers"]);
+}
+
+#[test]
+fn a_file_is_a_test_module_only_where_its_parent_declares_one() {
+    let root = Path::new("crate").join("src");
+    let lib = root.join("lib.rs");
+    assert!(is_in_test_module(&root.join("tests.rs"), &lib, "tests"));
+    assert!(is_in_test_module(
+        &root.join("tests").join("cases.rs"),
+        &lib,
+        "tests"
+    ));
+    assert!(!is_in_test_module(&root.join("tests.rs"), &lib, "helpers"));
+
+    let parent = root.join("watcher").join("handler.rs");
+    let child = root.join("watcher").join("handler").join("tests.rs");
+    assert!(is_in_test_module(&child, &parent, "tests"));
+    assert!(!is_in_test_module(
+        &root.join("watcher").join("tests.rs"),
+        &parent,
+        "tests"
+    ));
 }

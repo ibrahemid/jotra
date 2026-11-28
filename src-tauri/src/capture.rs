@@ -4,12 +4,16 @@
 //! The window is mechanism only. What the entry adds to Today's File is
 //! `jotra_core::capture`, and the append is `commands::capture`.
 
+use std::path::Path;
 use std::sync::Mutex;
 
+use jotra_storage::capture_draft;
 use tauri::{
     AppHandle, Manager, PhysicalPosition, WebviewUrl, WebviewWindow, WebviewWindowBuilder,
 };
 use tracing::{info, warn};
+
+use crate::state::AppState;
 
 /// The capture window's label. Every single-window path in the shell asks for
 /// `"main"` by name, so none of them reaches this one.
@@ -71,6 +75,65 @@ pub trait CaptureSurface {
 
 /// What was in front when the note was last shown, until it hides.
 static PREVIOUS: Mutex<Option<Previous>> = Mutex::new(None);
+
+/// The note's text as its page last sent it, until it is written to the data
+/// folder: when the note hides, and when the app quits.
+pub struct DraftSlot {
+    held: Mutex<Option<String>>,
+    writing: Mutex<()>,
+}
+
+impl DraftSlot {
+    pub const fn new() -> Self {
+        Self {
+            held: Mutex::new(None),
+            writing: Mutex::new(()),
+        }
+    }
+
+    /// Holds `text` until the next [`Self::write`].
+    pub fn hold(&self, text: String) {
+        *self.held.lock().unwrap_or_else(|e| e.into_inner()) = Some(text);
+    }
+
+    /// The text held, or the draft `dir` keeps when nothing is.
+    pub fn read(&self, dir: &Path) -> String {
+        let held = self.held.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        held.unwrap_or_else(|| capture_draft::read(dir))
+    }
+
+    /// Writes the held text to `dir`. Writes run one at a time, so a newer
+    /// text is never overwritten by an older one; a failed write keeps its
+    /// text held unless a newer one arrived.
+    pub fn write(&self, dir: &Path) {
+        let _writing = self.writing.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(text) = self.held.lock().unwrap_or_else(|e| e.into_inner()).take() else {
+            return;
+        };
+        if let Err(error) = capture_draft::write(dir, &text) {
+            warn!(%error, "the capture note's text could not be kept");
+            self.held
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .get_or_insert(text);
+        }
+    }
+}
+
+impl Default for DraftSlot {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// The running app's [`DraftSlot`].
+pub static DRAFT: DraftSlot = DraftSlot::new();
+
+/// Writes the note's text to the data folder, on the calling thread. The
+/// shutdown path calls it once nothing more can come from the page.
+pub fn write_draft(app: &AppHandle) {
+    DRAFT.write(&app.state::<AppState>().jotra_dir);
+}
 
 /// The capture chord: shows the note, or hides it when it is already in
 /// front, the way the summon chord toggles the window.
@@ -266,6 +329,8 @@ impl CaptureSurface for OsSurface<'_> {
                 warn!(%error, "the capture window could not be hidden");
             }
         }
+        let app = self.0.clone();
+        std::thread::spawn(move || write_draft(&app));
     }
 
     fn main_visible(&self) -> bool {
@@ -413,6 +478,44 @@ mod tests {
         fn activate(&self, token: i64) {
             self.asks.borrow_mut().push(format!("activate {token}"));
         }
+    }
+
+    #[test]
+    fn the_text_the_page_sent_reaches_the_data_folder_when_written() {
+        let dir = tempfile::tempdir().unwrap();
+        let slot = DraftSlot::new();
+        slot.hold("call the bank".into());
+        assert_eq!(slot.read(dir.path()), "call the bank");
+        assert_eq!(capture_draft::read(dir.path()), "");
+
+        slot.write(dir.path());
+        assert_eq!(capture_draft::read(dir.path()), "call the bank");
+        assert_eq!(DraftSlot::new().read(dir.path()), "call the bank");
+    }
+
+    #[test]
+    fn a_sent_note_leaves_no_draft_behind() {
+        let dir = tempfile::tempdir().unwrap();
+        let slot = DraftSlot::new();
+        slot.hold("call the bank".into());
+        slot.write(dir.path());
+        slot.hold(String::new());
+        slot.write(dir.path());
+        assert!(!capture_draft::path(dir.path()).exists());
+    }
+
+    #[test]
+    fn a_draft_that_cannot_be_written_stays_held_for_the_next_write() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(capture_draft::path(dir.path())).unwrap();
+        let slot = DraftSlot::new();
+        slot.hold("call the bank".into());
+        slot.write(dir.path());
+        assert_eq!(slot.read(dir.path()), "call the bank");
+
+        std::fs::remove_dir(capture_draft::path(dir.path())).unwrap();
+        slot.write(dir.path());
+        assert_eq!(capture_draft::read(dir.path()), "call the bank");
     }
 
     #[test]

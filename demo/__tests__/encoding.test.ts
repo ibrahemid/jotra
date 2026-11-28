@@ -145,6 +145,19 @@ describe("Reopen with Encoding on the demo", () => {
     expect(lossyCharacters(refusal)).toEqual({ encoding: "windows-1252", characters: ["😀"] });
   });
 
+  it("saves what the encoding cannot hold in UTF-8, which the note keeps", async () => {
+    const handle = backend();
+    const doc = await open(handle, LISBON);
+    await handle("reopen_with_encoding", { bufferId: doc.id, encoding: "windows-1252" });
+
+    await handle("save_buffer_as_utf8", { id: doc.id, content: "smile 😀\n" });
+
+    expect(((await handle("get_buffer", { id: doc.id })) as BufferDocument).encoding).toBe("UTF-8");
+    expect(await readText(handle, doc.id)).toBe("smile 😀\n");
+    await handle("save_buffer_content", { id: doc.id, content: "smile 😀 again\n" });
+    expect(await readText(handle, doc.id)).toBe("smile 😀 again\n");
+  });
+
   it("refuses an encoding the file is not text in, and the note keeps the one it had", async () => {
     const handle = backend();
     const doc = await open(handle, LISBON);

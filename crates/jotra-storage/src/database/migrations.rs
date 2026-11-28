@@ -124,6 +124,23 @@ fn applied_schema_versions(conn: &Connection) -> StorageResult<HashSet<i32>> {
     Ok(versions)
 }
 
+/// The migration versions this binary embeds that the database at `conn` has
+/// not recorded, in the order `MIGRATIONS` lists them.
+///
+/// The highest recorded version can equal [`binary_schema_version`] while a
+/// lower one is missing, since the runner applies a lower version merged after
+/// a higher one. A reader that compares only the highest version would take
+/// that database as current and read a table or column the missing migration
+/// adds.
+pub fn pending_schema_versions(conn: &Connection) -> StorageResult<Vec<i32>> {
+    let applied = applied_schema_versions(conn)?;
+    Ok(MIGRATIONS
+        .iter()
+        .map(|(version, _)| *version)
+        .filter(|version| !applied.contains(version))
+        .collect())
+}
+
 /// Applies every pending schema migration to `conn`.
 ///
 /// Migrations are embedded at compile time and tracked in a

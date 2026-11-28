@@ -51,6 +51,7 @@ vi.mock("../../services/tauri", () => ({
   showOpenFileDialog: vi.fn().mockResolvedValue(null),
   readBufferContent: vi.fn().mockResolvedValue(""),
   previewClose: vi.fn().mockResolvedValue(undefined),
+  getBuffer: vi.fn(),
 }));
 
 vi.mock("../../services/autosave", () => ({
@@ -70,8 +71,9 @@ vi.mock("../../stores/global/notifications", () => ({
   showToast: vi.fn(),
 }));
 
+const active = vi.hoisted(() => ({ window: null as unknown }));
 vi.mock("../../stores/global/window-registry", () => ({
-  windowRegistry: { getActive: () => null },
+  windowRegistry: { getActive: () => active.window },
 }));
 
 vi.mock("../../stores/global/notes", () => ({
@@ -83,7 +85,7 @@ vi.mock("../../stores/global/notes", () => ({
 }));
 
 import { bufferRegistry } from "../../stores/global/buffer-registry";
-import { confirmAndDeleteNote, noteIsDeletable } from "../../lib/note-actions";
+import { confirmAndDeleteNote, noteIsDeletable, saveNoteAsUtf8 } from "../../lib/note-actions";
 import * as api from "../../services/tauri";
 import { cancelAutosave } from "../../services/autosave";
 
@@ -92,6 +94,7 @@ const mockedApi = vi.mocked(api);
 describe("note operations", () => {
   beforeEach(async () => {
     vi.clearAllMocks();
+    active.window = null;
     mockedApi.listActiveBuffers.mockResolvedValue([doc()]);
     mockedApi.listHistory.mockResolvedValue([]);
     await bufferRegistry.load();
@@ -169,5 +172,30 @@ describe("note operations", () => {
     expect(mockedApi.createBuffer).not.toHaveBeenCalled();
     expect(created.id).toBe("n-2");
     expect(bufferRegistry.activeTabs().map((b) => b.id)).toEqual(["n-1", "n-2"]);
+  });
+
+  it("save_as_utf8_takes_the_row_that_names_the_new_encoding", async () => {
+    mockedApi.listActiveBuffers.mockResolvedValue([doc({ encoding: "windows-1252" })]);
+    await bufferRegistry.load();
+    const saveAsUtf8 = vi.fn().mockResolvedValue({ ok: true, failures: [] });
+    active.window = { editor: { saveAsUtf8 } };
+    mockedApi.getBuffer.mockResolvedValue(doc({ encoding: "UTF-8" }));
+
+    await saveNoteAsUtf8("n-1");
+
+    expect(saveAsUtf8).toHaveBeenCalledWith("n-1");
+    expect(bufferRegistry.buffers().find((b) => b.id === "n-1")?.encoding).toBe("UTF-8");
+  });
+
+  it("save_as_utf8_that_did_not_land_leaves_the_row_alone", async () => {
+    mockedApi.listActiveBuffers.mockResolvedValue([doc({ encoding: "windows-1252" })]);
+    await bufferRegistry.load();
+    const saveAsUtf8 = vi.fn().mockResolvedValue({ ok: false, failures: [] });
+    active.window = { editor: { saveAsUtf8 } };
+
+    await saveNoteAsUtf8("n-1");
+
+    expect(mockedApi.getBuffer).not.toHaveBeenCalled();
+    expect(bufferRegistry.buffers().find((b) => b.id === "n-1")?.encoding).toBe("windows-1252");
   });
 });

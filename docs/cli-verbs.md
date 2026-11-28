@@ -56,10 +56,10 @@ exit 1, as it is for a connected program.
 | `jotra search <query> [--limit N] [--json]` | files whose text matches, best match first (20 unless `--limit`) |
 | `jotra cat <file> [--json]` | the file's text, as written |
 | `jotra ls [<folder>] [--json]` | every file in the folder, or in one folder inside it |
-| `jotra append <file> [--json]` | adds piped stdin to the end of the file |
-| `jotra today [--append] [--no-open] [--json]` | opens today's file, creating it when the day has none |
+| `jotra append <file> [-] [--json]` | adds piped stdin to the end of the file |
+| `jotra today [--append [-]] [--no-open] [--json]` | opens today's file, creating it when the day has none |
 | `jotra open <name>[:<line>] [--wait] [--json]` | opens a file in the folder by name, at a line |
-| `jotra new [<name>] [--json]` | creates a file, holding piped stdin when there is any, and prints its path |
+| `jotra new [<name>] [-] [--json]` | creates a file, holding piped stdin when there is any, and prints its path |
 | `jotra rename <file> <new-name> [--json]` | renames a file inside its folder |
 | `jotra trash <file> [--json]` | moves a file to the trash and prints where it was |
 | `jotra mcp` | serves the folder to an MCP client over stdin and stdout |
@@ -118,9 +118,10 @@ under that name keeps its approvals; under any other name it is `jotra` with
 Code 1 covers: no file of that name, a name two files answer to, a file the
 index does not hold yet, an absent index, an index written under a different
 schema version than this build reads, a file outside the notes folder, a file
-over 2 MB for `cat` and `append`, a failed create, rename, trash or append, and
-an open Jotra did not take. Code 2 prints what was wrong and the usage on
-stderr. `append` and `today --append` with nothing piped exit 2. The
+over 2 MB for `cat` and `append`, a failed create, rename, trash or append, an
+open Jotra did not take, and an open stdin that sends nothing for 5 seconds
+without `-`. Code 2 prints what was wrong and the usage on stderr. `append` and
+`today --append` with nothing piped exit 2, as does `-` with nothing piped. The
 file-opening path uses the same codes: two folders at once, a file and a folder
 together, `--wait` on a folder, `--no-open` with a path, and `jotra -` with
 nothing piped exit 2.
@@ -346,6 +347,15 @@ to the day's file, `<yyyy-mm-dd>.<ext>`, found and minted by the rule the
 window's Today's File uses.
 
 `new` with piped stdin creates the file holding the text as piped.
+
+`new`, `append` and `today --append` write nothing before stdin is read to its
+end. A stdin that is closed or empty is read at once. On an open stdin the
+first byte has 5 seconds to come; once it has, the rest is read however long it
+takes. When nothing comes in 5 seconds, the command exits 1 with nothing
+written and stderr names the two ways out: pass `-` to wait for slow input, or
+close stdin. With `-` there is no limit: the command waits for stdin to close,
+and stderr says it is waiting once 5 seconds pass. Verbs that take no piped
+text never read stdin. A failed read exits 1 with nothing written.
 
 `new` with no name mints the name the window's New File mints,
 `jotra-<yymmdd>-<hhmm>` in local time (`jotra_core::notes::minted_stem`). A name

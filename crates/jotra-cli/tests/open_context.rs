@@ -183,9 +183,30 @@ fn sockets_of(pid: u32) -> Vec<String> {
         .collect()
 }
 
-#[cfg(not(any(target_os = "macos", target_os = "linux")))]
-fn sockets_of(_pid: u32) -> Vec<String> {
-    Vec::new()
+#[cfg(windows)]
+fn sockets_of(pid: u32) -> Vec<String> {
+    let system = std::env::var_os("SystemRoot").unwrap_or_else(|| "C:\\Windows".into());
+    let netstat = Path::new(&system).join("System32").join("netstat.exe");
+    let output = Command::new(netstat).arg("-ano").output().expect("netstat");
+    let pid = pid.to_string();
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .filter(|line| {
+            let mut fields = line.split_whitespace();
+            matches!(fields.next(), Some("TCP" | "UDP")) && fields.last() == Some(pid.as_str())
+        })
+        .map(str::to_string)
+        .collect()
+}
+
+#[test]
+fn the_socket_check_sees_a_socket_the_process_holds() {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("a socket");
+    assert!(
+        !sockets_of(std::process::id()).is_empty(),
+        "a bound listener is listed"
+    );
+    drop(listener);
 }
 
 #[test]

@@ -251,6 +251,32 @@ fn an_index_read_held_but_absent_says_the_index_is_not_there() {
 }
 
 #[test]
+fn an_index_missing_a_migration_below_its_highest_is_not_read() {
+    let fixture = fixture();
+    write_note(&fixture, "Launch.md", "see [[Plan]]\n");
+    build_index(&fixture);
+    let conn = open_database(&fixture.db).expect("open the database");
+    let skipped: i32 = conn
+        .query_row(
+            "SELECT version FROM schema_version ORDER BY version DESC LIMIT 1 OFFSET 1",
+            [],
+            |row| row.get(0),
+        )
+        .expect("a version below the highest");
+    conn.execute("DELETE FROM schema_version WHERE version = ?1", [skipped])
+        .expect("forget one migration");
+    drop(conn);
+
+    let host = indexed_host(&fixture, &[Capability::ReadIndex]);
+
+    assert!(!host.has_index());
+    assert_eq!(
+        host.note_links("Launch.md").expect_err("no current index"),
+        HostError::IndexUnavailable
+    );
+}
+
+#[test]
 fn list_notes_answers_in_path_order_and_stops_at_the_limit() {
     let fixture = fixture();
     write_note(&fixture, "Beta.md", "b\n");

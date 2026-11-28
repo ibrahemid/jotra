@@ -2,7 +2,6 @@ import { createSignal, Show, For, createEffect, createMemo, onCleanup } from "so
 import { spellingStore, entryKey } from "../../stores/global/spelling";
 import type { SpellingEntry } from "../../editor/spelling";
 import Button from "../Button/Button";
-import { showToast } from "../../stores/global/notifications";
 import "./SpellingPreview.css";
 
 // Non-modal overlay listing every flagged range as `wrong → fix`, with
@@ -57,9 +56,8 @@ export default function SpellingPreview() {
 
   function apply() {
     const chosen = rows().filter((e) => isFixable(e) && selected().has(entryKey(e)));
-    const fixed = spellingStore.applyEntries(chosen);
+    spellingStore.applyEntries(chosen);
     closeSpellingPreview();
-    if (fixed > 0) showToast(`Fixed ${fixed} word${fixed === 1 ? "" : "s"}`, "info");
   }
 
   async function ignore(entry: SpellingEntry) {

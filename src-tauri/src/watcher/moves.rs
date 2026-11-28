@@ -16,11 +16,14 @@ use jotra_core::text_encoding::TextEncoding;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use jotra_core::hash::Sha256Digest;
+use jotra_core::note_history::VersionKey;
 use jotra_core::notes::guard::DiskState;
 use jotra_core::notes::identity::{FileIdentity, IdentityProbe};
 use jotra_core::notes::Writer;
 use jotra_core::watcher::pending::RemovalHolds;
 use jotra_storage::paths::file_name_only;
+use jotra_storage::write_lock::WriteLock;
 use tauri::{AppHandle, Manager};
 
 use crate::state::AppState;
@@ -310,12 +313,29 @@ impl NoteFiles for SharedNoteFiles {
 
 /// What wrote `bytes` into the note at `path`, as the version store records
 /// it. Reads the store only; never the buffer store, and never the file.
+///
+/// A writer keeps the version of what it landed before it lets go of the data
+/// folder's write lock. Bytes with no version yet are asked about again once
+/// the lock is had, so a version kept slower than the watcher's window still
+/// names its writer, and bytes nobody versions cost one more read.
 pub(crate) fn writer_of_file(state: &AppState, path: &Path, bytes: &[u8]) -> Option<Writer> {
     let key = state.note_history.key_for(path)?;
-    match state
-        .note_history
-        .writer_of(&key, jotra_core::hash::sha256_bytes(bytes))
-    {
+    let digest = jotra_core::hash::sha256_bytes(bytes);
+    stored_writer(state, &key, digest, path).or_else(|| {
+        let _held = WriteLock::in_data_folder(&state.jotra_dir).hold()?;
+        stored_writer(state, &key, digest, path)
+    })
+}
+
+/// The writer the version store records for `digest` as the note's newest
+/// version, or `None` when it records none or could not be read.
+fn stored_writer(
+    state: &AppState,
+    key: &VersionKey,
+    digest: Sha256Digest,
+    path: &Path,
+) -> Option<Writer> {
+    match state.note_history.writer_of(key, digest) {
         Ok(stored) => stored.as_deref().and_then(Writer::from_stored),
         Err(error) => {
             tracing::warn!(
@@ -371,7 +391,8 @@ pub enum MoveOutcome {
 /// The store lock is released before the folder watch is taken. The save path
 /// takes them in that order — a first save attaches a file and then follows it
 /// — so taking them the other way round here is how a watcher thread and a
-/// keystroke deadlock.
+/// keystroke deadlock. The text the index records for the file is read before
+/// the store is taken.
 ///
 /// The bytes did not move, so the record of what Jotra last read or wrote
 /// stays as it is, size and modification time with it. Reading again would
@@ -389,19 +410,27 @@ fn apply_move(state: &AppState, note_id: &str, from: &Path, to: &Path) -> MoveOu
         );
         return MoveOutcome::Failed;
     };
+    let Ok(doc) = state.lock_store().get(note_id) else {
+        return MoveOutcome::Failed;
+    };
+    if doc.source_path.as_deref() == Some(destination) {
+        return MoveOutcome::AlreadyThere;
+    }
+    let text = jotra_storage::buffer_store::indexable_text_at(&doc, to);
     {
-        let Ok(store) = state.store.lock() else {
-            return MoveOutcome::Failed;
-        };
+        let store = state.lock_store();
         let Ok(doc) = store.get(note_id) else {
             return MoveOutcome::Failed;
         };
         if doc.source_path.as_deref() == Some(destination) {
             return MoveOutcome::AlreadyThere;
         }
-        if let Err(e) =
-            store.rename_to_file(note_id, destination, &crate::commands::notes::note_name(to))
-        {
+        if let Err(e) = store.rename_to_file(
+            note_id,
+            destination,
+            &crate::commands::notes::note_name(to),
+            &text,
+        ) {
             tracing::warn!(note = %note_id, error = %e, "a note's row could not follow its file");
             return MoveOutcome::Failed;
         }
@@ -411,6 +440,7 @@ fn apply_move(state: &AppState, note_id: &str, from: &Path, to: &Path) -> MoveOu
     }
     state.follow_note_path(note_id, to);
     state.observe_source_file(note_id, to);
+    crate::instance::tab_moved(state, from, to);
     tracing::info!(
         note = %note_id,
         from = %file_name_only(&from.to_string_lossy()),

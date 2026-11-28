@@ -9,6 +9,8 @@ function setup(overrides: Partial<CaptureCalls> = {}) {
     append: vi.fn(async () => ({ name: "2026-10-15.txt", added: true })),
     target: vi.fn(async () => "2026-10-15.txt"),
     close: vi.fn(async () => {}),
+    draft: vi.fn(async () => ""),
+    keep: vi.fn(async () => {}),
     ...overrides,
   };
   const note = createRoot(() => createCaptureNoteStore(fake));
@@ -20,6 +22,12 @@ function setup(overrides: Partial<CaptureCalls> = {}) {
 const settle = () => new Promise<void>((done) => setTimeout(done, 0));
 
 describe("CaptureNote", () => {
+  it("shows the text it held when the app last quit", async () => {
+    const { field } = setup({ draft: vi.fn(async () => "call the bank") });
+    await settle();
+    expect(field.value).toBe("call the bank");
+  });
+
   it("takes the keyboard and names the file the line goes to", async () => {
     const { field, view } = setup();
     await settle();

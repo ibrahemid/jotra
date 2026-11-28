@@ -118,7 +118,7 @@ fn write_config_text(state: &AppState, contents: &str) -> Result<(), String> {
     state
         .config_store
         .write_serialized(contents)
-        .map_err(|e| e.to_string())
+        .map_err(|e| crate::commands::buffer::save_failure_message(&e))
 }
 
 /// Takes a frontend write into the live config and answers what belongs on

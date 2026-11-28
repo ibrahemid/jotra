@@ -80,13 +80,27 @@ openssl_is_3() {
   return 1
 }
 
+# minisign signs a BLAKE2b-512 digest; an OpenSSL in FIPS mode has none.
+openssl_has_blake2() {
+  printf '' | openssl dgst -blake2b512 >/dev/null 2>&1
+}
+
 pick_verifier() {
   if have minisign; then
     echo minisign
-  elif have openssl && openssl_is_3; then
+  elif have openssl && openssl_is_3 && openssl_has_blake2; then
     echo openssl
   else
     echo none
+  fi
+}
+
+# Prints what to install when pick_verifier finds none.
+get_missing_verifier() {
+  if have openssl && openssl_is_3; then
+    echo "this OpenSSL has no BLAKE2b-512 digest (FIPS mode turns it off), so install minisign"
+  else
+    echo "install minisign or OpenSSL 3.0 or later"
   fi
 }
 
@@ -204,7 +218,7 @@ main() {
   if [ "${VERIFIER}" = none ]; then
     SKIP_VARIABLE="$(get_signature_skip_variable)"
     if [ -z "${SKIP_VARIABLE}" ]; then
-      fail "cannot check the release signature: install minisign or OpenSSL 3.0 or later and run this again. To install without checking the signature, run it with JOTRA_INSTALL_SKIP_SIGNATURE=1."
+      fail "cannot check the release signature: $(get_missing_verifier) and run this again. To install without checking the signature, run it with JOTRA_INSTALL_SKIP_SIGNATURE=1."
     fi
     echo "jotra install: ${SKIP_VARIABLE}=1 is set, so the release signature is not checked." >&2
   else

@@ -1,6 +1,6 @@
 import { createSignal, Show } from "solid-js";
 import { saveStatusStore } from "../../stores/global/save-status";
-import { saveCopyOfNote } from "../../lib/note-actions";
+import { saveCopyOfNote, saveNoteAsUtf8 } from "../../lib/note-actions";
 import { useWindow } from "../WindowProvider/WindowProvider";
 import Button from "../Button/Button";
 import "./EditorBar.css";
@@ -8,6 +8,8 @@ import "./EditorBar.css";
 // The code for a file whose bytes are not on this machine. Asking the file
 // before writing again is what stops a press landing on a placeholder.
 const ERR_FILE_NOT_DOWNLOADED = "ERR_FILE_NOT_DOWNLOADED";
+// Characters the file's encoding has no bytes for; UTF-8 has bytes for all (ADR-049).
+const ERR_ENCODING_LOSSY = "ERR_ENCODING_LOSSY";
 
 /**
  * The bar a note carries while its text is not on disk.
@@ -65,6 +67,15 @@ export default function SaveFailureBar(props: { noteId: string | null }) {
     }
   }
 
+  async function saveAsUtf8(id: string) {
+    setRetryingNote(id);
+    try {
+      await saveNoteAsUtf8(id);
+    } finally {
+      setRetryingNote((current) => (current === id ? null : current));
+    }
+  }
+
   return (
     <Show when={failed()}>
       {(current) => (
@@ -87,6 +98,16 @@ export default function SaveFailureBar(props: { noteId: string | null }) {
                 }
               >
                 Try again
+              </Button>
+            </Show>
+            <Show
+              when={current().reason?.code === ERR_ENCODING_LOSSY && !heldForAnswer()}
+            >
+              <Button
+                disabled={retrying()}
+                onClick={() => void saveAsUtf8(props.noteId!)}
+              >
+                Save as UTF-8
               </Button>
             </Show>
             <Button onClick={() => void saveCopyOfNote(props.noteId!)}>Save a copy…</Button>

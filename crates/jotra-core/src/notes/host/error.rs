@@ -24,6 +24,14 @@ pub enum HostError {
         /// The path as the caller wrote it.
         path: String,
     },
+    /// A write names a file the notes folder skips: one inside `.obsidian`,
+    /// `.git` or another folder an app keeps for itself, or one under a
+    /// temp-file name. Nothing was written.
+    #[error("{path} is in a folder or under a name Jotra skips, such as .obsidian, so it was left alone")]
+    SkippedName {
+        /// The path as the caller wrote it.
+        path: String,
+    },
     /// The index is absent, unreadable, or at another version.
     #[error("the index is not readable")]
     IndexUnavailable,
@@ -55,7 +63,9 @@ pub enum HostError {
         path: String,
     },
     /// The note holds something other than what the caller last saw, so the
-    /// write was not made. The caller's text is beside the note.
+    /// write was not made. The caller's text is beside the note when
+    /// `conflict_copy` names it, and never for a write held for the person's
+    /// answer.
     #[error("{path} changed on disk after it was read")]
     Conflict {
         /// The path as the caller wrote it.
@@ -124,6 +134,16 @@ pub enum HostError {
         encoding: String,
         /// The characters it cannot hold, as `U+…` code points.
         characters: String,
+    },
+    /// The file is in an encoding with bytes that are not text in it, so an
+    /// edit of its text would write a replacement character over them.
+    /// Nothing was written (ADR-049).
+    #[error("{path} has bytes that are not {encoding} text")]
+    NotInEncoding {
+        /// The path as the caller wrote it.
+        path: String,
+        /// The encoding's name.
+        encoding: String,
     },
     /// The write waited for the person, who discarded it in Jotra. Nothing was
     /// written (ADR-053).

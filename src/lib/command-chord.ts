@@ -9,8 +9,3 @@ export function commandBinding(commandId: string): string | undefined {
 export function commandChord(commandId: string): string {
   return formatKeybinding(commandBinding(commandId));
 }
-
-export function withChord(label: string, commandId: string): string {
-  const chord = commandChord(commandId);
-  return chord ? `${label} ${chord}` : label;
-}

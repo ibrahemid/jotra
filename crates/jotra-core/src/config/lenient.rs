@@ -8,7 +8,7 @@
 
 use serde::Serialize;
 
-use super::JotraConfig;
+use super::{JotraConfig, NotesConfig};
 
 /// One value in `config.toml` the startup read could not use.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -37,7 +37,9 @@ impl JotraConfig {
     ///
     /// A file that reads in full is exactly [`JotraConfig::parse`]. One that is
     /// not TOML runs on [`JotraConfig::default`] with one diagnostic at the
-    /// line the parser stopped on. Otherwise each value that fails is found by
+    /// line the parser stopped on, apart from `notes.root`, which is read from
+    /// the line that holds it ([`NotesConfig::root_from_config_text`]), so the
+    /// launch never moves the notes folder. Otherwise each value that fails is found by
     /// reading it on its own, removed, and named; what is left is read as a
     /// whole, so a removed value falls back to what a file without it reads
     /// as, and the tables around it keep their other values.
@@ -102,16 +104,22 @@ impl JotraConfig {
                     message: error.message().trim().to_string(),
                 });
                 LenientConfig {
-                    config: JotraConfig::default(),
+                    config: Self::defaults_keeping_notes_root(text),
                     diagnostics,
                 }
             }
         }
     }
 
+    fn defaults_keeping_notes_root(text: &str) -> JotraConfig {
+        let mut config = JotraConfig::default();
+        config.notes.root = NotesConfig::root_from_config_text(text);
+        config
+    }
+
     fn unreadable(text: &str, error: &toml::de::Error) -> LenientConfig {
         LenientConfig {
-            config: JotraConfig::default(),
+            config: Self::defaults_keeping_notes_root(text),
             diagnostics: vec![ConfigDiagnostic {
                 key: String::new(),
                 line: error.span().map_or(1, |span| line_at(text, span.start)),

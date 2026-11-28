@@ -61,6 +61,15 @@ function createCommandUsageStore() {
       await api.recordCommandUses(uses);
       writeFailureReported = false;
     } catch {
+      // Put back for the next write, added to any recorded while this one was out.
+      for (const use of uses) {
+        const queued = pending.get(use.id);
+        pending.set(use.id, {
+          id: use.id,
+          count: use.count + (queued?.count ?? 0),
+          last_used_ms: Math.max(use.last_used_ms, queued?.last_used_ms ?? 0),
+        });
+      }
       if (writeFailureReported) return;
       writeFailureReported = true;
       logFailure("command usage could not be written");

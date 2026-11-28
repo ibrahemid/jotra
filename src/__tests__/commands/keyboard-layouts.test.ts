@@ -123,6 +123,26 @@ describe("chords on a non-Latin layout", () => {
     expect(ran).toEqual(["editor.toggleComment"]);
   });
 
+  it("leaves Cmd+? on a US layout to the system: the Shift+/ alias is for layouts where / needs Shift", () => {
+    hostIs("MacIntel");
+    command("editor.toggleComment", "CmdOrCtrl+/", ["CmdOrCtrl+Shift+/"]);
+    rebuildKeyMap();
+
+    const help = keyEvent({ key: "?", code: "Slash", metaKey: true, shiftKey: true });
+    expect(handleKeyDown(help)).toBe(false);
+    expect(help.preventDefault).not.toHaveBeenCalled();
+    expect(ran).toEqual([]);
+  });
+
+  it("reaches a shifted punctuation chord by the key's position", () => {
+    hostIs("Win32");
+    command("fold.here", "CmdOrCtrl+Shift+[");
+    rebuildKeyMap();
+
+    handleKeyDown(keyEvent({ key: "{", code: "BracketLeft", ctrlKey: true, shiftKey: true }));
+    expect(ran).toEqual(["fold.here"]);
+  });
+
   it("reaches a shifted digit chord the character misses", () => {
     hostIs("MacIntel");
     command("preview.resetRatio", "CmdOrCtrl+Shift+0");

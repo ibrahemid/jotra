@@ -21,6 +21,7 @@ export default function CaptureNote(props: { note?: typeof captureNoteStore }) {
     const onLeft = () => void note.dismiss();
     window.addEventListener("focus", onShown);
     window.addEventListener("blur", onLeft);
+    void note.restoreDraft();
     onShown();
     onCleanup(() => {
       window.removeEventListener("focus", onShown);

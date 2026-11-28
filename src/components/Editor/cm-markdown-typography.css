@@ -268,7 +268,8 @@
 
 /* The heading fold control. The anchor sits at the start of the heading line
    and takes no width and no height, so the line keeps its box and CodeMirror's
-   height cache stays right; the chevron hangs to its left in the margin. */
+   height cache stays right; the chevron hangs before it in the margin, on the
+   right of a right-to-left heading. */
 .cm-editor .cm-md-fold {
   position: relative;
   display: inline-block;
@@ -293,11 +294,18 @@
 .cm-editor .cm-md-fold[data-folded] .cm-md-fold-control {
   opacity: 1;
 }
+.cm-editor .cm-md-fold[data-dir="rtl"] .cm-md-fold-control {
+  right: auto;
+  left: 0.3em;
+}
 .cm-editor .cm-md-fold-control:hover {
   color: var(--jotra-fg-muted);
 }
 .cm-editor .cm-md-fold[data-folded] .cm-fold-chevron {
   transform: rotate(-90deg);
+}
+.cm-editor .cm-md-fold[data-folded][data-dir="rtl"] .cm-fold-chevron {
+  transform: rotate(90deg);
 }
 
 /* Blocks drawn in place while the caret is outside them: a table, display

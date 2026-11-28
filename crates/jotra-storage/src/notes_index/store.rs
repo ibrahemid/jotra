@@ -11,6 +11,7 @@ use jotra_core::notes::links::{self, Resolution};
 use jotra_core::search::{SearchHit, SearchQuery};
 use jotra_core::workspace::file_search::FileHit;
 use rusqlite::Connection;
+use tracing::warn;
 
 use super::queries;
 use super::reconcile::{self, IndexAccess, RecentWrites, ReconcileOutcome};
@@ -23,6 +24,7 @@ use super::{
 };
 use crate::database::connection::{open_database, open_database_read_only};
 use crate::errors::StorageResult;
+use crate::paths::file_name_only;
 
 /// Read connections kept open between commands. A command that finds none
 /// idle opens another; one that finds the pool full closes its own.
@@ -53,16 +55,31 @@ const IDLE_READERS: usize = 4;
 /// A write made through the store while a walk is under way is recorded, and
 /// the walk leaves that path alone: it neither writes over it with what it
 /// read before nor removes it at its end ([`RecentWrites`]).
+///
+/// The buffer store writes the index under its own lock, so its writes never
+/// wait for the writer: one that finds it busy is left here and returns
+/// ([`NotesIndexStore::upsert_or_defer`]). The write holding the writer makes
+/// it before letting go, or, when it arrived after that, the first thread to
+/// find the writer free does.
 pub struct NotesIndexStore {
     writer: Writer<Connection>,
     readers: ReaderPool,
     names: RwLock<NameCache>,
     recent_writes: Mutex<RecentWrites>,
+    /// Writes left while the writer was busy, oldest first, one per path.
+    deferred: Mutex<Vec<(String, DeferredWrite)>>,
     /// A store opened by another process, which only reads: its names are
     /// checked against the database before every use, because the app writes
     /// it without telling this one.
     read_only: bool,
     generation: AtomicU64,
+}
+
+/// An index write the buffer store left because the writer was busy.
+#[derive(Debug)]
+enum DeferredWrite {
+    Upsert { note: IndexedNote, content: String },
+    Forget,
 }
 
 /// The names, and the names version they match.
@@ -212,6 +229,7 @@ impl NotesIndexStore {
             },
             names: RwLock::new(NameCache::default()),
             recent_writes: Mutex::default(),
+            deferred: Mutex::default(),
             read_only,
             generation: AtomicU64::new(0),
         }
@@ -221,6 +239,13 @@ impl NotesIndexStore {
     /// [`crate::database::migrations::applied_schema_version`].
     pub fn schema_version(&self) -> StorageResult<i32> {
         self.read(crate::database::migrations::applied_schema_version)
+    }
+
+    /// The migration versions this build embeds that the open database has
+    /// not recorded. See
+    /// [`crate::database::migrations::pending_schema_versions`].
+    pub fn pending_schema_versions(&self) -> StorageResult<Vec<i32>> {
+        self.read(crate::database::migrations::pending_schema_versions)
     }
 
     /// Which folder the index is describing, as a number that changes whenever
@@ -247,11 +272,12 @@ impl NotesIndexStore {
     /// left, and a walk that started before the move writes and removes
     /// nothing more: a row it wrote now would be keyed under the old folder.
     pub fn rekey_root(&self, from: &Path, to: &Path) -> StorageResult<usize> {
-        let writer = self.writer();
-        let changed = upsert::rekey(&writer, from, to)?;
-        recover(self.recent_writes.lock()).moved_every_path();
-        self.load_names(&writer)?;
-        Ok(changed)
+        self.holding(self.writer(), |writer| {
+            let changed = upsert::rekey(writer, from, to)?;
+            recover(self.recent_writes.lock()).moved_every_path();
+            self.load_names(writer)?;
+            Ok(changed)
+        })
     }
 
     /// Up to `limit` ranked content hits. See [`super::NotesIndex::search_hits`].
@@ -412,9 +438,11 @@ impl NotesIndexStore {
     /// next file rather than meeting a database `f` keeps busy: the startup
     /// maintenance, whose `VACUUM` holds the database's write lock for as long
     /// as it takes.
+    ///
+    /// A write the buffer store asked for meanwhile is made once `f` returns,
+    /// before the writer is let go.
     pub fn holding_writes<R>(&self, f: impl FnOnce() -> R) -> R {
-        let _writer = self.writer();
-        f()
+        self.holding(self.writer(), |_| f())
     }
 
     /// The line a heading anchor is on. See
@@ -433,6 +461,30 @@ impl NotesIndexStore {
     pub fn upsert(&self, note: &IndexedNote, content: &str) -> StorageResult<()> {
         self.write_ahead(|conn, names| {
             upsert::write_file(conn, names, note, content, Expect::Anything)?;
+            recover(self.recent_writes.lock()).wrote(&note.path);
+            Ok(())
+        })
+    }
+
+    /// [`NotesIndexStore::upsert`] for a caller holding a lock of its own,
+    /// which must not wait for the writer: the buffer store.
+    ///
+    /// When the writer is busy the write is left for the write holding it,
+    /// which makes it before letting go, and this returns at once. A later
+    /// write of the same path left meanwhile replaces it.
+    pub fn upsert_or_defer(&self, note: &IndexedNote, content: &str) -> StorageResult<()> {
+        let Some(writer) = self.writer.try_lock() else {
+            self.defer(
+                note.path.clone(),
+                DeferredWrite::Upsert {
+                    note: note.clone(),
+                    content: content.to_owned(),
+                },
+            );
+            return Ok(());
+        };
+        self.holding(writer, |conn| {
+            upsert::write_file(conn, &self.names, note, content, Expect::Anything)?;
             recover(self.recent_writes.lock()).wrote(&note.path);
             Ok(())
         })
@@ -477,6 +529,21 @@ impl NotesIndexStore {
         self.forget_key(&index_key(path))
     }
 
+    /// [`NotesIndexStore::forget_path`] for a caller that must not wait for
+    /// the writer, the way [`NotesIndexStore::upsert_or_defer`] is.
+    pub fn forget_path_or_defer(&self, path: &Path) -> StorageResult<()> {
+        let key = index_key(path);
+        let Some(writer) = self.writer.try_lock() else {
+            self.defer(key, DeferredWrite::Forget);
+            return Ok(());
+        };
+        self.holding(writer, |conn| {
+            upsert::forget_file(conn, &self.names, &key)?;
+            recover(self.recent_writes.lock()).wrote(&key);
+            Ok(())
+        })
+    }
+
     /// [`NotesIndexStore::forget_path`] for a row whose key the caller read
     /// while the file was still under it.
     ///
@@ -519,7 +586,79 @@ impl NotesIndexStore {
         &self,
         f: impl FnOnce(&Connection, &RwLock<NameCache>) -> StorageResult<R>,
     ) -> StorageResult<R> {
-        f(&self.writer(), &self.names)
+        self.holding(self.writer(), |conn| f(conn, &self.names))
+    }
+
+    /// Runs `f` on the writer `writer` holds, making the writes left while it
+    /// was busy before `f` and again after it, and then, with the writer let
+    /// go, any left in between.
+    fn holding<G: Deref<Target = Connection>, R>(
+        &self,
+        writer: G,
+        f: impl FnOnce(&Connection) -> R,
+    ) -> R {
+        self.make_deferred(&writer);
+        let result = f(&writer);
+        self.make_deferred(&writer);
+        drop(writer);
+        self.catch_up();
+        result
+    }
+
+    /// Leaves `write` of the index key `key` for the write holding the writer,
+    /// in place of any left before it for that key.
+    ///
+    /// It counts as written now ([`RecentWrites`]): a walk that read the file
+    /// before this leaves the path to it, and one that reads it after writes
+    /// over it with what it read.
+    fn defer(&self, key: String, write: DeferredWrite) {
+        recover(self.recent_writes.lock()).wrote(&key);
+        {
+            let mut deferred = recover(self.deferred.lock());
+            deferred.retain(|(waiting, _)| *waiting != key);
+            deferred.push((key, write));
+        }
+        self.catch_up();
+    }
+
+    /// Makes the writes left so far, on the writer the caller holds.
+    ///
+    /// A write that fails is logged and dropped; the next walk finds the row
+    /// out of step with its file and writes it.
+    fn make_deferred(&self, writer: &Connection) {
+        let deferred = std::mem::take(&mut *recover(self.deferred.lock()));
+        for (key, write) in deferred {
+            let made = match write {
+                DeferredWrite::Upsert { note, content } => {
+                    upsert::write_file(writer, &self.names, &note, &content, Expect::Anything)
+                        .map(|_| ())
+                }
+                DeferredWrite::Forget => upsert::forget_file(writer, &self.names, &key),
+            };
+            if let Err(error) = made {
+                warn!(
+                    note = %file_name_only(&key),
+                    error = %error,
+                    "a deferred notes index write failed"
+                );
+            }
+        }
+    }
+
+    /// Makes the writes left so far while the writer is free, and leaves them
+    /// to the write holding it when it is not: that write makes them before
+    /// letting go, or meets this again once it has.
+    fn catch_up(&self) {
+        while self.has_deferred() {
+            let Some(writer) = self.writer.try_lock() else {
+                return;
+            };
+            self.make_deferred(&writer);
+        }
+    }
+
+    fn has_deferred(&self) -> bool {
+        !recover(self.deferred.lock()).is_empty()
     }
 
     fn names_cache(&self) -> RwLockReadGuard<'_, NameCache> {
@@ -556,10 +695,10 @@ impl NotesIndexStore {
     /// time.
     fn check_names(&self) -> StorageResult<()> {
         if self.read_only || self.names_cache().version.is_none() {
-            return self.sync_names(&self.writer());
+            return self.holding(self.writer(), |writer| self.sync_names(writer));
         }
         match self.writer.try_lock() {
-            Some(writer) => self.sync_names(&writer),
+            Some(writer) => self.holding(writer, |writer| self.sync_names(writer)),
             None => Ok(()),
         }
     }
@@ -577,7 +716,7 @@ impl IndexAccess for NotesIndexStore {
         &self,
         f: impl FnOnce(&Connection, &Self::Names) -> StorageResult<R>,
     ) -> StorageResult<R> {
-        f(&self.writer.lock_for_walk(), &self.names)
+        self.holding(self.writer.lock_for_walk(), |conn| f(conn, &self.names))
     }
 
     fn with_names<R>(&self, f: impl FnOnce(&NameIndex) -> R) -> StorageResult<R> {
@@ -602,8 +741,8 @@ mod tests {
     use crate::buffer_store::BufferStore;
     use crate::database::connection::open_database;
     use crate::database::migrations::run_migrations;
-    use crate::notes_index::index_key;
     use crate::notes_index::reconcile::IndexAccess;
+    use crate::notes_index::{index_key, IndexedNote};
 
     /// The walk holds the writer for one file when Cmd+N's write arrives. The
     /// walk's next write finds the new note recorded: it let Cmd+N go first
@@ -782,5 +921,110 @@ mod tests {
             loads,
             "a save that adds no note read the folder's names again"
         );
+    }
+
+    fn open_index(dir: &tempfile::TempDir) -> (NotesIndexStore, std::path::PathBuf) {
+        let db_path = dir.path().join("jotra.db");
+        run_migrations(&open_database(&db_path).expect("open_database")).expect("migrations");
+        let notes = dir.path().join("notes");
+        std::fs::create_dir_all(&notes).expect("notes dir");
+        (NotesIndexStore::open(&db_path).expect("index"), notes)
+    }
+
+    fn hits(index: &NotesIndexStore, word: &str) -> usize {
+        let query = jotra_core::search::to_prefix_match(word).expect("query");
+        let terms = jotra_core::search::search_terms(word);
+        index.search_hits(&query, &terms, 10).expect("search").len()
+    }
+
+    fn noted(path: &Path, content: &str) -> IndexedNote {
+        std::fs::write(path, content).expect("write note");
+        IndexedNote::from_file(path).expect("metadata")
+    }
+
+    /// A write that holds the writer, the startup `VACUUM`'s: the buffer
+    /// store's write returns without waiting for it and lands as it lets go.
+    #[test]
+    fn an_upsert_that_finds_the_writer_busy_returns_and_lands_once_it_is_let_go() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let (index, notes) = open_index(&dir);
+        let note = noted(&notes.join("Plan.md"), "# Plan\n\nkestrel\n");
+
+        let during = index.holding_writes(|| {
+            index
+                .upsert_or_defer(&note, "# Plan\n\nkestrel\n")
+                .expect("upsert");
+            hits(&index, "kestrel")
+        });
+
+        assert_eq!(during, 0, "the write waited for the writer");
+        assert_eq!(hits(&index, "kestrel"), 1);
+    }
+
+    #[test]
+    fn a_forget_that_finds_the_writer_busy_returns_and_lands_once_it_is_let_go() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let (index, notes) = open_index(&dir);
+        let path = notes.join("Plan.md");
+        let note = noted(&path, "# Plan\n\nkestrel\n");
+        index
+            .upsert_or_defer(&note, "# Plan\n\nkestrel\n")
+            .expect("upsert");
+        assert_eq!(hits(&index, "kestrel"), 1);
+
+        let during = index.holding_writes(|| {
+            index.forget_path_or_defer(&path).expect("forget");
+            hits(&index, "kestrel")
+        });
+
+        assert_eq!(during, 1, "the forget waited for the writer");
+        assert_eq!(hits(&index, "kestrel"), 0);
+    }
+
+    /// Two saves of one note while the writer is busy: the index ends with
+    /// the later text.
+    #[test]
+    fn the_later_of_two_writes_left_for_one_note_is_the_one_that_lands() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let (index, notes) = open_index(&dir);
+        let path = notes.join("Plan.md");
+
+        index.holding_writes(|| {
+            let first = noted(&path, "# Plan\n\nkestrel\n");
+            index
+                .upsert_or_defer(&first, "# Plan\n\nkestrel\n")
+                .expect("first");
+            let second = noted(&path, "# Plan\n\nmarzipan\n");
+            index
+                .upsert_or_defer(&second, "# Plan\n\nmarzipan\n")
+                .expect("second");
+        });
+
+        assert_eq!(hits(&index, "kestrel"), 0);
+        assert_eq!(hits(&index, "marzipan"), 1);
+    }
+
+    /// A write left while a walk holds the writer for a file lands before
+    /// the walk lets it go.
+    #[test]
+    fn a_write_left_beside_a_walk_lands_before_the_walk_lets_the_writer_go() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let (index, notes) = open_index(&dir);
+        let note = noted(&notes.join("Plan.md"), "# Plan\n\nkestrel\n");
+
+        let recorded: i64 = IndexAccess::write(&index, |conn, _| {
+            index
+                .upsert_or_defer(&note, "# Plan\n\nkestrel\n")
+                .expect("upsert");
+            Ok(conn.query_row(
+                "SELECT COUNT(*) FROM files WHERE path = ?1",
+                [&note.path],
+                |row| row.get(0),
+            )?)
+        })
+        .expect("the walk's write");
+
+        assert_eq!(recorded, 0, "the write waited for the walk");
+        assert_eq!(hits(&index, "kestrel"), 1);
     }
 }

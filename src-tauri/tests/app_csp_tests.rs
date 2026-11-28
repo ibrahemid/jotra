@@ -91,13 +91,14 @@ fn no_form_posts_anywhere() {
 
 /// The frontend makes no fetch, XHR, WebSocket or EventSource request; the
 /// updater runs in Rust. The only connections are IPC, which WebView2 serves
-/// as `http://ipc.localhost`.
+/// as `http://ipc.localhost`. Not even the app's own origin: a script that got
+/// into the window cannot read the app's files back with `fetch`.
 #[test]
 fn connections_reach_only_the_ipc_origins() {
     for windows in [false, true] {
         assert_eq!(
             directive(&app_csp_for(windows), "connect-src"),
-            "'self' ipc: http://ipc.localhost"
+            "ipc: http://ipc.localhost"
         );
     }
 }

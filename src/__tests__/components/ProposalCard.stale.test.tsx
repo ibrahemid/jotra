@@ -7,7 +7,7 @@ import { render, cleanup, fireEvent, waitFor } from "@solidjs/testing-library";
 // dated copy beside the note every time it is pressed.
 
 type Handler = (payload: unknown) => void;
-type SavedListener = (bufferId: string, diskHash: string | null) => void;
+type SavedListener = Parameters<typeof onAutosaveSuccess>[0];
 
 const mocks = vi.hoisted(() => ({
   chatList: vi.fn(),
@@ -75,6 +75,7 @@ vi.mock("../../stores/global/notes", () => ({
 import ProposalCard from "../../components/Chat/ProposalCard";
 import { chatStore } from "../../stores/global/chat";
 import type { ChatConversation, ChatProposal } from "../../services/tauri";
+import type { onAutosaveSuccess } from "../../services/autosave";
 
 const PROPOSAL: ChatProposal = {
   path: "Launch.md",
@@ -118,7 +119,7 @@ function emit(kind: string, payload: unknown) {
 }
 
 function saveTab(id: string) {
-  for (const listener of [...bus.saved]) listener(id, "new-hash");
+  for (const listener of [...bus.saved]) listener(id, "new-hash", false, { source: "", generation: 1 });
 }
 
 async function flush() {

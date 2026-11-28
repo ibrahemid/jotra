@@ -14,6 +14,34 @@ use serde::{Deserialize, Serialize};
 /// writes nothing.
 pub const REVIEW_WAIT: Duration = Duration::from_secs(5 * 60);
 
+/// How long Codex waits for one tool call before it gives up on it, unless
+/// its own `tool_timeout_sec` setting says otherwise.
+pub const CODEX_TOOL_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// How much sooner than a program's own limit its held write stops waiting,
+/// so the program reads the answer before it gives up on the call.
+pub const PROGRAM_LIMIT_MARGIN: Duration = Duration::from_secs(5);
+
+/// The programs, by the name each sends, that give up on a tool call sooner
+/// than [`REVIEW_WAIT`], with how long each waits.
+pub const PROGRAM_TOOL_LIMITS: &[(&str, Duration)] = &[
+    ("codex", CODEX_TOOL_TIMEOUT),
+    ("codex-cli", CODEX_TOOL_TIMEOUT),
+    ("codex-mcp-client", CODEX_TOOL_TIMEOUT),
+];
+
+/// How long a held write from `program` waits for the person: [`REVIEW_WAIT`],
+/// or less than the program's own limit for one in [`PROGRAM_TOOL_LIMITS`], so
+/// nothing lands after the program has stopped waiting for the call.
+pub fn review_wait_for(program: &str) -> Duration {
+    PROGRAM_TOOL_LIMITS
+        .iter()
+        .find(|&&(name, _)| name == program)
+        .map_or(REVIEW_WAIT, |&(_, limit)| {
+            limit.saturating_sub(PROGRAM_LIMIT_MARGIN).min(REVIEW_WAIT)
+        })
+}
+
 /// What a held write would do to the file.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
@@ -129,6 +157,17 @@ mod tests {
         ] {
             assert_eq!(verdict(Err(reason)), Err(Refused::Unavailable(reason)));
         }
+    }
+
+    #[test]
+    fn a_program_that_gives_up_on_a_call_sooner_is_answered_before_it_does() {
+        for codex in ["codex", "codex-cli", "codex-mcp-client"] {
+            let wait = review_wait_for(codex);
+            assert!(wait < CODEX_TOOL_TIMEOUT, "{codex} waits {wait:?}");
+            assert!(wait >= Duration::from_secs(30), "{codex} waits {wait:?}");
+        }
+        assert_eq!(review_wait_for("claude-code"), REVIEW_WAIT);
+        assert_eq!(review_wait_for("Codex"), REVIEW_WAIT);
     }
 
     #[test]

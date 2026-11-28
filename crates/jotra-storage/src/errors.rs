@@ -78,6 +78,15 @@ pub enum StorageError {
         conflict_copy: Option<String>,
     },
 
+    /// The file the write was built from was removed before the write landed.
+    /// Nothing was written: the bytes were made from text that is no longer
+    /// anywhere, and writing them would bring back a file someone removed.
+    #[error("the file was removed before the write landed: {path}")]
+    SourceRemoved {
+        /// The note's path.
+        path: String,
+    },
+
     /// The file's bytes are not on this machine, so there is nothing to
     /// compare a save against and nothing to write over (ADR-028 §5).
     ///
@@ -131,6 +140,12 @@ pub enum StorageError {
         /// The note's path.
         path: String,
     },
+
+    /// A thread panicked while it held the store, so nothing that lets the
+    /// preview run scripts or read files is granted until the app restarts
+    /// (ADR-045).
+    #[error("after an internal error, the preview runs no scripts and shows no embedded files until Jotra restarts")]
+    HeldThroughAPanic,
 
     /// A buffer was named that the store does not hold, so nothing was
     /// recorded for it.

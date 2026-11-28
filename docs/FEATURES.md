@@ -39,7 +39,7 @@ What Jotra does, at the level of detail that answers "does it do X".
 ## Editing
 
 - CodeMirror 6. A file's name decides its language, and a `.txt` or `.text` file stays plain text whatever it holds. Change Language in the palette picks another language for one file, and the file keeps it.
-- Word wrap, tab size and reading width, under Settings, Editor, apply to open files at once. Reading width keeps lines of prose to a set width; code files keep the full width.
+- Word wrap, tab size and reading width, under Settings, Editor, apply to open files at once. Reading width keeps lines of prose to the narrow, medium or wide width Line length picks; code files keep the full width.
 - The command palette opens on a double tap of `Shift` (Help > Command Palette). Typing a file's name there lists the file under the commands.
 - File > Open Folder (`Cmd+Option+O`) shows a folder's files in the sidebar. The tree draws only the rows on screen; it is one `Tab` stop, with the arrow keys, `Home`, `End` and typing a name to move inside it. A folder Jotra cannot read says so with Try again, and folders stay open across launches. Right-click on any row shows it in the file manager or copies its path; in Jotra's folder it also renames, moves to the Trash, or makes a new file in a folder.
 - Help holds Jotra Help (the guide on the site), Keyboard Shortcuts, What's New (the changelog at this version), Show Setup Again and Report an Issue (the bug form, with the version filled in).
@@ -88,7 +88,7 @@ Chat and Rewrite share one AI connection: Ollama, LM Studio, llama.cpp or Jan on
 - Spell check runs on this machine and is off until you turn it on. Code, URLs and identifiers stay unflagged.
 - A watched folder (Settings, Integrations) opens new files as they arrive. See [adr/018-watch-inbox.md](adr/018-watch-inbox.md).
 - The `jotra` command opens files, folders and piped text from a terminal, and answers questions about the folder. See [cli-verbs.md](cli-verbs.md).
-- On macOS and Windows, `jotra://open?path=Plan.md&line=12` opens a file in Jotra's folder at a line, from a browser or another program, and `jotra://new?name=Plan` opens a new tab. `writ://` links work the same way. A link opens only a file inside the folder and writes nothing. See [adr/052-writ-links.md](adr/052-writ-links.md).
+- `jotra://open?path=Plan.md&line=12` opens a file in Jotra's folder at a line, from a browser or another program, and `jotra://new?name=Plan` opens a new tab. `writ://` links work the same way. A link opens only a file inside the folder and writes nothing. See [adr/052-writ-links.md](adr/052-writ-links.md).
 - A folder written in Obsidian opens as it is: [what carries over](./importing-from-obsidian.md).
 - No account and no telemetry.
 - Each update is verified against Jotra's signing key before it installs, and the automatic check can be turned off under Settings, About. See [adr/007-in-app-updater.md](adr/007-in-app-updater.md).

@@ -185,6 +185,20 @@ impl UpdatePhase {
         Ok(next)
     }
 
+    /// The phase a check nobody asked for moves to, or `None` when it must
+    /// not start.
+    ///
+    /// Only [`UpdatePhase::Idle`] admits one. Every other phase is on screen
+    /// or in flight, and a silent check tells the frontend nothing until it
+    /// finds an update, so the screen would keep showing a phase the backend
+    /// had left.
+    pub fn start_silent_check(&self) -> Option<UpdatePhase> {
+        match self {
+            UpdatePhase::Idle => self.apply(UpdateEvent::CheckStarted).ok(),
+            _ => None,
+        }
+    }
+
     fn label(&self) -> &'static str {
         match self {
             UpdatePhase::Idle => "idle",

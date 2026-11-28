@@ -180,6 +180,39 @@ fn open_note_at(state: &AppState, path: &std::path::Path, content: &str) -> Stri
 }
 
 #[test]
+fn a_new_note_and_a_copy_wait_for_the_write_lock_without_holding_the_store() {
+    let dir = TempDir::new().expect("temp dir");
+    let state = make_state(&dir);
+    let elsewhere = dir.path().join("report.md");
+    let id = open_note_at(&state, &elsewhere, "the text");
+    let lock = jotra_storage::write_lock::WriteLock::in_data_folder(&state.jotra_dir);
+    let held = lock.hold().expect("the lock is free");
+
+    std::thread::scope(|scope| {
+        let created = scope.spawn(|| new_note_named_inner(&state, "Grocery list"));
+        let copied = scope.spawn(|| save_note_copy_inner(&state, &id, "the text plus more"));
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        assert!(
+            !created.is_finished() && !copied.is_finished(),
+            "a write landed while another writer held the data folder's lock"
+        );
+        assert!(
+            state.store.try_lock().is_ok(),
+            "a write waits for the lock holding the buffer store"
+        );
+        drop(held);
+        created
+            .join()
+            .expect("the create thread")
+            .expect("the note is made once the lock is free");
+        copied
+            .join()
+            .expect("the copy thread")
+            .expect("the copy is made once the lock is free");
+    });
+}
+
+#[test]
 fn a_named_note_takes_its_file_name_from_the_name() {
     let dir = TempDir::new().expect("temp dir");
     let state = make_state(&dir);
@@ -840,6 +873,7 @@ fn a_rename_the_row_cannot_follow_puts_the_file_back() {
     let refuse = |_: &jotra_storage::buffer_store::BufferStore,
                   _: &str,
                   _: &str,
+                  _: &str,
                   _: &str|
      -> Result<(), StorageError> {
         Err(StorageError::Consistency {
@@ -1026,6 +1060,52 @@ fn a_programs_write_reaches_the_tab_with_the_programs_name_and_an_unknown_one_wi
     let seen = external_events(&rx);
     assert_eq!(seen.len(), 1, "the tab must be told once, saw {seen:?}");
     assert_eq!(writer_named_by(&seen[0]), None);
+}
+
+#[test]
+fn a_programs_version_kept_after_the_watchers_window_still_names_the_program() {
+    // A program keeps the version of what it landed before it lets go of the
+    // write lock, so the watcher waits for the lock rather than report the
+    // change with nobody behind it.
+    let dir = TempDir::new().expect("temp dir");
+    let (state, rx) = watching_state(&dir);
+    state.note_history.set_notes_root(state.notes_root());
+
+    let doc = new_note_inner(&state).expect("new note");
+    let path = note_file(&state, &doc.id);
+    std::thread::sleep(APART);
+
+    let written = b"rewritten by a program that keeps its version slowly\n";
+    let held = jotra_storage::write_lock::WriteLock::in_data_folder(&state.jotra_dir)
+        .hold()
+        .expect("the write lock");
+    rewrite_from_outside(&path, written);
+    std::thread::sleep(APART * 2);
+    let key = state
+        .note_history
+        .key_for(&path)
+        .expect("a note in the folder");
+    state
+        .note_history
+        .capture(
+            &key,
+            written,
+            std::time::SystemTime::now(),
+            &WriteOrigin::Mcp {
+                client: "claude-code".to_string(),
+            },
+        )
+        .expect("the program's version");
+    drop(held);
+
+    let seen = external_events(&rx);
+    assert_eq!(seen.len(), 1, "the tab must be told once, saw {seen:?}");
+    assert_eq!(
+        writer_named_by(&seen[0]),
+        Some(Writer::Program {
+            name: "claude-code".to_string()
+        })
+    );
 }
 
 #[test]

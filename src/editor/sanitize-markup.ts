@@ -72,6 +72,12 @@ function fetchesFromCss(text: string): boolean {
   return CSS_FETCH.test(decoded) || (text.includes("\\") && CSS_URL.test(decoded));
 }
 
+// Attributes no engine reads as CSS or as a URL: text a reader or a screen
+// reader is shown, which may say "url(" without loading anything.
+function isTextOnly(attr: string): boolean {
+  return attr === "title" || attr === "alt" || attr.startsWith("aria-");
+}
+
 function clean(parent: Element | DocumentFragment): void {
   for (const element of Array.from(parent.children)) {
     const name = element.localName.toLowerCase();
@@ -85,7 +91,7 @@ function clean(parent: Element | DocumentFragment): void {
         attr.startsWith("on") ||
         attr === "srcset" ||
         (URL_ATTRIBUTES.has(attr) && !SAFE_URL.test(attribute.value.trim())) ||
-        fetchesFromCss(attribute.value)
+        (!isTextOnly(attr) && fetchesFromCss(attribute.value))
       ) {
         element.removeAttribute(attribute.name);
       }
@@ -100,6 +106,75 @@ function clean(parent: Element | DocumentFragment): void {
   }
 }
 
+const FRAGMENT_URL = /url\(\s*(["']?)#([^"')\s]+)\1\s*\)/g;
+const ID_REFERENCE_LISTS = new Set(["aria-labelledby", "aria-describedby", "aria-controls", "aria-owns"]);
+
+function everyElementIn(root: DocumentFragment): Element[] {
+  const found: Element[] = [];
+  const walk = (parent: Element | DocumentFragment) => {
+    for (const child of Array.from(parent.children)) {
+      found.push(child);
+      walk(child);
+    }
+  };
+  walk(root);
+  return found;
+}
+
+function escapedForPattern(text: string): string {
+  return text.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+/**
+ * Gives every id in the fragment `suffix`, and every reference to one of them
+ * the same: a fragment link, a `url(#…)` in an attribute or a stylesheet, an
+ * id selector, an ARIA id list. Two copies of one drawing then name their
+ * markers, clips and styles apart.
+ */
+function suffixIds(root: DocumentFragment, suffix: string): void {
+  const elements = everyElementIn(root);
+  const renamed = new Map<string, string>();
+  for (const element of elements) {
+    const id = element.getAttribute("id");
+    if (id === null || id === "") continue;
+    const next = `${id}${suffix}`;
+    renamed.set(id, next);
+    element.setAttribute("id", next);
+  }
+  if (renamed.size === 0) return;
+  const swapUrls = (text: string) =>
+    text.replace(FRAGMENT_URL, (whole, quote: string, id: string) => {
+      const next = renamed.get(id);
+      return next === undefined ? whole : `url(${quote}#${next}${quote})`;
+    });
+  const ids = [...renamed.keys()].sort((a, b) => b.length - a.length).map(escapedForPattern);
+  const selector = new RegExp(`#(${ids.join("|")})(?![\\w-])`, "g");
+  const swapSelectors = (text: string) => text.replace(selector, (_whole, id: string) => `#${renamed.get(id)}`);
+  for (const element of elements) {
+    for (const attribute of Array.from(element.attributes)) {
+      const attr = attribute.name.toLowerCase();
+      const value = attribute.value;
+      let next = value;
+      if ((attr === "href" || attr === "xlink:href") && value.startsWith("#")) {
+        const target = renamed.get(value.slice(1));
+        if (target !== undefined) next = `#${target}`;
+      } else if (ID_REFERENCE_LISTS.has(attr)) {
+        next = value
+          .split(/\s+/)
+          .map((token) => renamed.get(token) ?? token)
+          .join(" ");
+      } else if (value.includes("url(")) {
+        next = swapUrls(value);
+      }
+      if (next !== value) element.setAttribute(attribute.name, next);
+    }
+    if (element.localName.toLowerCase() === "style" && element.children.length === 0) {
+      // An id selector and a `url(#…)` both read `#id` here.
+      element.textContent = swapSelectors(element.textContent ?? "");
+    }
+  }
+}
+
 /**
  * Markup a renderer produced, parsed into an inert fragment with everything
  * that could run, load or navigate taken out. The editor's window can call
@@ -107,13 +182,18 @@ function clean(parent: Element | DocumentFragment): void {
  * allows: no script, no event handler, no link out of the drawing, and no
  * stylesheet or attribute whose CSS fetches anything.
  *
+ * With `idSuffix`, every id in the markup and every reference to it carries
+ * the suffix, so the same drawing can be in the document twice. The ids are
+ * renamed before the cleaning pass, which judges the text as inserted.
+ *
  * The fragment is what gets inserted, never markup serialized back out of it:
  * a second parse of the cleaned text could read it differently from the
  * first.
  */
-export function sanitizedFragment(markup: string): DocumentFragment {
+export function sanitizedFragment(markup: string, idSuffix?: string): DocumentFragment {
   const template = document.createElement("template");
   template.innerHTML = markup;
+  if (idSuffix !== undefined) suffixIds(template.content, idSuffix);
   clean(template.content);
   return template.content;
 }

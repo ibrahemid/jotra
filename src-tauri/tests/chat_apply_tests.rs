@@ -362,6 +362,97 @@ fn an_undo_puts_back_a_file_outside_the_folder_through_its_tab() {
     );
 }
 
+/// A file outside the notes folder holding `seeded`, open in a tab, with
+/// `proposed` applied to it through its card: the state, the file's path, the
+/// texts the card keeps for Undo, the digest the offer was made against and the
+/// digest the apply reported.
+fn applied_to_an_outside_file(
+    dir: &TempDir,
+    seeded: &[u8],
+    proposed: &str,
+) -> (AppState, String, EarlierTexts, String, String) {
+    let state = make_state(dir);
+    let file = dir.path().join("README.md");
+    std::fs::write(&file, seeded).expect("seed the file");
+    let path = canonicalize_for_authorization(&file).expect("canonical");
+    state.authorized_paths.record_for_open(path.clone());
+    open_file_from_path(&state, &path)
+        .expect("open")
+        .doc
+        .expect("a row");
+    let earlier = EarlierTexts::default();
+    let before = sha256_hex(seeded);
+    let applied = apply_proposal_to_state(&state, &earlier, "probe-host", &path, proposed, &before)
+        .expect("applied");
+    assert!(applied.undoable, "the text the apply replaced is kept");
+    assert_ne!(
+        std::fs::read(&path).expect("read"),
+        proposed.as_bytes(),
+        "the file keeps its own form"
+    );
+    (state, path, earlier, before, applied.hash)
+}
+
+#[test]
+fn an_undo_restores_the_crlf_bytes_of_a_file_outside_the_folder() {
+    let dir = TempDir::new().expect("temp dir");
+    let seeded = b"first line\r\nsecond line\r\n";
+    let (state, path, earlier, before, applied) =
+        applied_to_an_outside_file(&dir, seeded, "first line\nsecond line, tightened\n");
+
+    undo_proposal_to_state(&state, &earlier, "probe-host", &path, &before, &applied)
+        .expect("undone");
+
+    assert_eq!(std::fs::read(&path).expect("read"), seeded);
+}
+
+#[test]
+fn an_undo_restores_the_byte_order_mark_of_a_file_outside_the_folder() {
+    let dir = TempDir::new().expect("temp dir");
+    let seeded = b"\xef\xbb\xbfthe readme text\n";
+    let (state, path, earlier, before, applied) =
+        applied_to_an_outside_file(&dir, seeded, "a tighter readme\n");
+
+    undo_proposal_to_state(&state, &earlier, "probe-host", &path, &before, &applied)
+        .expect("undone");
+
+    assert_eq!(std::fs::read(&path).expect("read"), seeded);
+}
+
+#[test]
+fn an_undo_restores_a_file_outside_the_folder_in_a_legacy_encoding() {
+    let dir = TempDir::new().expect("temp dir");
+    let seeded = b"Le caf\xe9 est ouvert. Une r\xe9union demain.\n";
+    let (state, path, earlier, before, applied) =
+        applied_to_an_outside_file(&dir, seeded, "Le caf\u{e9} est ferm\u{e9}.\n");
+
+    undo_proposal_to_state(&state, &earlier, "probe-host", &path, &before, &applied)
+        .expect("undone");
+
+    assert_eq!(std::fs::read(&path).expect("read"), seeded);
+}
+
+#[test]
+fn an_undo_of_a_file_outside_the_folder_another_program_edited_is_refused() {
+    let dir = TempDir::new().expect("temp dir");
+    let seeded = b"Le caf\xe9 est ouvert. Une r\xe9union demain.\n";
+    let (state, path, earlier, before, applied) =
+        applied_to_an_outside_file(&dir, seeded, "Le caf\u{e9} est ferm\u{e9}.\n");
+    let landed = std::fs::read(&path).expect("read");
+    let edited = b"Le caf\xe9 est ferm\xe9 le lundi.\n";
+    std::fs::write(&path, edited).expect("another program writes");
+
+    let refused = undo_proposal_to_state(&state, &earlier, "probe-host", &path, &before, &applied)
+        .expect_err("the undo is refused");
+
+    assert!(refused.contains("changed since the change was applied"));
+    assert_eq!(std::fs::read(&path).expect("read"), edited);
+    std::fs::write(&path, &landed).expect("the applied bytes come back");
+    undo_proposal_to_state(&state, &earlier, "probe-host", &path, &before, &applied)
+        .expect("undone once the file holds what the apply wrote");
+    assert_eq!(std::fs::read(&path).expect("read"), seeded);
+}
+
 #[test]
 fn an_applied_note_nobody_has_open_tells_no_tab() {
     let dir = TempDir::new().expect("temp dir");
@@ -451,4 +542,84 @@ fn an_applied_edit_is_not_reverted_by_recovery() {
         "the launch would write something back over the applied edit"
     );
     assert_eq!(std::fs::read_to_string(&file).expect("read"), "after\n");
+}
+
+#[test]
+fn an_apply_to_an_open_note_in_the_folder_waits_for_its_tabs_turn() {
+    let dir = TempDir::new().expect("temp dir");
+    let state = make_state(&dir);
+    let (file, hash) = seed_note(&state, "Launch.md", "before\n");
+    open_row(&state, "note-1", &file, "before\n");
+    let earlier = EarlierTexts::default();
+
+    let held = state.buffer_writes.turn("note-1");
+    std::thread::scope(|scope| {
+        let apply = scope.spawn(|| {
+            apply_proposal_to_state(
+                &state,
+                &earlier,
+                "probe-host",
+                "Launch.md",
+                "after\n",
+                &hash,
+            )
+        });
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        assert!(
+            !apply.is_finished(),
+            "the apply wrote while a save of the tab held its turn"
+        );
+        assert_eq!(std::fs::read_to_string(&file).expect("read"), "before\n");
+        drop(held);
+        let outcome = apply
+            .join()
+            .expect("the apply thread")
+            .expect("the apply lands once the turn is free");
+        assert!(outcome.changed);
+    });
+    assert_eq!(std::fs::read_to_string(&file).expect("read"), "after\n");
+}
+
+#[test]
+fn an_undo_of_an_open_note_in_the_folder_waits_for_its_tabs_turn() {
+    let dir = TempDir::new().expect("temp dir");
+    let state = make_state(&dir);
+    state.note_history.set_notes_root(state.notes_root());
+    let (file, before) = seed_note(&state, "Launch.md", "before\n");
+    open_row(&state, "note-1", &file, "before\n");
+    let earlier = EarlierTexts::default();
+    let applied = apply_proposal_to_state(
+        &state,
+        &earlier,
+        "probe-host",
+        "Launch.md",
+        "after\n",
+        &before,
+    )
+    .expect("applied");
+
+    let held = state.buffer_writes.turn("note-1");
+    std::thread::scope(|scope| {
+        let undo = scope.spawn(|| {
+            undo_proposal_to_state(
+                &state,
+                &earlier,
+                "probe-host",
+                "Launch.md",
+                &before,
+                &applied.hash,
+            )
+        });
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        assert!(
+            !undo.is_finished(),
+            "the undo wrote while a save of the tab held its turn"
+        );
+        assert_eq!(std::fs::read_to_string(&file).expect("read"), "after\n");
+        drop(held);
+        undo.join()
+            .expect("the undo thread")
+            .expect("the undo lands once the turn is free");
+    });
+    assert_eq!(std::fs::read_to_string(&file).expect("read"), "before\n");
 }

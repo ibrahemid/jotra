@@ -1,7 +1,10 @@
 import { createSignal, createRoot } from "solid-js";
 import type { EditorView } from "@codemirror/view";
+import type { Text } from "@codemirror/state";
+import { undo } from "@codemirror/commands";
 import { checkSpelling, spellingAddIgnoredWord } from "../../services/tauri";
 import { configStore } from "./config";
+import { dismissToast, showToast } from "./notifications";
 import type { SpellingLint } from "../../types/spelling";
 import {
   setSpellingLintsIn,
@@ -33,6 +36,7 @@ function createSpellingStore() {
   let view: EditorView | null = null;
   let timer: ReturnType<typeof setTimeout> | null = null;
   let generation = 0;
+  let undoOffer: { view: EditorView; doc: Text; toast: number } | null = null;
 
   function cancelTimer() {
     if (timer) {
@@ -51,6 +55,7 @@ function createSpellingStore() {
     cancelTimer();
     generation += 1;
     view = null;
+    withdrawUndo();
     setCount(0);
   }
 
@@ -70,6 +75,7 @@ function createSpellingStore() {
    * view when the debounce fires.
    */
   function requestCheck() {
+    withdrawStaleUndo();
     cancelTimer();
     const requested = ++generation;
     timer = setTimeout(() => {
@@ -151,13 +157,51 @@ function createSpellingStore() {
     return true;
   }
 
-  /** Applies only the fixes for the given entries, in one undo step. */
+  /**
+   * Applies only the fixes for the given entries, in one undo step, and says
+   * how many words changed. The toast's Undo stays while the file is the one
+   * the fix produced.
+   */
   function applyEntries(selected: SpellingEntry[]): number {
     const active = view;
     if (!active) return 0;
     const wanted = new Set(selected.map(entryKey));
     const fixes = computeFixChanges(entries(), docSlice, (entry) => wanted.has(entryKey(entry)));
-    return applySpellingFixes(active, fixes);
+    const fixed = applySpellingFixes(active, fixes);
+    if (fixed > 0) offerUndo(active, fixed);
+    return fixed;
+  }
+
+  function offerUndo(active: EditorView, fixed: number) {
+    withdrawUndo();
+    const doc = active.state.doc;
+    const toast = showToast({
+      text: `Fixed ${fixed} word${fixed === 1 ? "" : "s"}`,
+      type: "info",
+      action: {
+        label: "Undo",
+        run: () => {
+          if (active.state.doc !== doc) return;
+          undo(active);
+          active.focus();
+        },
+      },
+      onClose: () => {
+        if (undoOffer?.toast === toast) undoOffer = null;
+      },
+    });
+    undoOffer = { view: active, doc, toast };
+  }
+
+  function withdrawUndo() {
+    const offer = undoOffer;
+    undoOffer = null;
+    if (offer) dismissToast(offer.toast);
+  }
+
+  /** Withdraws the Undo once the file is no longer the one the fix produced. */
+  function withdrawStaleUndo() {
+    if (undoOffer && undoOffer.view.state.doc !== undoOffer.doc) withdrawUndo();
   }
 
   /** Moves the cursor to an entry and scrolls it into view. */

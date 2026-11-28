@@ -29,6 +29,23 @@ fn keeps_existing_real_files() {
 }
 
 #[test]
+fn a_file_uri_opens_the_file_it_names() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let file = dir.path().join("plan for today.md");
+    std::fs::write(&file, "x").unwrap();
+    let uri = url::Url::from_file_path(&file).unwrap();
+    assert!(uri.as_str().contains("%20"));
+
+    let from_uri = arg_paths_from_iter(vec![os(uri.as_str())]);
+    assert_eq!(from_uri, arg_paths_from_iter(vec![OsString::from(&file)]));
+    assert_eq!(from_uri.len(), 1);
+    let on_localhost = uri.as_str().replacen("file://", "file://localhost", 1);
+    assert_eq!(arg_paths_from_iter(vec![os(&on_localhost)]), from_uri);
+    assert!(arg_paths_from_iter(vec![os("file://elsewhere/plan.md")]).is_empty());
+    assert!(arg_paths_from_iter(vec![os("jotra://open?path=plan.md")]).is_empty());
+}
+
+#[test]
 fn drops_non_existent_paths() {
     let dir = tempfile::TempDir::new().unwrap();
     let real = dir.path().join("real.txt");

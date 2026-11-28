@@ -8,12 +8,16 @@ export interface CaptureCalls {
   append: (text: string) => Promise<api.CaptureOutcome>;
   target: () => Promise<string>;
   close: (returnFocus: boolean) => Promise<void>;
+  draft: () => Promise<string>;
+  keep: (text: string) => Promise<void>;
 }
 
 const SERVICE_CALLS: CaptureCalls = {
   append: (text) => api.appendCapture(text),
   target: () => api.captureTarget(),
   close: (returnFocus) => api.closeCapture(returnFocus),
+  draft: () => api.captureDraft(),
+  keep: (text) => api.keepCaptureDraft(text),
 };
 
 const CODED = /^ERR_[A-Z_]+/;
@@ -36,10 +40,31 @@ export function captureFailureMessage(error: unknown, name: string): string {
 // window, and the main window's stores never load here.
 
 export function createCaptureNoteStore(calls: CaptureCalls = SERVICE_CALLS) {
-  const [text, setText] = createSignal("");
+  const [text, setTextSignal] = createSignal("");
   const [target, setTarget] = createSignal("");
   const [problem, setProblem] = createSignal<string | null>(null);
   const [busy, setBusy] = createSignal(false);
+  let edited = false;
+
+  /** Changes the text and hands it to the app, which keeps it across a quit. */
+  function setText(value: string): void {
+    edited = true;
+    setTextSignal(value);
+    calls.keep(value).catch(() => logFailure("the capture note's text could not be kept"));
+  }
+
+  /** Puts back the text the note held when the app last quit, unless
+   * something was typed since. */
+  async function restoreDraft(): Promise<void> {
+    let draft = "";
+    try {
+      draft = await calls.draft();
+    } catch {
+      logFailure("the capture note's last text could not be read");
+      return;
+    }
+    if (!edited && draft !== "") setTextSignal(draft);
+  }
 
   async function close(returnFocus: boolean): Promise<void> {
     try {
@@ -88,7 +113,7 @@ export function createCaptureNoteStore(calls: CaptureCalls = SERVICE_CALLS) {
     await close(false);
   }
 
-  return { text, setText, target, problem, busy, refreshTarget, submit, dismiss };
+  return { text, setText, target, problem, busy, refreshTarget, restoreDraft, submit, dismiss };
 }
 
 export const captureNoteStore = createRoot(() => createCaptureNoteStore());

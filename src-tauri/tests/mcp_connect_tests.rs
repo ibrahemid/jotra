@@ -98,6 +98,38 @@ fn a_command_that_is_not_ready_is_handed_to_no_card() {
     }
 }
 
+#[test]
+fn the_login_shell_is_read_once_however_often_the_cards_load() {
+    use jotra_tauri_lib::commands::mcp_connect::remembered_login_path;
+    use std::cell::Cell;
+    use std::sync::OnceLock;
+
+    let runs = Cell::new(0);
+    let read = |path: &str| {
+        let path = path.to_string();
+        let runs = &runs;
+        move || {
+            runs.set(runs.get() + 1);
+            Some(path)
+        }
+    };
+    let cell = OnceLock::new();
+    assert_eq!(
+        remembered_login_path(&cell, read("/opt/tools/bin")),
+        Some("/opt/tools/bin")
+    );
+    assert_eq!(
+        remembered_login_path(&cell, read("/elsewhere/bin")),
+        Some("/opt/tools/bin")
+    );
+    assert_eq!(runs.get(), 1);
+
+    let failed = OnceLock::new();
+    assert_eq!(remembered_login_path(&failed, || None), None);
+    assert_eq!(remembered_login_path(&failed, read("/opt/tools/bin")), None);
+    assert_eq!(runs.get(), 1, "a shell that gave nothing is not run again");
+}
+
 /// The `PATH` separator and an absolute path are spelled the Unix way here.
 #[cfg(unix)]
 #[test]

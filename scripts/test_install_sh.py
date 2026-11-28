@@ -77,6 +77,15 @@ OLD_OPENSSL = """#!/bin/sh
 exit 1
 """
 
+# An OpenSSL 3 in FIPS mode: no BLAKE2b-512 digest, everything else delegated.
+FIPS_OPENSSL = """#!/bin/sh
+[ "$1" = version ] && echo "OpenSSL 3.0.13 30 Jan 2024 (Library: OpenSSL 3.0.13 30 Jan 2024)" && exit 0
+for arg in "$@"; do
+  [ "$arg" = -blake2b512 ] && echo "dgst: Unknown digest or option blake2b512" >&2 && exit 1
+done
+exec "$REAL_OPENSSL" "$@"
+"""
+
 
 def find_openssl3() -> str | None:
     candidates = [
@@ -371,6 +380,20 @@ class InstallScriptTests(InstallScriptFixture):
     def test_an_openssl_older_than_3_is_no_verifier(self) -> None:
         self.stub("openssl", OLD_OPENSSL)
         self.assert_refused(self.run_install(), "install minisign or OpenSSL 3.0 or later")
+
+    def test_an_openssl_without_blake2_is_named_as_the_missing_verifier(self) -> None:
+        self.stub("openssl", FIPS_OPENSSL)
+        result = self.run_install(REAL_OPENSSL=OPENSSL)  # type: ignore[arg-type]
+        self.assert_refused(result, "this OpenSSL has no BLAKE2b-512 digest")
+        self.assertIn("install minisign and run this again", result.stderr)
+        self.assertNotIn("does not match", result.stderr)
+        self.assertEqual(self.downloads(), [])
+
+    @unittest.skipIf(MINISIGN is None, "minisign is not installed")
+    def test_minisign_verifies_beside_an_openssl_without_blake2(self) -> None:
+        self.stub("openssl", FIPS_OPENSSL)
+        self.use("minisign", MINISIGN)  # type: ignore[arg-type]
+        self.assert_installed(self.run_install(REAL_OPENSSL=OPENSSL))  # type: ignore[arg-type]
 
     def test_the_escape_installs_without_a_signature_check_and_says_so(self) -> None:
         result = self.run_install(JOTRA_INSTALL_SKIP_SIGNATURE="1")

@@ -16,6 +16,23 @@ import {
 // CSS, so the attribute is attached with line decorations over the viewport.
 const autoDirLine = Decoration.line({ attributes: { dir: "auto" } });
 
+const STRONG_RTL =
+  /[‏؜\p{Script=Hebrew}\p{Script=Arabic}\p{Script=Syriac}\p{Script=Thaana}\p{Script=Nko}\p{Script=Samaritan}\p{Script=Mandaic}\p{Script=Adlam}\p{Script=Hanifi_Rohingya}\p{Script=Yezidi}\p{Script=Mende_Kikakui}]/u;
+const STRONG = /[\p{L}‎‏؜]/u;
+
+/**
+ * The direction a decorated line resolves to: the side of its first strong
+ * directional character, left-to-right when it has none, and left-to-right
+ * for a line too long to carry `dir="auto"`.
+ */
+export function autoDirectionOf(text: string): "ltr" | "rtl" {
+  if (text.length > MAX_NORMAL_LINE_LENGTH) return "ltr";
+  for (const char of text) {
+    if (STRONG.test(char)) return STRONG_RTL.test(char) ? "rtl" : "ltr";
+  }
+  return "ltr";
+}
+
 /**
  * Builds one `dir="auto"` line decoration per rendered line.
  *

@@ -601,6 +601,8 @@ export const CSS_VAR = {
   proseSize: "--jotra-prose-size",
   proseLineHeight: "--jotra-prose-lh",
   proseMeasure: "--jotra-prose-measure",
+  proseMeasureNarrow: "--jotra-prose-measure-narrow",
+  proseMeasureWide: "--jotra-prose-measure-wide",
   prosePadX: "--jotra-prose-pad-x",
   prosePadY: "--jotra-prose-pad-y",
   prosePadXEm: "--jotra-prose-pad-x-em",

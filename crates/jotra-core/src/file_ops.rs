@@ -283,6 +283,8 @@ pub fn generate_hex_dump(data: &[u8], total_bytes: usize) -> String {
 /// The helper:
 ///
 /// - drops arguments that begin with `-` (flags),
+/// - reads a `file://` URI as the local path it names, the way a Linux
+///   launcher's `%U` hands an opened file over,
 /// - drops paths that do not exist or are not regular files,
 /// - converts to absolute paths via [`std::fs::canonicalize`], falling back
 ///   to the input path when canonicalisation fails (rare but possible on
@@ -309,7 +311,7 @@ where
             }
         }
 
-        let candidate = PathBuf::from(&raw);
+        let candidate = file_uri_path(&raw).unwrap_or_else(|| PathBuf::from(&raw));
         if !candidate.is_file() {
             continue;
         }
@@ -323,6 +325,21 @@ where
     }
 
     out
+}
+
+/// The local path a `file://` URI names, or `None` for any other argument and
+/// for a URI that names a file on another host.
+fn file_uri_path(raw: &std::ffi::OsStr) -> Option<PathBuf> {
+    let text = raw.to_str()?;
+    if !text.get(..7)?.eq_ignore_ascii_case("file://") {
+        return None;
+    }
+    let uri = url::Url::parse(text).ok()?;
+    // Windows turns a host into a network share path; the other systems refuse it.
+    if uri.host_str().is_some_and(|host| !host.is_empty()) {
+        return None;
+    }
+    uri.to_file_path().ok()
 }
 
 #[cfg(windows)]
@@ -348,8 +365,10 @@ pub fn extract_filename(path: &Path) -> String {
         .to_string()
 }
 
-/// `true` when the first [`BINARY_CHECK_BYTES`] of `data` contain a NUL byte
-/// and declare no text encoding.
+/// `true` when the first [`BINARY_CHECK_BYTES`] of `data` hold a NUL: a NUL
+/// byte when they declare no text encoding, a NUL character in the text after
+/// the byte order mark when they declare one
+/// ([`crate::text_encoding::sniffs_binary`]).
 ///
 /// UTF-16 has a NUL in nearly every unit of Latin text, so a byte order mark
 /// or the shape of UTF-16 ([`crate::text_encoding::declared`]) is asked about
@@ -361,7 +380,5 @@ pub fn extract_filename(path: &Path) -> String {
 /// the file a second time. An empty slice is never binary.
 pub fn is_binary_bytes(data: &[u8]) -> bool {
     let checked = &data[..data.len().min(BINARY_CHECK_BYTES)];
-    !checked.is_empty()
-        && crate::text_encoding::declared(checked).is_none()
-        && checked.contains(&0u8)
+    !checked.is_empty() && crate::text_encoding::sniffs_binary(checked)
 }

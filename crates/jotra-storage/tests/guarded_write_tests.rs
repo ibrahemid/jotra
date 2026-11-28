@@ -20,6 +20,7 @@ use jotra_storage::guarded::{
     CreateNote, DiskRead, GuardedWrite, TakenName, WriteCapture,
 };
 use jotra_storage::note_history::NoteHistoryStore;
+use jotra_storage::write_lock::WriteLock;
 use tempfile::TempDir;
 
 /// What the file holds right now, as the adapter records it after a read.
@@ -470,6 +471,26 @@ fn the_hook_the_crate_ships_keeps_both_texts_and_lets_the_write_through() {
         versions.content(kept[1].id).expect("content"),
         b"what was there\n"
     );
+}
+
+#[test]
+fn the_version_of_what_landed_is_kept_before_the_write_lock_is_let_go() {
+    let (_root, path) = seeded("what was there\n");
+    let data = TempDir::new().expect("temp dir");
+    let lock = WriteLock::in_data_folder(data.path());
+    let held_while_kept = RefCell::new(None);
+    let hook = |_: WriteCapture<'_>| {
+        let free = lock.hold_within(std::time::Duration::ZERO).is_some();
+        *held_while_kept.borrow_mut() = Some(!free);
+    };
+
+    let mut request = saving(&path, b"what is there now\n", Some(recorded(&path)));
+    request.history = Some(&hook);
+    request.lock = Some(&lock);
+    write_note_guarded(request, None).expect("write");
+
+    assert_eq!(*held_while_kept.borrow(), Some(true));
+    assert!(lock.hold_within(std::time::Duration::ZERO).is_some());
 }
 
 #[test]

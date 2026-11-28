@@ -1,0 +1,50 @@
+{
+  "modifiers": {
+    "CmdOrCtrl": ["cmdorctrl", "ctrlorcmd", "mod"],
+    "Ctrl": ["ctrl", "control"],
+    "Cmd": ["cmd", "command", "meta", "super"],
+    "Shift": ["shift"],
+    "Alt": ["alt", "option", "opt"]
+  },
+  "keys": {
+    "Space": ["SPACE"],
+    "Enter": ["ENTER", "RETURN"],
+    "Escape": ["ESC", "ESCAPE"],
+    "Tab": ["TAB"],
+    "ArrowUp": ["UP", "ARROWUP"],
+    "ArrowDown": ["DOWN", "ARROWDOWN"],
+    "ArrowLeft": ["LEFT", "ARROWLEFT"],
+    "ArrowRight": ["RIGHT", "ARROWRIGHT"],
+    "Backquote": ["BACKQUOTE", "`"],
+    "Comma": ["COMMA", ","],
+    "Period": ["PERIOD", "."],
+    "Slash": ["SLASH", "/"],
+    "Semicolon": ["SEMICOLON", ";"],
+    "Quote": ["QUOTE", "'"],
+    "LeftBracket": ["LEFTBRACKET", "["],
+    "RightBracket": ["RIGHTBRACKET", "]"],
+    "Backslash": ["BACKSLASH", "\\"],
+    "Minus": ["MINUS", "-"],
+    "Equal": ["EQUAL", "="]
+  },
+  "held": {
+    "mac": {
+      "CmdOrCtrl": "Super",
+      "Ctrl": "Control",
+      "Cmd": "Super",
+      "Shift": "Shift",
+      "Alt": "Alt"
+    },
+    "other": {
+      "CmdOrCtrl": "Control",
+      "Ctrl": "Control",
+      "Cmd": "Super",
+      "Shift": "Shift",
+      "Alt": "Alt"
+    }
+  },
+  "keysTheOsLacks": {
+    "mac": ["F21", "F22", "F23", "F24"],
+    "other": []
+  }
+}

@@ -17,6 +17,7 @@ import { useActiveBuffer } from "../../lib/use-active-buffer";
 import { indexCacheStore } from "../../stores/global/index-cache";
 import { notesStore } from "../../stores/global/notes";
 import { themeStore } from "../../stores/global/theme";
+import { reportOpenOutcome } from "../../stores/global/open-report";
 import { FOLDER_LAYOUT_OPTIONS } from "../../lib/graph/layout";
 import { folderColors } from "../../lib/graph/color";
 import {
@@ -244,6 +245,14 @@ export default function FolderGraphView() {
     if (chosen !== null && hidden().has(chosen)) win.folderGraph.select(null);
   }
 
+  /** Lights one folder, or every folder again. A chosen file the legend dims
+   * is no longer chosen, so Enter cannot open what is drawn faint. */
+  function isolateFolder(folder: string | null) {
+    win.folderGraph.isolate(folder);
+    const chosen = win.folderGraph.selected();
+    if (chosen !== null && dimmed().has(chosen)) win.folderGraph.select(null);
+  }
+
   /** What each note is drawn in: its folder's colour, or the muted one. */
   const nodeColors = createMemo(() => {
     const perFolder = colors();
@@ -283,9 +292,12 @@ export default function FolderGraphView() {
     queueMicrotask(readTokens);
   });
 
-  /** Opens `path` behind the layer, then closes the layer onto it. */
+  /** Opens `path` behind the layer, then closes the layer onto it. A file that
+   * did not open leaves the layer up, with what went wrong said. */
   async function openAndClose(path: string) {
-    await win.tabs.openFile(path).catch(() => null);
+    const outcome = await win.tabs.openPath(path);
+    reportOpenOutcome(outcome);
+    if (outcome.kind === "declined" || outcome.kind === "refused") return;
     handsFocusToEditor = true;
     win.folderGraph.close();
   }
@@ -444,7 +456,7 @@ export default function FolderGraphView() {
                     type="button"
                     class="folder-graph-chip"
                     aria-pressed={win.folderGraph.isolated() === entry.folder}
-                    onClick={() => win.folderGraph.isolate(entry.folder)}
+                    onClick={() => isolateFolder(entry.folder)}
                   >
                     <span
                       class="folder-graph-swatch"

@@ -7,6 +7,7 @@ import type { NotesFallbackReason } from "../../../stores/global/notes";
 import { showToast } from "../../../stores/global/notifications";
 import { UNUSABLE_GLOBAL_KEY } from "../../../lib/chord";
 import { joinAnd } from "../../../lib/join-and";
+import { userErrorText } from "../../../lib/error-text";
 import { logFailure } from "../../../lib/log";
 import { formatKeybinding } from "../../../lib/keybinding-format";
 import { detectPlatform, FILE_MANAGER_NAME, SHOW_IN_FILE_MANAGER } from "../../../lib/platform";
@@ -90,8 +91,8 @@ function FolderRow() {
         return;
       }
       showToast(`Your files are now in ${where}.`, "success");
-    } catch {
-      showToast("Could not move the folder", "error");
+    } catch (error) {
+      showToast(userErrorText(error) ?? "Could not move the folder", "error");
       logFailure("the folder could not be moved");
     }
   }
@@ -148,6 +149,7 @@ function GlobalChordRow() {
   }
 
   async function apply(next: string) {
+    const held = hotkeyStore.chord();
     let given: boolean;
     try {
       given = await hotkeyStore.rebind(next);
@@ -161,7 +163,11 @@ function GlobalChordRow() {
       setProblem(`Another app is using ${formatKeybinding(next)}.`);
     }
     const toggle = hotkeyStore.chord() || next;
-    await patchConfig((prev) => ({ ...prev, hotkey: { ...prev.hotkey, toggle } }));
+    const saved = await patchConfig((prev) => ({ ...prev, hotkey: { ...prev.hotkey, toggle } }));
+    // The config keeps the chord it had, so the OS goes back to it.
+    if (!saved && hotkeyStore.chord() !== held) {
+      await hotkeyStore.rebind(held).catch(() => false);
+    }
   }
 
   createEffect(() => {

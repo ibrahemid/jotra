@@ -37,6 +37,8 @@
 //! - [`link`]: external-link allowlist policy (ADR-025).
 //! - [`linux_rename`]: the Linux autostart entry, AppImage command copies and
 //!   desktop entry after the rename (ADR-059).
+//! - [`login_item`]: which side moves when the config and the OS login item
+//!   disagree.
 //! - [`maintenance`]: database bloat policy driving startup `VACUUM`.
 //! - [`mcp_clients`]: the MCP clients Jotra connects, and the command, link,
 //!   bundle or JSON each is handed (ADR-031 rule 2.4).
@@ -122,6 +124,10 @@ pub mod legacy_names;
 pub mod link;
 /// The Linux autostart entry and AppImage files after the rename.
 pub mod linux_rename;
+/// What a log line may say about where a file is (ADR-045).
+pub mod log_line;
+/// Which side moves when the config and the OS login item disagree.
+pub mod login_item;
 /// Database bloat policy driving the startup vacuum.
 pub mod maintenance;
 /// The MCP clients Jotra connects, and what each is handed (ADR-031).

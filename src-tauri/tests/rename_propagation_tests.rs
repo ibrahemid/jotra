@@ -721,6 +721,66 @@ fn a_note_something_else_rewrote_is_named_rather_than_rewritten() {
     );
 }
 
+#[test]
+fn a_link_rewrite_of_an_open_note_waits_for_its_tabs_turn() {
+    let (_dir, state) = seeded(&[("Old note.md", "the note itself\n")]);
+    let linking = new_note_named_inner(&state, "Linking.md").expect("new note");
+    save_buffer_content_inner(&state, &linking.id, "see [[Old note]]\n").expect("save");
+    let path = {
+        let store = state.store.lock().expect("lock");
+        store
+            .get(&linking.id)
+            .expect("row")
+            .source_path
+            .expect("file")
+    };
+    reindex(&state);
+    let old = path_text(&state, "Old note.md");
+
+    let held = state.buffer_writes.turn(&linking.id);
+    std::thread::scope(|scope| {
+        let rename = scope.spawn(|| rename_note_with_links_inner(&state, &old, "New note", true));
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        assert_eq!(
+            std::fs::read_to_string(&path).expect("read"),
+            "see [[Old note]]\n",
+            "the rewrite wrote the open note while a save of it held its turn"
+        );
+        drop(held);
+        let outcome = rename.join().expect("the rename thread").expect("rename");
+        assert_eq!(outcome.updated, 1);
+    });
+    assert_eq!(
+        std::fs::read_to_string(&path).expect("read"),
+        "see [[New note]]\n"
+    );
+}
+
+#[test]
+fn a_link_rewrite_waits_for_the_write_lock_another_writer_holds() {
+    let (_dir, state) = seeded(&[
+        ("Old note.md", "the note itself\n"),
+        ("First.md", "see [[Old note]]\n"),
+    ]);
+    let lock = jotra_storage::write_lock::WriteLock::in_data_folder(&state.jotra_dir);
+    let held = lock.hold().expect("the lock is free");
+    let old = path_text(&state, "Old note.md");
+
+    std::thread::scope(|scope| {
+        let rename = scope.spawn(|| rename_note_with_links_inner(&state, &old, "New note", true));
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        assert_eq!(
+            read(&state, "First.md"),
+            "see [[Old note]]\n",
+            "the rewrite wrote while another writer held the data folder's lock"
+        );
+        drop(held);
+        let outcome = rename.join().expect("the rename thread").expect("rename");
+        assert_eq!(outcome.updated, 1);
+    });
+    assert_eq!(read(&state, "First.md"), "see [[New note]]\n");
+}
+
 /// Where the walk below stands with the note it reached first.
 #[derive(Debug)]
 enum RenameDuringWalk {
