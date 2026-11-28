@@ -1,4 +1,6 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
+import { readFileSync } from "node:fs";
+import { resolve } from "node:path";
 
 const h = vi.hoisted(() => ({
   capture: undefined as string | undefined,
@@ -17,11 +19,13 @@ vi.mock("../../../stores/global/hotkey", () => ({
 }));
 
 import {
+  GLOBAL_ROW_LABEL,
   heldCaptureChord,
   readAnyAppChord,
   savedCaptureChord,
   windowChordRule,
 } from "../../../components/ShortcutEditor/any-app-chord";
+import { settingTitle } from "../../../settings";
 
 const OTHER = { chord: "CmdOrCtrl+Shift+Alt+Space", label: "Quick capture" };
 
@@ -59,6 +63,19 @@ describe("reading a chord for a row the OS holds for every app", () => {
     ).toEqual({ kind: "refuse", text: "Quick capture uses this shortcut.", resetRecorder: true });
   });
 
+  it("refuses the other row's chord when the config spells it another way", () => {
+    const handEdited = { chord: "cmd+shift+option+space", label: "Quick capture" };
+    const recorded = { kind: "captured", binding: "CmdOrCtrl+Shift+Alt+Space" } as const;
+    expect(readAnyAppChord(recorded, "mac", handEdited)).toEqual({
+      kind: "refuse",
+      text: "Quick capture uses this shortcut.",
+      resetRecorder: true,
+    });
+    const controlSpelled = { chord: "control+shift+alt+space", label: "Quick capture" };
+    expect(readAnyAppChord(recorded, "win", controlSpelled).kind).toBe("refuse");
+    expect(readAnyAppChord(recorded, "mac", controlSpelled).kind).toBe("take");
+  });
+
   it("takes a chord that holds Cmd, Ctrl or Alt", () => {
     expect(readAnyAppChord({ kind: "captured", binding: "CmdOrCtrl+Alt+K" }, "mac", OTHER)).toEqual(
       { kind: "take", binding: "CmdOrCtrl+Alt+K" },
@@ -87,5 +104,16 @@ describe("the capture chord the window's row compares with", () => {
     expect(heldCaptureChord()).toBe("Ctrl+Alt+K");
     h.held = "Ctrl+Alt+J";
     expect(heldCaptureChord()).toBe("Ctrl+Alt+J");
+  });
+});
+
+describe("the window chord's row", () => {
+  it("takes its name from the setting it changes, which holds the one copy", () => {
+    expect(GLOBAL_ROW_LABEL).toBe(settingTitle("hotkey.toggle"));
+    const source = readFileSync(
+      resolve(__dirname, "../../../components/ShortcutEditor/any-app-chord.ts"),
+      "utf8",
+    );
+    expect(source).not.toContain(`"${settingTitle("hotkey.toggle")}"`);
   });
 });

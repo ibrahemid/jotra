@@ -513,6 +513,32 @@ fn an_index_from_a_newer_schema_is_refused() {
 }
 
 #[test]
+fn an_index_missing_a_migration_below_its_highest_is_refused() {
+    let fixture = Fixture::new();
+    fixture.indexed();
+    let conn = open_database(&fixture.db_path()).expect("open_database");
+    let skipped: i32 = conn
+        .query_row(
+            "SELECT version FROM schema_version ORDER BY version DESC LIMIT 1 OFFSET 1",
+            [],
+            |row| row.get(0),
+        )
+        .expect("a version below the highest");
+    conn.execute("DELETE FROM schema_version WHERE version = ?1", [skipped])
+        .expect("forget one migration");
+    drop(conn);
+
+    let output = fixture.run(&["links", "One"]);
+    assert_eq!(code(&output), 1);
+    let said = stderr(&output);
+    assert!(
+        said.contains(&format!("has not taken update {skipped}")),
+        "{said}"
+    );
+    assert!(said.contains("brings it up to date"), "{said}");
+}
+
+#[test]
 fn a_file_that_is_not_a_database_is_not_called_stale() {
     // Reporting a corrupt file as an old index would send the reader off to
     // run the app for a migration that cannot help. The three states each get

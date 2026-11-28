@@ -18,5 +18,5 @@ Other apps, agents and MCP answers had no way to point at a file or a line in Wr
 
 ## Consequences
 
-- Links work in installed builds on macOS and Windows. A dev build and an AppImage have no scheme registered, and the bundled Linux `.desktop` entry claims the scheme with an `Exec` line that carries no `%u`, so a launcher there may start Writ without the link.
+- Links work in installed builds on macOS, Windows and Linux. The `.deb` and `.rpm` entry (`src-tauri/linux/jotra.desktop`) claims both schemes with `Exec=... %U`, so a launcher hands the link over. A release AppImage writes a hidden `jotra-links.desktop` to the user's applications folder at each launch, starting the image with `%u` and claiming both schemes, and sets it as a scheme's handler through `xdg-mime` only while no program handles that scheme, so an installed package keeps its claim. A dev build registers no scheme.
 - `fuzz/fuzz_targets/writ_link_parser.rs` and a stable property test hold the grammar's invariants.

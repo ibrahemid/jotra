@@ -212,6 +212,13 @@ const RUST_ALLOWLIST: &[AllowedString] = &[
         word: "note",
         note: "log line the prefix test misses inside a multi-line macro",
     },
+    AllowedString {
+        file: "src-tauri/src/commands/notices.rs",
+        item: "RETIRED_NOTICES_TITLE",
+        text: "Third-party licences",
+        word: "licence",
+        note: "the title earlier builds wrote, kept to find and remove their file",
+    },
 ];
 
 /// Lines whose first token opens a log macro or an attribute, plus the lines a
@@ -1040,9 +1047,9 @@ fn collect_matches(words: &[&'static str]) -> Vec<Offender> {
     offenders
 }
 
-#[test]
-fn banned_words_have_no_new_violations_in_rust_user_messages() {
-    let offenders = collect_offenders();
+/// The strings no record answers for, and each string a record answers for
+/// beside another, since a record answers for exactly one.
+fn unlisted(offenders: &[Offender]) -> Vec<String> {
     let mut new_violations: Vec<String> = offenders
         .iter()
         .filter(|offender| {
@@ -1068,6 +1075,12 @@ fn banned_words_have_no_new_violations_in_rust_user_messages() {
             }));
         }
     }
+    new_violations
+}
+
+#[test]
+fn banned_words_have_no_new_violations_in_rust_user_messages() {
+    let new_violations = unlisted(&collect_offenders());
     assert!(
         new_violations.is_empty(),
         "ADR-028 §10 retires this vocabulary from user-visible messages: {}",
@@ -1092,10 +1105,7 @@ const OTHER_LOCALE_AND_VOICE: &[&str] = &[
 
 #[test]
 fn rust_user_messages_use_one_locale_and_one_voice() {
-    let found: Vec<String> = collect_matches(OTHER_LOCALE_AND_VOICE)
-        .iter()
-        .map(Offender::describe)
-        .collect();
+    let found = unlisted(&collect_matches(OTHER_LOCALE_AND_VOICE));
     assert!(
         found.is_empty(),
         "user messages spell in US English and say \"Could not\": {}",
@@ -1105,7 +1115,10 @@ fn rust_user_messages_use_one_locale_and_one_voice() {
 
 #[test]
 fn rust_banned_words_allowlist_has_no_stale_entries() {
-    let live = collect_offenders();
+    let live: Vec<Offender> = collect_offenders()
+        .into_iter()
+        .chain(collect_matches(OTHER_LOCALE_AND_VOICE))
+        .collect();
     let stale: Vec<String> = RUST_ALLOWLIST
         .iter()
         .filter(|entry| !live.iter().any(|offender| entry.answers_for(offender)))

@@ -276,7 +276,11 @@ fn a_run_that_could_not_record_the_answer_can_be_answered_again() {
     // retry once the way is clear.
     let config = config_file(dir.path());
     std::fs::create_dir_all(&config).expect("a folder where the config goes");
-    assert!(finish_first_run_inner(&state, FileExtension::Md, &[]).is_err());
+    let error = finish_first_run_inner(&state, FileExtension::Md, &[]).expect_err("no config");
+    assert!(
+        error.starts_with("ERR_"),
+        "the setup screen reads a code: {error}"
+    );
     assert!(
         notes_folder_entries(&state).is_empty(),
         "a run that recorded nothing mints nothing"

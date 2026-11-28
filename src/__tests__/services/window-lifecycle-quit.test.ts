@@ -28,7 +28,11 @@ vi.mock("../../services/events", () => ({
 }));
 
 import { debouncedSave, resetAutosave } from "../../services/autosave";
-import { installCloseFlush, startWindowLifecycle } from "../../services/window-lifecycle";
+import {
+  installCloseFlush,
+  QUIT_FLUSH_DEADLINE_MS,
+  startWindowLifecycle,
+} from "../../services/window-lifecycle";
 import { confirmQuitFlush, recordUnsavedNotes, saveBufferContent } from "../../services/tauri";
 
 const mockedSave = vi.mocked(saveBufferContent);
@@ -173,6 +177,34 @@ describe("window lifecycle", () => {
     eventHandlers.get("quit:flush")!({});
     await vi.advanceTimersByTimeAsync(0);
 
+    expect(mockedConfirm).toHaveBeenCalledOnce();
+  });
+
+  it("a_quit_flush_that_never_settles_keeps_the_text_and_confirms_before_the_shutdown_stops_waiting", async () => {
+    await startWindowLifecycle();
+    mockedSave.mockReturnValueOnce(new Promise(() => {}));
+
+    debouncedSave("lifecycle-hung", "on a share that stopped answering");
+    eventHandlers.get("quit:flush")!({});
+    await vi.advanceTimersByTimeAsync(QUIT_FLUSH_DEADLINE_MS * 3);
+
+    expect(QUIT_FLUSH_DEADLINE_MS * 3).toBeLessThan(2000);
+    expect(mockedRecord).toHaveBeenCalledWith([
+      { id: "lifecycle-hung", content: "on a share that stopped answering" },
+    ]);
+    expect(mockedConfirm).toHaveBeenCalledOnce();
+  });
+
+  it("the_quit_flush_writes_what_is_still_waiting_elsewhere_before_it_confirms", async () => {
+    const lastWrite = vi.fn().mockResolvedValue(undefined);
+    const hungWrite = vi.fn().mockReturnValue(new Promise(() => {}));
+    await startWindowLifecycle([lastWrite, hungWrite]);
+
+    eventHandlers.get("quit:flush")!({});
+    await vi.advanceTimersByTimeAsync(QUIT_FLUSH_DEADLINE_MS * 3);
+
+    expect(lastWrite).toHaveBeenCalledOnce();
+    expect(hungWrite).toHaveBeenCalledOnce();
     expect(mockedConfirm).toHaveBeenCalledOnce();
   });
 });

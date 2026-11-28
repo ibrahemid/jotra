@@ -1,8 +1,9 @@
+use jotra_core::data_folder::DataFolderOrigin;
 use jotra_core::instance::{
-    is_wait_token, split_line_target, ContextAsk, OpenRequest, ReviewAsk, CONTEXT_ASK_FRESH_MS,
-    MAX_WAIT_TOKEN_LEN, OPEN_REQUEST_FRESH_MS,
+    held_folder_refusal, is_wait_token, on_held_folder, split_line_target, ContextAsk, HeldFolder,
+    OpenRequest, ReviewAsk, CONTEXT_ASK_FRESH_MS, MAX_WAIT_TOKEN_LEN, OPEN_REQUEST_FRESH_MS,
 };
-use jotra_core::write_review::REVIEW_WAIT;
+use jotra_core::write_review::{review_wait_for, CODEX_TOOL_TIMEOUT, REVIEW_WAIT};
 
 fn sent_at(sent_at_ms: i64) -> OpenRequest {
     OpenRequest {
@@ -115,6 +116,22 @@ fn a_review_ask_crosses_the_wire_opens_nothing_and_is_answered_while_the_write_w
     assert!(ask("rv-1").review_ask(waited + 1).is_none());
     assert!(ask("../config.toml").review_ask(0).is_none());
     assert!(ask("").review_ask(0).is_none());
+}
+
+#[test]
+fn a_review_ask_from_codex_is_not_answered_once_codex_has_stopped_waiting() {
+    let request = OpenRequest {
+        review: Some(ReviewAsk {
+            token: "rv-1".to_string(),
+            program: "codex-mcp-client".to_string(),
+        }),
+        ..OpenRequest::default()
+    };
+    let limit = i64::try_from(CODEX_TOOL_TIMEOUT.as_millis()).expect("fits");
+    let waited = i64::try_from(review_wait_for("codex-mcp-client").as_millis()).expect("fits");
+    assert!(request.review_ask(waited).is_some());
+    assert!(request.review_ask(waited + 1).is_none());
+    assert!(request.review_ask(limit).is_none());
 }
 
 #[test]
@@ -235,4 +252,32 @@ fn closing_a_file_nobody_waits_on_answers_nobody() {
     waits.register("t1", ["/a.md".to_string()]);
     assert!(waits.closed(["/other.md"]).is_empty());
     assert!(!waits.is_empty());
+}
+
+#[test]
+fn a_wait_on_a_file_that_moved_is_answered_when_its_new_name_closes() {
+    let mut waits = jotra_core::instance::WaitSet::default();
+    waits.register("t1", ["/a.md".to_string(), "/b.md".to_string()]);
+    waits.moved("/a.md", "/renamed.md");
+    assert!(waits.closed(["/a.md", "/b.md"]).is_empty());
+    assert_eq!(waits.closed(["/renamed.md"]), vec!["t1".to_string()]);
+}
+
+#[test]
+fn a_dev_build_on_the_home_folder_another_copy_holds_stops_instead_of_handing_over() {
+    assert_eq!(
+        on_held_folder(true, DataFolderOrigin::Home),
+        HeldFolder::Refuse
+    );
+    assert_eq!(
+        on_held_folder(true, DataFolderOrigin::Variable),
+        HeldFolder::HandOver,
+        "a folder a variable names was chosen for this launch"
+    );
+    assert_eq!(
+        on_held_folder(false, DataFolderOrigin::Home),
+        HeldFolder::HandOver
+    );
+    let message = held_folder_refusal(std::path::Path::new("data"));
+    assert!(message.contains("JOTRA_DATA_DIR"), "{message}");
 }

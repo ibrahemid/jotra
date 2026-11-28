@@ -25,8 +25,8 @@ use jotra_tauri_lib::commands::images::{
     ClipboardPasteResult, ClipboardPicture, ClipboardReader, ERR_TAB_NOT_OPEN,
 };
 use jotra_tauri_lib::commands::preview::{
-    preview_remote_image_lookup_inner, preview_remote_image_store_inner, InlineImageResult,
-    RemoteImageLookup,
+    preview_inline_image_inner, preview_remote_image_lookup_inner,
+    preview_remote_image_store_inner, InlineImageResult, RemoteImageLookup,
 };
 use jotra_tauri_lib::preview::handler::resolve_cached;
 use jotra_tauri_lib::state::AppState;
@@ -592,6 +592,31 @@ fn closing_a_tab_releases_the_remote_images_it_was_granted() {
             .preview_render_cache
             .grant_remote_image(&pending.key, "buf-2")
             .is_none());
+    }
+}
+
+#[test]
+fn closing_a_tab_ends_its_local_image_urls() {
+    for close in [
+        (|state: &AppState| close_buffer_inner(state, "buf-1"))
+            as fn(&AppState) -> Result<(), String>,
+        |state| close_buffers_inner(state, &["buf-1".to_string()]),
+        |state| delete_buffer_inner(state, "buf-1"),
+    ] {
+        let f = Fixture::new();
+        std::fs::write(f.note_dir.join("map.png"), PNG).unwrap();
+        let state = f.state();
+        let url = ready_url(
+            preview_inline_image_inner(&state, "buf-1", "map.png", &|_: &Path| false).unwrap(),
+        )
+        .replace("http://jotra-preview.", "jotra-preview://");
+        let serve = || resolve_cached(&url, &state.preview_render_cache, &|_: &Path| false);
+        assert_eq!(serve().status, 200);
+        close(&state).unwrap();
+        let after = serve();
+        assert_ne!(after.status, 200);
+        assert!(!after.body.starts_with(PNG));
+        assert!(state.preview_render_cache.scope("buf-1").is_none());
     }
 }
 

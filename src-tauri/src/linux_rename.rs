@@ -6,6 +6,9 @@ use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 
+use jotra_core::default_app::{
+    appimage_link_entry, claims_link_type, link_types, APPIMAGE_LINK_ENTRY,
+};
 use jotra_core::legacy_names;
 use jotra_core::linux_rename::{
     appimage_command_copies, autostart_file_name, is_stale_command_copy, plan_appimage_entry,
@@ -138,6 +141,59 @@ pub(crate) fn refresh_appimage_entry(
     Ok(true)
 }
 
+/// Writes the link entry in `applications_dir` that starts `image`, when it
+/// names another image or is not there. Whether it was written, or `None`
+/// when `image` cannot be written into an `Exec` value.
+pub(crate) fn write_appimage_link_entry(
+    applications_dir: &Path,
+    image: &Path,
+    app_name: &str,
+) -> Result<Option<bool>, LinuxRenameError> {
+    let Some(entry) = image
+        .to_str()
+        .and_then(|image| appimage_link_entry(image, app_name))
+    else {
+        return Ok(None);
+    };
+    let path = applications_dir.join(APPIMAGE_LINK_ENTRY);
+    if read_regular_text(&path)?.as_deref() == Some(entry.as_str()) {
+        return Ok(Some(false));
+    }
+    fs::create_dir_all(applications_dir)
+        .map_err(|source| io_error("create", applications_dir, source))?;
+    write_atomic(&path, entry.as_bytes()).map_err(|source| write_error(&path, source))?;
+    Ok(Some(true))
+}
+
+/// Sets the link entry as the handler of each link type no program handles
+/// yet, through `xdg-mime`.
+fn claim_link_types() {
+    for link in link_types() {
+        let answer = match std::process::Command::new("xdg-mime")
+            .args(["query", "default", &link])
+            .output()
+        {
+            Ok(output) if output.status.success() => output.stdout,
+            Ok(_) => continue,
+            Err(error) => {
+                warn!(%error, "xdg-mime did not run; links were left to the system");
+                return;
+            }
+        };
+        if !claims_link_type(&String::from_utf8_lossy(&answer)) {
+            continue;
+        }
+        match std::process::Command::new("xdg-mime")
+            .args(["default", APPIMAGE_LINK_ENTRY, &link])
+            .status()
+        {
+            Ok(status) if status.success() => info!(link, "the AppImage handles links"),
+            Ok(_) => warn!(link, "xdg-mime did not set the link handler"),
+            Err(error) => warn!(%error, "xdg-mime did not run; links were left to the system"),
+        }
+    }
+}
+
 fn refresh_command_copy(path: &Path, source: &Path) -> Result<bool, LinuxRenameError> {
     if !is_regular_file(path)? {
         return Ok(false);
@@ -202,12 +258,28 @@ pub(crate) struct LinuxRenameSteps {
     pub(crate) appimage: Option<AppImageFiles>,
 }
 
-fn refresh_appimage(files: &AppImageFiles, home: Option<&Path>, app_name: &str) {
+fn refresh_appimage(files: &AppImageFiles, steps: &LinuxRenameSteps) {
+    let (home, app_name) = (steps.home.as_deref(), steps.app_name.as_str());
+    match jotra_storage::app_image::record_app_image(&steps.data_dir, &files.image) {
+        Ok(true) => info!("the AppImage this launch runs from was recorded"),
+        Ok(false) => {}
+        Err(error) => warn!(%error, "the AppImage record was left as it was"),
+    }
     if let Some(applications_dir) = &files.applications_dir {
         match refresh_appimage_entry(applications_dir, &files.image, app_name) {
             Ok(true) => info!("the AppImage desktop entry was rewritten"),
             Ok(false) => {}
             Err(error) => warn!(%error, "the AppImage desktop entry was left as it was"),
+        }
+        match write_appimage_link_entry(applications_dir, &files.image, app_name) {
+            Ok(Some(written)) => {
+                if written {
+                    info!("the AppImage link entry was written");
+                }
+                claim_link_types();
+            }
+            Ok(None) => warn!("the AppImage path cannot start it from a link"),
+            Err(error) => warn!(%error, "the AppImage link entry was left as it was"),
         }
     }
     let Some(bundled) = &files.bundled_cli else {
@@ -242,7 +314,7 @@ pub(crate) fn run_rename_steps(steps: &LinuxRenameSteps) -> Option<StepRun> {
         }
     };
     if let Some(files) = &steps.appimage {
-        refresh_appimage(files, steps.home.as_deref(), &steps.app_name);
+        refresh_appimage(files, steps);
     }
     autostart
 }
@@ -294,6 +366,31 @@ mod tests {
 
     fn signed(tag: &str) -> Vec<u8> {
         [tag.as_bytes(), CLI_SIGNATURE].concat()
+    }
+
+    #[test]
+    fn the_link_entry_follows_the_image_and_is_written_once() {
+        let home = tempfile::tempdir().expect("home");
+        let applications = home.path().join("share").join("applications");
+        let image = Path::new("/home/a/Jotra.AppImage");
+        let moved = Path::new("/home/a/Apps/Jotra.AppImage");
+        let entry = applications.join(APPIMAGE_LINK_ENTRY);
+
+        let write = |image: &Path| write_appimage_link_entry(&applications, image, "Jotra");
+        assert_eq!(write(image).expect("write"), Some(true));
+        assert_eq!(write(image).expect("again"), Some(false));
+        assert_eq!(
+            write(Path::new("/home/a/100%.AppImage")).expect("odd"),
+            None
+        );
+        let text = fs::read_to_string(&entry).expect("entry");
+        let exec = desktop_entry_value(&text, "Exec").expect("Exec");
+        assert_eq!(exec, "/home/a/Jotra.AppImage %u");
+
+        assert_eq!(write(moved).expect("moved"), Some(true));
+        let text = fs::read_to_string(&entry).expect("entry");
+        let exec = desktop_entry_value(&text, "Exec").expect("Exec");
+        assert_eq!(exec, "/home/a/Apps/Jotra.AppImage %u");
     }
 
     #[test]
@@ -610,5 +707,10 @@ mod tests {
         assert_eq!(fs::read(&beside).expect("beside"), signed("new"));
         let entry = fs::read_to_string(applications.join(APPIMAGE_ENTRY_FILE)).expect("entry");
         assert_eq!(desktop_entry_value(&entry, "Name"), Some("Jotra"));
+        assert_eq!(
+            jotra_storage::app_image::recorded_app_image(data.path()),
+            Some(image),
+            "a copy of the command finds the app through the record"
+        );
     }
 }

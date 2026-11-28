@@ -13,7 +13,9 @@ import { activityStore } from "../global/activity";
 import { aiRewriteStore } from "../global/ai-rewrite";
 import { bufferRegistry, type OpenOutcome } from "../global/buffer-registry";
 import { chatStore } from "../global/chat";
+import { commandUsageStore } from "../global/command-usage";
 import { configStore } from "../global/config";
+import { dropPendingRecentRemovals } from "../global/recent-removal";
 import { syncConfigFromDisk } from "../global/config-sync";
 import { probeDefaultAppSupport } from "../global/default-app-support";
 import { firstRunStore, watchSavesForRetitle } from "../global/first-run";
@@ -228,7 +230,8 @@ export async function receiveDroppedFiles(paths: string[], position?: DropPoint)
 
 /**
  * Opens files the OS, a drop or the `jotra` command handed to the window, one
- * line for every refusal, each at the line `lines` names for it.
+ * line for every refusal, each at the line `lines` names for it. The files
+ * that got no tab are reported back, which answers a `jotra --wait` on them.
  */
 export async function openPendingPaths(
   paths: string[],
@@ -246,6 +249,7 @@ export async function openPendingPaths(
     return;
   }
   const outcomes: OpenOutcome[] = [];
+  const unopened: string[] = [];
   for (const path of paths) {
     try {
       const outcome = await win.tabs.openPath(path);
@@ -253,12 +257,19 @@ export async function openPendingPaths(
       if (outcome.kind === "opened" && typeof line === "number") {
         win.editor.requestReveal(outcome.doc.id, line);
       }
+      if (outcome.kind === "declined" || outcome.kind === "refused") unopened.push(path);
       outcomes.push(outcome);
     } catch (error) {
+      unopened.push(path);
       outcomes.push({ kind: "refused", path, reason: openFailureReason(error) });
     }
   }
   reportOpenOutcomes(outcomes);
+  if (unopened.length > 0) {
+    await api.filesNotOpened(unopened).catch(() => {
+      logFailure("a waiting jotra command was not told a file did not open");
+    });
+  }
 }
 
 /** Reports the time to the next frame to Rust's startup log. */
@@ -279,13 +290,15 @@ export interface BootShell {
   prepareShell(): UnlistenFn[];
   registerCommands(): void;
   installKeyboard(): UnlistenFn;
-  runMenuAction(id: string): void;
+  /** Runs a native menu item's command; false when no command has that id yet. */
+  runMenuAction(id: string): boolean;
   /** Work the component does once the window is on screen. */
   afterReveal: ReadonlyArray<readonly [string, () => Promise<unknown> | unknown]>;
 }
 
 /** The window's boot, wired to the stores and services it runs against. */
 export function createBootPlan(win: WindowState, shell: BootShell): BootPlan {
+  const menuActions = holdUnregisteredMenuActions((id) => shell.runMenuAction(id));
   const externalEditDeps = createExternalEditDeps({
     editor: win.editor,
     openBuffers: () => bufferRegistry.buffers(),
@@ -328,8 +341,14 @@ export function createBootPlan(win: WindowState, shell: BootShell): BootPlan {
       // would be an IPC round-trip per resize feeding a signal nothing renders.
       if (!IS_MAC) off.push(await osWindowStore.installMaximizeSync());
       off.push(await osWindowStore.installGeometryPersistence());
-      off.push(await installCloseFlush([() => osWindowStore.flushGeometry()]));
-      off.push(...(await startWindowLifecycle()));
+      const lastWrites = [
+        () => osWindowStore.flushGeometry(),
+        () => configStore.flushPending(),
+        () => commandUsageStore.flush(),
+        () => dropPendingRecentRemovals(),
+      ];
+      off.push(await installCloseFlush(lastWrites));
+      off.push(...(await startWindowLifecycle(lastWrites)));
       return off;
     },
 
@@ -408,7 +427,7 @@ export function createBootPlan(win: WindowState, shell: BootShell): BootPlan {
             });
           }),
       ],
-      ["menu:action", () => onEvent("menu:action", (p) => shell.runMenuAction(p.action))],
+      ["menu:action", () => onEvent("menu:action", (p) => menuActions.run(p.action))],
       ["update:status", () => updateStore.subscribe()],
       // The window's own chord: what the OS said at startup, then every rebind,
       // so the shortcut editor can show a chord another app holds rather than a
@@ -465,6 +484,28 @@ export function createBootPlan(win: WindowState, shell: BootShell): BootPlan {
       ["default app", () => void probeDefaultAppSupport()],
       ["hotkey", () => void hotkeyStore.load()],
       ["capture hotkey", () => void captureHotkeyStore.load()],
+      ["held menu items", () => menuActions.release()],
     ],
+  };
+}
+
+/**
+ * Native menu items chosen while the commands they name are still being
+ * registered: held until the boot's last step, then run once.
+ */
+function holdUnregisteredMenuActions(runMenuAction: (id: string) => boolean) {
+  let held: string[] | null = [];
+  return {
+    run(id: string): void {
+      if (runMenuAction(id) || held === null) return;
+      held.push(id);
+    },
+    release(): void {
+      const waiting = held ?? [];
+      held = null;
+      for (const id of waiting) {
+        if (!runMenuAction(id)) logFailure(`the menu item "${id}" names no command`);
+      }
+    },
   };
 }

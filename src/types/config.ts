@@ -5,6 +5,9 @@ export type DefaultLayout = "source" | "split" | "preview";
 /** How a Markdown file is shown: rendered in the editor, or as its source. */
 export type MarkdownLayout = "inline" | "source";
 
+/** How wide a line of prose runs while Reading width is on. */
+export type ReadingMeasure = "narrow" | "medium" | "wide";
+
 export interface PreviewConfig {
   default_layout_html: DefaultLayout;
   default_layout_markdown: MarkdownLayout;
@@ -193,7 +196,7 @@ export interface JotraConfig {
   panel: PanelConfig;
   chat_panel: ChatPanelConfig;
   first_run: FirstRunConfig;
-  editor: { font_size: number; word_wrap: boolean; tab_size: number; autosave_debounce_ms: number; markdown_editing: boolean; status_bar: boolean; status_bar_counts: boolean; reading_width: boolean; load_remote_images?: boolean };
+  editor: { font_size: number; word_wrap: boolean; tab_size: number; autosave_debounce_ms: number; markdown_editing: boolean; status_bar: boolean; status_bar_counts: boolean; reading_width: boolean; reading_measure?: ReadingMeasure; load_remote_images?: boolean };
   window: { width: number; height: number; x?: number | null; y?: number | null; maximized: boolean };
   keybindings: Record<string, string>;
   history: { max_entries: number };

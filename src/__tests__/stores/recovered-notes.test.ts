@@ -45,7 +45,7 @@ function restoreAtLaunch(store: ReturnType<typeof createEditorStore>): Promise<v
     prepareShell: () => [],
     registerCommands: () => {},
     installKeyboard: () => () => {},
-    runMenuAction: () => {},
+    runMenuAction: () => true,
     afterReveal: [],
   });
   return plan.restoreRecovered();

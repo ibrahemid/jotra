@@ -283,6 +283,8 @@ pub fn generate_hex_dump(data: &[u8], total_bytes: usize) -> String {
 /// The helper:
 ///
 /// - drops arguments that begin with `-` (flags),
+/// - reads a `file://` URI as the local path it names, the way a Linux
+///   launcher's `%U` hands an opened file over,
 /// - drops paths that do not exist or are not regular files,
 /// - converts to absolute paths via [`std::fs::canonicalize`], falling back
 ///   to the input path when canonicalisation fails (rare but possible on
@@ -309,7 +311,7 @@ where
             }
         }
 
-        let candidate = PathBuf::from(&raw);
+        let candidate = file_uri_path(&raw).unwrap_or_else(|| PathBuf::from(&raw));
         if !candidate.is_file() {
             continue;
         }
@@ -323,6 +325,21 @@ where
     }
 
     out
+}
+
+/// The local path a `file://` URI names, or `None` for any other argument and
+/// for a URI that names a file on another host.
+fn file_uri_path(raw: &std::ffi::OsStr) -> Option<PathBuf> {
+    let text = raw.to_str()?;
+    if !text.get(..7)?.eq_ignore_ascii_case("file://") {
+        return None;
+    }
+    let uri = url::Url::parse(text).ok()?;
+    // Windows turns a host into a network share path; the other systems refuse it.
+    if uri.host_str().is_some_and(|host| !host.is_empty()) {
+        return None;
+    }
+    uri.to_file_path().ok()
 }
 
 #[cfg(windows)]

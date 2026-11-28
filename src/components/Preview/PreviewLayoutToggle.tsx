@@ -4,7 +4,6 @@ import { useWindow } from "../WindowProvider/WindowProvider";
 import { useActiveBuffer } from "../../lib/use-active-buffer";
 import { contentTypeForBuffer } from "../../lib/content-type";
 import { defaultSplit, type LayoutKind, type LayoutMode } from "../../lib/preview-layout";
-import { withChord } from "../../lib/command-chord";
 import Tooltip from "../Tooltip/Tooltip";
 import "./preview-layout-toggle.css";
 
@@ -122,7 +121,7 @@ export default function PreviewLayoutToggle() {
           {(seg, index) => {
             const isActive = () => currentKind() === seg.kind;
             return (
-              <Tooltip label={withChord(seg.tip, "preview.cycleLayout")} anchorRole="none">
+              <Tooltip label={seg.tip} kbd="preview.cycleLayout" anchorRole="none">
                 <button
                   type="button"
                   class="layout-toggle-seg"

@@ -2,7 +2,7 @@
 
 use jotra_core::instance::OpenRequest;
 use jotra_storage::instance::{
-    acquire, lock_path, requests_dir, send_request, take_requests, InstanceLockError,
+    acquire, is_held, lock_path, requests_dir, send_request, take_requests, InstanceLockError,
 };
 
 fn request(paths: &[&str], sent_at_ms: i64) -> OpenRequest {
@@ -28,6 +28,21 @@ fn claiming_creates_the_folder_and_the_lock_file() {
     let jotra_dir = dir.path().join("data");
     let _lock = acquire(&jotra_dir).expect("claim");
     assert!(lock_path(&jotra_dir).is_file());
+}
+
+#[test]
+fn a_look_at_the_folder_another_command_is_taking_does_not_read_as_a_running_app() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    assert!(!is_held(dir.path()));
+    let other_look = std::fs::File::open(lock_path(dir.path())).expect("lock file");
+    other_look.lock_shared().expect("the other command's look");
+    assert!(!is_held(dir.path()));
+    drop(other_look);
+
+    let app = acquire(dir.path()).expect("the app claims the folder");
+    assert!(is_held(dir.path()));
+    drop(app);
+    assert!(!is_held(dir.path()));
 }
 
 #[test]

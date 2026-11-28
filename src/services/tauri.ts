@@ -888,6 +888,11 @@ export async function openFileConfirmed(path: string): Promise<FileOpenResult> {
   return invoke("open_file_confirmed", { path });
 }
 
+// Files handed to the window that got no tab, so a `jotra --wait` on them returns.
+export async function filesNotOpened(paths: string[]): Promise<void> {
+  return invoke("files_not_opened", { paths });
+}
+
 // The language chosen for a file, or null to let its name decide. Answers the
 // row as it now stands.
 export async function setBufferLanguage(
@@ -1301,16 +1306,6 @@ export async function previewListRenderers(): Promise<PreviewRendererInfo[]> {
   return invoke("preview_list_renderers");
 }
 
-export async function previewRender(
-  bufferId: string,
-  contentType: string,
-  text: string,
-  theme: ThemePolarity,
-  zoom: number,
-): Promise<PreviewRenderResult> {
-  return invoke("preview_render", { bufferId, contentType, text, theme, zoom });
-}
-
 export async function previewForceRender(
   bufferId: string,
   contentType: string,
@@ -1575,6 +1570,10 @@ export async function getDefaultAppStatus(id: string): Promise<DefaultAppStatus>
   return invoke("get_default_app_status", { id });
 }
 
+export async function getDefaultAppSupport(): Promise<boolean> {
+  return invoke("get_default_app_support");
+}
+
 export async function setDefaultApp(id: string): Promise<void> {
   return invoke("set_default_app", { id });
 }
@@ -1677,6 +1676,17 @@ export async function captureTarget(): Promise<string> {
  * the keyboard back. */
 export async function closeCapture(returnFocus: boolean): Promise<void> {
   return invoke("capture_close", { returnFocus });
+}
+
+/** The capture note's unsent text, kept across a quit. */
+export async function captureDraft(): Promise<string> {
+  return invoke("capture_draft");
+}
+
+/** Hands the capture note's text to the app, which writes it to disk when the
+ * note hides and when the app quits. */
+export async function keepCaptureDraft(text: string): Promise<void> {
+  return invoke("capture_keep_draft", { text });
 }
 
 // --- Open at login ---

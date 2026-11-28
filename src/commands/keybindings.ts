@@ -5,6 +5,7 @@ import {
   notifyRegistryChanged,
 } from "./registry";
 import { effectiveBinding } from "./effective-bindings";
+import { isCommandOffered } from "./app-commands";
 import { isModalOpen } from "../lib/modal-stack";
 import { canonicalChord, chordFromKey, chordFromPosition } from "../lib/chord";
 import { isImeComposing } from "../lib/ime";
@@ -46,18 +47,44 @@ export function normalizeKey(e: KeyboardEvent, platform: Platform = detectPlatfo
   return chordFromKey(e, platform);
 }
 
-const keyBindingMap = new Map<string, string>();
+/** A command that holds a chord, and whether the chord is one of its aliases. */
+interface ChordHolder {
+  id: string;
+  alias: boolean;
+}
+
+const keyBindingMap = new Map<string, ChordHolder[]>();
+
+/**
+ * The holder a chord runs: the last registered among the commands the
+ * shortcut editor lists, so a chord the person gave a command is never taken
+ * by an app that is off; a command of an app that is off only when no other
+ * command holds the chord.
+ */
+function answeringHolder(holders: readonly ChordHolder[] | undefined): string | undefined {
+  if (!holders || holders.length === 0) return undefined;
+  for (let i = holders.length - 1; i >= 0; i--) {
+    const cmd = getCommand(holders[i].id);
+    if (cmd && isCommandOffered(cmd)) return holders[i].id;
+  }
+  return holders[holders.length - 1].id;
+}
 
 /**
  * The command a keystroke names: by the character first, then by the key's
  * position, so Ctrl+N on an Arabic layout (character "ى", position KeyN) still
- * makes a file while punctuation chords keep their character.
+ * makes a file while punctuation chords keep their character. An alias names
+ * the character it is for, so a shifted punctuation key reaches it by
+ * character only: Cmd+? on a US layout is not the CmdOrCtrl+Shift+/ alias.
  */
 function commandForKey(e: KeyboardEvent, platform: Platform): string | undefined {
-  const byKey = keyBindingMap.get(chordFromKey(e, platform));
+  const byKey = answeringHolder(keyBindingMap.get(chordFromKey(e, platform)));
   if (byKey) return byKey;
   const byPosition = chordFromPosition(e, platform);
-  return byPosition === null ? undefined : keyBindingMap.get(byPosition);
+  if (byPosition === null) return undefined;
+  const holders = keyBindingMap.get(byPosition);
+  const punctuation = !/^(Key[A-Z]|Digit[0-9]|Space)$/.test(e.code ?? "");
+  return answeringHolder(punctuation ? holders?.filter((holder) => !holder.alias) : holders);
 }
 
 let lastShiftTime = 0;
@@ -70,15 +97,18 @@ export function rebuildKeyMap() {
 
   for (const cmd of getAllCommands()) {
     const primary = effectiveBinding(cmd.id, cmd.keybinding);
-    const bindings = [primary, ...(cmd.keybindingAliases ?? [])].filter(
-      (b): b is string => Boolean(b),
-    );
-    for (const binding of bindings) {
+    const bindings = [
+      ...(primary ? [{ binding: primary, alias: false }] : []),
+      ...(cmd.keybindingAliases ?? []).map((binding) => ({ binding, alias: true })),
+    ];
+    for (const { binding, alias } of bindings) {
+      if (!binding) continue;
       if (binding === "Shift+Shift") {
         shiftCommandId = cmd.id;
         continue;
       }
-      keyBindingMap.set(canonicalChord(binding, platform), cmd.id);
+      const chord = canonicalChord(binding, platform);
+      keyBindingMap.set(chord, [...(keyBindingMap.get(chord) ?? []), { id: cmd.id, alias }]);
     }
   }
 

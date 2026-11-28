@@ -112,7 +112,7 @@ const CALL_PHRASES: Readonly<Record<string, CallPhrase>> = {
     beforePath: "",
     alone: "a file",
   },
-  today: { done: "used", asked: "use", beforePath: "", alone: "today's file" },
+  today: { done: "found", asked: "use", beforePath: "", alone: "today's file" },
   restore_note_version: {
     done: "put back",
     asked: "put back",
@@ -135,13 +135,26 @@ const CALL_PHRASES: Readonly<Record<string, CallPhrase>> = {
   discard_proposal: { done: "changed", asked: "change", beforePath: "", alone: "a file" },
 };
 
-export function describeCall(logged: string, namesFile: boolean, decision: ActivityDecision): string {
+// `today` logs the bytes it wrote: none when it only found the day's file,
+// zero when it made one with nothing in it.
+function todayVerb(bytes: number | null | undefined): string {
+  if (bytes === null || bytes === undefined) return "found";
+  return bytes > 0 ? "added to" : "made";
+}
+
+export function describeCall(
+  logged: string,
+  namesFile: boolean,
+  decision: ActivityDecision,
+  bytes?: number | null,
+): string {
   const action = currentActivityAction(logged);
   const phrase = CALL_PHRASES[action];
   if (!phrase) return action.replace(/_/g, " ");
   const done = decision === "allow" && !isReadAction(action);
   if (action === "rename_note" && namesFile && done) return "renamed a file to";
-  const verb = done ? phrase.done : `asked to ${phrase.asked}`;
+  const doneVerb = action === "today" ? todayVerb(bytes) : phrase.done;
+  const verb = done ? doneVerb : `asked to ${phrase.asked}`;
   const object = namesFile && phrase.beforePath !== undefined ? phrase.beforePath : phrase.alone;
   return object ? `${verb} ${object}` : verb;
 }

@@ -11,6 +11,8 @@ function calls(overrides: Partial<CaptureCalls> = {}) {
     append: vi.fn(async () => ({ name: "2026-10-15.txt", added: true })),
     target: vi.fn(async () => "2026-10-15.txt"),
     close: vi.fn(async () => {}),
+    draft: vi.fn(async () => ""),
+    keep: vi.fn(async () => {}),
     ...overrides,
   };
 }
@@ -97,6 +99,39 @@ describe("the capture note", () => {
 });
 
 describe("what a note that was not written says", () => {
+  it("hands each change of the text to the app, and the empty field once it is sent", async () => {
+    const fake = calls();
+    const capture = note(fake);
+    capture.setText("buy");
+    capture.setText("buy milk");
+    await capture.submit();
+    expect(vi.mocked(fake.keep).mock.calls.map(([text]) => text)).toEqual(["buy", "buy milk", ""]);
+  });
+
+  it("keeps the text it could not add for the next launch", async () => {
+    const fake = calls({ append: vi.fn(async () => Promise.reject("ERR_WRITE_FAILED: no room")) });
+    const capture = note(fake);
+    capture.setText("buy milk");
+    await capture.submit();
+    expect(fake.keep).toHaveBeenLastCalledWith("buy milk");
+  });
+
+  it("gives back the text it held when the app last quit", async () => {
+    const capture = note(calls({ draft: vi.fn(async () => "call the bank") }));
+    await capture.restoreDraft();
+    expect(capture.text()).toBe("call the bank");
+  });
+
+  it("leaves what was typed while the last text was being read", async () => {
+    let answer: (text: string) => void = () => {};
+    const capture = note(calls({ draft: vi.fn(() => new Promise<string>((done) => (answer = done))) }));
+    const restoring = capture.restoreDraft();
+    capture.setText("new thought");
+    answer("call the bank");
+    await restoring;
+    expect(capture.text()).toBe("new thought");
+  });
+
   it("names a file that kept changing and how to try again", () => {
     expect(captureFailureMessage("ERR_FILE_CHANGED_ON_DISK: changed", "2026-10-15.txt")).toBe(
       "2026-10-15.txt kept changing while this was being added. Press Escape to try again.",

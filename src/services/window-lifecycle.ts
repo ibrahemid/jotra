@@ -17,13 +17,16 @@ import { logFailure } from "../lib/log";
 // shutdown path asks for the flush and waits for the answer, so the answer has
 // to go back even when a write failed. Withholding it only holds the quit for
 // the timeout and then exits anyway.
-export async function startWindowLifecycle(): Promise<UnlistenFn[]> {
+export async function startWindowLifecycle(
+  extraFlushes: ReadonlyArray<() => Promise<void> | void> = [],
+  deadlineMs: number = QUIT_FLUSH_DEADLINE_MS,
+): Promise<UnlistenFn[]> {
   const unlistenFocus = await onWindowFocusChange((focused) => {
     if (!focused) void flushAutosave();
   });
 
   const unlistenQuit = await onEvent("quit:flush", () => {
-    void flushThenConfirm();
+    void flushThenConfirm(extraFlushes, deadlineMs);
   });
 
   return [unlistenFocus, unlistenQuit];
@@ -59,9 +62,28 @@ async function keepUnsavedText(flushed: SaveResult, when: string): Promise<void>
   }
 }
 
-async function flushThenConfirm(): Promise<void> {
+/**
+ * How long quitting waits on each step of the last writes. The shutdown stops
+ * waiting for the answer after 2 s (`QUIT_FLUSH_TIMEOUT`), so the flush and
+ * the journal behind it both have to fit inside that.
+ */
+export const QUIT_FLUSH_DEADLINE_MS = 600;
+
+async function flushThenConfirm(
+  extraFlushes: ReadonlyArray<() => Promise<void> | void>,
+  deadlineMs: number,
+): Promise<void> {
   try {
-    await keepUnsavedText(await flushAutosave(), "quitting");
+    const extras = Promise.all(
+      extraFlushes.map((flush) => Promise.resolve().then(flush).catch(() => undefined)),
+    );
+    const flushed = await within(flushAutosave(), deadlineMs);
+    if (flushed === TIMED_OUT) logFailure("a save did not finish before quitting");
+    const outcome = flushed === TIMED_OUT ? { ok: true, failures: [] } : flushed;
+    if ((await within(keepUnsavedText(outcome, "quitting"), deadlineMs)) === TIMED_OUT) {
+      logFailure("unsaved text could not be kept before quitting");
+    }
+    await within(extras, deadlineMs);
   } finally {
     await confirmQuitFlush();
   }

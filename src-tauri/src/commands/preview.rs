@@ -4,10 +4,9 @@
 //!   frontend's `rendererRegistry` global.
 //! - [`preview_open`] / [`preview_close`] — webview-slot assignment for a
 //!   `(window, buffer)` pair.
-//! - [`preview_render`] / [`preview_force_render`] — run the renderer over
-//!   the live buffer text and cache the HTML for the protocol handler. The
-//!   frontend debounces keystroke-driven renders; `force_render` is the Cmd+R
-//!   path (identical at the IPC boundary — the debounce gate is frontend-side).
+//! - [`preview_force_render`] — run the renderer over the live buffer text
+//!   and cache the HTML for the protocol handler. The frontend debounces
+//!   keystroke-driven renders before it asks.
 //!
 //! Phase 2b adds `preview_set_layout`, `preview_detach`, `preview_print`,
 //! `preview_export` alongside the layout surface.
@@ -356,7 +355,7 @@ pub enum CachedRender {
     Failed(RenderError),
 }
 
-/// [`preview_render`] without Tauri: render the request with the renderer
+/// [`preview_force_render`] without Tauri: render the request with the renderer
 /// registered for its content type and cache the document for the protocol
 /// handler, with the request's asset scope and the file's scripts opt-in. The
 /// handler serves the cached document under the CSP that opt-in calls for.
@@ -451,26 +450,11 @@ fn render_error_message(err: &RenderError) -> String {
 }
 
 /// Render the live buffer text and cache the result for the protocol
-/// handler. Invoked by the frontend debouncer after a keystroke.
+/// handler. The frontend asks after its keystroke debounce and on Cmd+R.
 ///
 /// Off the main thread, and in the buffer's render queue: renders of one
 /// buffer run one at a time in the order they were asked for, so the cache
 /// ends on the newest text (ADR-047).
-#[tauri::command]
-pub async fn preview_render<R: Runtime>(
-    app: AppHandle<R>,
-    buffer_id: String,
-    content_type: String,
-    text: String,
-    theme: ThemePolarity,
-    zoom: f64,
-) -> Result<PreviewRenderResult, String> {
-    render_in_order(app, buffer_id, content_type, text, theme, zoom).await
-}
-
-/// Force a render regardless of frontend debounce gating (Cmd+R). Identical
-/// to [`preview_render`] at the IPC boundary; the debounce lives frontend-
-/// side.
 #[tauri::command]
 pub async fn preview_force_render<R: Runtime>(
     app: AppHandle<R>,

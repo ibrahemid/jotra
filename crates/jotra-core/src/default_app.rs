@@ -98,17 +98,18 @@ pub fn claimable_types() -> &'static [ClaimableType] {
                 "public.c-header",
                 "public.swift-source",
             ],
-            // JSX and Swift have no shared-mime-info type: a default set for
-            // a made-up one reads back as Jotra's while their files open
-            // elsewhere.
+            // `text/jsx` and `text/x-swift` are newer shared-mime-info types;
+            // `known_mimes` leaves them out where the system has not got them.
             mimes: &[
                 "text/rust",
                 "text/x-go",
+                "text/jsx",
                 "application/typescript",
                 "text/x-python",
                 "text/x-shellscript",
                 "text/javascript",
                 "text/x-c",
+                "text/x-swift",
             ],
         },
     ];
@@ -188,6 +189,37 @@ pub fn aggregate_status(statuses: &[DefaultAppStatus]) -> DefaultAppStatus {
         .unwrap_or(DefaultAppStatus::NoHandler)
 }
 
+/// What the running system offers for making Jotra a default app.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DefaultAppSystem {
+    /// macOS, where Launch Services sets the default per type.
+    MacOs,
+    /// Windows, where only the user picks a default, in Settings.
+    Windows,
+    /// Linux, where `xdg-mime` sets the default against Jotra's desktop entry.
+    Linux {
+        /// Jotra's desktop entry is installed.
+        desktop_entry: bool,
+        /// `xdg-mime` is on the search path.
+        xdg_mime: bool,
+    },
+    /// Any other system.
+    Other,
+}
+
+/// Whether `system` lets the default-app control be offered at all, answered
+/// from what is installed without reading any type's current default.
+pub fn offers_default_apps(system: DefaultAppSystem) -> bool {
+    match system {
+        DefaultAppSystem::MacOs | DefaultAppSystem::Windows => true,
+        DefaultAppSystem::Linux {
+            desktop_entry,
+            xdg_mime,
+        } => desktop_entry && xdg_mime,
+        DefaultAppSystem::Other => false,
+    }
+}
+
 /// The Windows settings page where the user picks default apps. Windows lets
 /// no app make itself the default, so Jotra opens this page instead.
 pub const WINDOWS_DEFAULT_APPS_URI: &str = "ms-settings:defaultapps";
@@ -204,10 +236,10 @@ pub const DESKTOP_ENTRY_NAMES: &[&str] = &[
 
 const CURRENT_DESKTOP_ENTRY_COUNT: usize = 2;
 
-/// The folders a desktop entry is looked up in, in the XDG order:
-/// `$XDG_DATA_HOME/applications` (default `~/.local/share/applications`),
-/// then each of `$XDG_DATA_DIRS` (default `/usr/local/share:/usr/share`).
-pub fn application_dirs(
+/// The XDG data folders, in order: `$XDG_DATA_HOME` (default
+/// `~/.local/share`), then each of `$XDG_DATA_DIRS` (default
+/// `/usr/local/share:/usr/share`).
+pub fn data_dirs(
     data_home: Option<&str>,
     data_dirs: Option<&str>,
     home: Option<&std::path::Path>,
@@ -216,10 +248,10 @@ pub fn application_dirs(
 
     let mut dirs = Vec::new();
     match data_home.map(str::trim).filter(|value| !value.is_empty()) {
-        Some(value) => dirs.push(PathBuf::from(value).join("applications")),
+        Some(value) => dirs.push(PathBuf::from(value)),
         None => {
             if let Some(home) = home {
-                dirs.push(home.join(".local/share/applications"));
+                dirs.push(home.join(".local/share"));
             }
         }
     }
@@ -231,9 +263,54 @@ pub fn application_dirs(
         data_dirs
             .split(':')
             .filter(|dir| !dir.is_empty())
-            .map(|dir| PathBuf::from(dir).join("applications")),
+            .map(PathBuf::from),
     );
     dirs
+}
+
+/// The folders a desktop entry is looked up in: `applications` inside each of
+/// [`data_dirs`], in the same order.
+pub fn application_dirs(
+    data_home: Option<&str>,
+    data_dirs: Option<&str>,
+    home: Option<&std::path::Path>,
+) -> Vec<std::path::PathBuf> {
+    self::data_dirs(data_home, data_dirs, home)
+        .into_iter()
+        .map(|dir| dir.join("applications"))
+        .collect()
+}
+
+/// The names a shared-mime-info database knows, from the `mime/types` file of
+/// one data folder (a type per line) and its `mime/aliases` file (an alias and
+/// its type per line).
+pub fn mime_database_names(types: &str, aliases: &str) -> std::collections::HashSet<String> {
+    let types = types
+        .lines()
+        .filter_map(|line| line.split_whitespace().next());
+    let aliases = aliases
+        .lines()
+        .flat_map(|line| line.split_whitespace().take(2));
+    types
+        .chain(aliases)
+        .filter(|name| name.contains('/'))
+        .map(str::to_owned)
+        .collect()
+}
+
+/// The types of `mimes` the system's database names, in order, or all of
+/// them when no database could be read (`known` is `None`). A default set
+/// for a type the database lacks reads back as Jotra's while the files it is
+/// meant for open as another type.
+pub fn known_mimes<'a>(
+    mimes: &[&'a str],
+    known: Option<&std::collections::HashSet<String>>,
+) -> Vec<&'a str> {
+    mimes
+        .iter()
+        .copied()
+        .filter(|mime| known.is_none_or(|known| known.contains(*mime)))
+        .collect()
 }
 
 /// The desktop entry a default is written for: the first current name found in
@@ -271,6 +348,37 @@ pub fn desktop_entry_status(answer: &str, ours: &str) -> DefaultAppStatus {
                 .to_string(),
         ),
     }
+}
+
+/// The hidden desktop entry a release AppImage writes in the user's
+/// applications folder so links under either scheme reach it: an image
+/// nobody integrated has no entry of its own.
+pub const APPIMAGE_LINK_ENTRY: &str = "jotra-links.desktop";
+
+/// The link types [`APPIMAGE_LINK_ENTRY`] handles, one per scheme a link is
+/// read under.
+pub fn link_types() -> [String; 2] {
+    [crate::jotra_link::SCHEME, crate::legacy_names::LINK_SCHEME]
+        .map(|scheme| format!("x-scheme-handler/{scheme}"))
+}
+
+/// The text of [`APPIMAGE_LINK_ENTRY`] starting the image at `image` with the
+/// link it is handed, or `None` when the path cannot be written into an
+/// `Exec` value.
+pub fn appimage_link_entry(image: &str, app_name: &str) -> Option<String> {
+    let exec = crate::linux_rename::exec_argument(image)?;
+    Some(format!(
+        "[Desktop Entry]\nType=Application\nName={app_name}\nExec={exec} %u\nTerminal=false\nNoDisplay=true\nMimeType={};\n",
+        link_types().join(";")
+    ))
+}
+
+/// Whether an AppImage sets its link entry as the handler of a link type,
+/// given what `xdg-mime query default` answers for it: only while no program
+/// handles the type, so a handler already set, an installed package's among
+/// them, is kept.
+pub fn claims_link_type(answer: &str) -> bool {
+    answer.trim().is_empty()
 }
 
 #[cfg(test)]

@@ -107,8 +107,9 @@ pub struct WriteNoteArgs {
     pub content: String,
     /// The hash read_note or an earlier write_note returned for this note.
     /// The write is made only while the note still holds that text; a note
-    /// somebody edited in between is left alone and your text is written
-    /// beside it. Leave it out and the note is compared with the text you
+    /// somebody edited in between is left alone, and your text is written
+    /// beside it unless Jotra asks before your writes, which writes nothing
+    /// then. Leave it out and the note is compared with the text you
     /// last read or wrote in this session, and a note you have not read is
     /// refused.
     pub expected_hash: Option<String>,
@@ -395,9 +396,9 @@ impl JotraServer {
     #[tool(
         name = "write_note",
         description = "Replace the text of a note that already exists. Read it first: a note \
-            edited since you read it is left alone, with your text written beside it, and a \
-            note you have not read is refused unless you pass overwrite. Jotra keeps the text \
-            every write replaces.",
+            edited since you read it is left alone, with your text written beside it unless \
+            Jotra asks before your writes, and a note you have not read is refused unless you \
+            pass overwrite. Jotra keeps the text every write replaces.",
         annotations(
             read_only_hint = false,
             destructive_hint = true,
@@ -539,9 +540,16 @@ impl JotraServer {
 
     #[tool(
         name = "open_in_jotra",
-        description = "Show a file to the user in Jotra, at a line when you pass one. Changes \
-            no file. Answers with open_url, the jotra:// link Jotra was handed.",
-        annotations(read_only_hint = true, open_world_hint = false)
+        description = "Show a file to the user in Jotra, at a line when you pass one. Starts \
+            Jotra when it is not running and brings it forward. Changes no file. Answers \
+            with open_url, the jotra:// link Jotra was handed, and starting when Jotra is \
+            still opening and shows the file once it has.",
+        annotations(
+            read_only_hint = false,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
     )]
     async fn open_in_jotra(
         &self,
@@ -556,9 +564,16 @@ impl JotraServer {
 
     #[tool(
         name = "reveal",
-        description = "Show a file to the user in Jotra at a heading or a line. Changes no \
-            file. Answers with open_url, the jotra:// link Jotra was handed.",
-        annotations(read_only_hint = true, open_world_hint = false)
+        description = "Show a file to the user in Jotra at a heading or a line. Starts Jotra \
+            when it is not running and brings it forward. Changes no file. Answers with \
+            open_url, the jotra:// link Jotra was handed, and starting when Jotra is still \
+            opening and shows the file once it has.",
+        annotations(
+            read_only_hint = false,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
     )]
     async fn reveal(
         &self,
@@ -829,6 +844,7 @@ fn mcp_error(error: ToolError) -> ErrorData {
         | ToolError::ContextNotAllowed { .. }
         | ToolError::Unnamed => ErrorData::invalid_request(message, None),
         ToolError::OutsideNotesFolder { .. }
+        | ToolError::SkippedName { .. }
         | ToolError::TooLarge { .. }
         | ToolError::TooMuchText { .. }
         | ToolError::HashNotUnderstood { .. }
@@ -963,6 +979,28 @@ mod tests {
         assert!(
             line.contains(&format!("{sees} that sees the file open in Jotra")),
             "{line}"
+        );
+    }
+
+    #[test]
+    fn write_note_says_a_program_jotra_asks_about_gets_nothing_beside_the_note() {
+        let dir = tempfile::TempDir::new().expect("temp dir");
+        let server = JotraServer::new(host(dir.path(), true));
+        let write_note = server
+            .listed_tools()
+            .into_iter()
+            .find(|tool| tool.name == "write_note")
+            .expect("write_note is listed");
+
+        let description = write_note.description.as_deref().unwrap_or_default();
+        assert!(
+            description.contains("written beside it unless Jotra asks before your writes"),
+            "{description}"
+        );
+        let schema = serde_json::to_string(&write_note.input_schema).expect("schema");
+        assert!(
+            schema.contains("unless Jotra asks before your writes, which writes nothing"),
+            "{schema}"
         );
     }
 

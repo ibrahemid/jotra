@@ -24,6 +24,9 @@ use jotra_tauri_lib::bus_subscribers::{attach_bus_subscribers, BusHost};
 use jotra_tauri_lib::commands::activity::announce_waiting_inner;
 use jotra_tauri_lib::commands::buffer::read_buffer_content_inner;
 use jotra_tauri_lib::commands::file::open_file_from_path;
+use jotra_tauri_lib::commands::login_item::{
+    reconcile_login_item, LoginItem, LoginItemError, LoginLaunch,
+};
 use jotra_tauri_lib::commands::notes::open_or_mint_dated_note;
 use jotra_tauri_lib::commands::preview::{
     preview_set_scripts_inner, render_into_cache, CachedRender,
@@ -61,6 +64,23 @@ impl BusHost for Headless {
 
     fn announce_waiting_clients(&self) {
         let _ = announce_waiting_inner(&self.state);
+    }
+
+    fn reconcile_login_item(&self) {
+        let _ = reconcile_login_item(&self.state, &AbsentLoginItem, LoginLaunch::INSTALLED);
+    }
+}
+
+/// An OS with no login item that takes every change.
+struct AbsentLoginItem;
+
+impl LoginItem for AbsentLoginItem {
+    fn is_enabled(&self) -> Result<bool, LoginItemError> {
+        Ok(false)
+    }
+
+    fn set(&self, _on: bool) -> Result<(), LoginItemError> {
+        Ok(())
     }
 }
 

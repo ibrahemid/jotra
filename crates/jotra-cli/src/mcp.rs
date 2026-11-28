@@ -16,9 +16,9 @@ use std::time::Duration;
 
 use jotra_core::open_context::OpenContext;
 use jotra_core::write_review::{
-    ReviewAnswer, ReviewUnavailable, WriteProposal, WriteReview, REVIEW_WAIT,
+    review_wait_for, ReviewAnswer, ReviewUnavailable, WriteProposal, WriteReview,
 };
-use jotra_mcp::tools::{AppNotesFolder, ContextSource, JotraNotReached, JotraOpener};
+use jotra_mcp::tools::{AppNotesFolder, ContextSource, JotraNotReached, JotraOpener, LinkHanded};
 
 use crate::handoff::{self, Timings};
 use crate::resolve_app_notes_dir;
@@ -60,12 +60,12 @@ impl AppNotesFolder for ConfiguredAppFolder {
     }
 }
 
-/// How long `open_in_jotra` waits for Jotra to take its link: a tool call holds
-/// the client until it answers, so a Jotra that is starting gets half the
-/// minute a request stays fresh.
+/// How long `open_in_jotra` waits for Jotra to take its link. A tool call holds
+/// the client until it answers, so a Jotra that is starting gets a few seconds,
+/// and after them the link stays waiting for it to take as it opens.
 pub const OPEN_TIMINGS: Timings = Timings {
     running: Duration::from_secs(10),
-    launched: Duration::from_secs(30),
+    launched: Duration::from_secs(5),
     poll: Duration::from_millis(100),
 };
 
@@ -83,9 +83,12 @@ impl<L> JotraOpener for LinkHandoff<L>
 where
     L: Fn() -> bool + Send + Sync,
 {
-    fn open_link(&self, link: &str) -> Result<(), JotraNotReached> {
-        handoff::deliver_link(&self.jotra_dir, link, &self.launch, OPEN_TIMINGS)
-            .map_err(|_| JotraNotReached)
+    fn open_link(&self, link: &str) -> Result<LinkHanded, JotraNotReached> {
+        match handoff::deliver_link(&self.jotra_dir, link, &self.launch, OPEN_TIMINGS) {
+            Ok(handoff::LinkDelivery::Taken) => Ok(LinkHanded::Taken),
+            Ok(handoff::LinkDelivery::Starting) => Ok(LinkHanded::Starting),
+            Err(_) => Err(JotraNotReached),
+        }
     }
 }
 
@@ -127,7 +130,12 @@ pub struct ReviewHandoff {
 
 impl WriteReview for ReviewHandoff {
     fn review(&self, proposal: &WriteProposal) -> Result<ReviewAnswer, ReviewUnavailable> {
-        handoff::ask_review(&self.jotra_dir, proposal, REVIEW_WAIT, REVIEW_POLL)
+        handoff::ask_review(
+            &self.jotra_dir,
+            proposal,
+            review_wait_for(&proposal.program),
+            REVIEW_POLL,
+        )
     }
 }
 

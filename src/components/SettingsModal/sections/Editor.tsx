@@ -1,6 +1,6 @@
 import { For } from "solid-js";
 import { configStore, EDITOR_FONT_MIN, EDITOR_FONT_MAX } from "../../../stores/global/config";
-import type { MarkdownLayout, SidebarSectionId } from "../../../types/config";
+import type { MarkdownLayout, ReadingMeasure, SidebarSectionId } from "../../../types/config";
 import { SectionLabel, clamp, parseIntSafe, patchConfig } from "../controls";
 import { ChordHints, FONT_SIZE_CHORDS, MARKDOWN_CHORDS, ProseSample } from "../previews";
 import { SettingsRow, SwitchRow } from "../SettingsRow";
@@ -69,6 +69,11 @@ export default function EditorSection() {
     void patchConfig((prev) => ({ ...prev, spelling: { ...prev.spelling, dialect: raw } }));
   }
 
+  function onReadingMeasureChange(raw: string) {
+    const measure = raw as ReadingMeasure;
+    void patchConfig((prev) => ({ ...prev, editor: { ...prev.editor, reading_measure: measure } }));
+  }
+
   function onMarkdownLayoutChange(raw: string) {
     const layout = raw as MarkdownLayout;
     void patchConfig((prev) => ({
@@ -125,6 +130,24 @@ export default function EditorSection() {
         checked={cfg().reading_width}
         onChange={() => toggleEditor("reading_width")}
       />
+      <SettingsRow
+        id="editor.reading_measure"
+        labelFor="setting-reading-measure"
+        caution={cfg().reading_width ? undefined : "Turn on Reading width to pick a line length."}
+      >
+        <select
+          id="setting-reading-measure"
+          class="settings-select"
+          data-setting="reading_measure"
+          disabled={!cfg().reading_width}
+          value={cfg().reading_measure ?? "medium"}
+          onChange={(e) => onReadingMeasureChange(e.currentTarget.value)}
+        >
+          <option value="narrow">Narrow</option>
+          <option value="medium">Medium</option>
+          <option value="wide">Wide</option>
+        </select>
+      </SettingsRow>
       <SwitchRow
         id="editor.markdown_editing"
         setting="markdown_editing"

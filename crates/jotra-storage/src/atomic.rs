@@ -605,13 +605,31 @@ pub fn write_atomic(target: &Path, bytes: &[u8]) -> Result<(), AtomicWriteError>
 /// will not take the temp file, and [`AtomicWriteError::Io`] when the write,
 /// the sync or the rename fails. No temp file is left behind.
 pub fn write_new(target: &Path, bytes: &[u8]) -> Result<(), AtomicWriteError> {
+    write_new_file(target, bytes, false)
+}
+
+/// [`write_new`] for a file only the current user may open, on every platform.
+///
+/// The temp file is created readable by its owner alone on macOS and Linux,
+/// and the name keeps that. On Windows it is created with an access list of
+/// one entry, for the current user, and nothing inherited from the folder.
+///
+/// # Errors
+///
+/// As [`write_new`], and [`AtomicWriteError::Io`] when the access list cannot
+/// be built. No temp file is left behind.
+pub fn write_new_private(target: &Path, bytes: &[u8]) -> Result<(), AtomicWriteError> {
+    write_new_file(target, bytes, true)
+}
+
+fn write_new_file(target: &Path, bytes: &[u8], private: bool) -> Result<(), AtomicWriteError> {
     let dir = target.parent().ok_or_else(|| {
         io::Error::new(
             io::ErrorKind::InvalidInput,
             format!("target path has no parent directory: {}", target.display()),
         )
     })?;
-    let mut tmp = match temp_sibling(dir) {
+    let mut tmp = match new_temp_sibling(dir, private) {
         Ok(tmp) => tmp,
         Err(e) if e.kind() == io::ErrorKind::PermissionDenied => {
             return Err(AtomicWriteError::FolderNotWritable)
@@ -630,6 +648,151 @@ pub fn write_new(target: &Path, bytes: &[u8]) -> Result<(), AtomicWriteError> {
         let _ = dir_handle.sync_all();
     }
     Ok(())
+}
+
+/// A temp file in `dir`; with `private`, one only the current user may open
+/// from the moment it exists (mode 0600 on macOS and Linux, as every temp file
+/// is there).
+fn new_temp_sibling(dir: &Path, private: bool) -> io::Result<NamedTempFile> {
+    #[cfg(windows)]
+    if private {
+        return Builder::new()
+            .prefix(TEMP_FILE_PREFIX)
+            .make_in(dir, owner_only::create_new);
+    }
+    let _ = private;
+    temp_sibling(dir)
+}
+
+/// Files only the current user may open, on Windows.
+#[cfg(windows)]
+mod owner_only {
+    use std::io;
+    use std::path::Path;
+
+    /// Creates a file at `path`, failing when one is there, whose access list
+    /// holds one entry granting the current user everything and nothing
+    /// inherited from the folder, so no other account can open it at any point.
+    #[allow(unsafe_code)]
+    pub(super) fn create_new(path: &Path) -> io::Result<std::fs::File> {
+        use std::os::windows::ffi::OsStrExt;
+        use std::os::windows::io::FromRawHandle;
+        use windows::core::{PCWSTR, PWSTR};
+        use windows::Win32::Foundation::{CloseHandle, LocalFree, HANDLE, HLOCAL};
+        use windows::Win32::Security::Authorization::{
+            ConvertSidToStringSidW, ConvertStringSecurityDescriptorToSecurityDescriptorW,
+            SDDL_REVISION_1,
+        };
+        use windows::Win32::Security::{
+            GetTokenInformation, TokenUser, PSECURITY_DESCRIPTOR, SECURITY_ATTRIBUTES, TOKEN_QUERY,
+            TOKEN_USER,
+        };
+        use windows::Win32::Storage::FileSystem::{
+            CreateFileW, CREATE_NEW, FILE_ATTRIBUTE_NORMAL, FILE_GENERIC_READ, FILE_GENERIC_WRITE,
+            FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
+        };
+        use windows::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
+
+        let mut token = HANDLE::default();
+        // SAFETY: the pseudo handle of this process needs no closing, and `token`
+        // is written by the call.
+        unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) }
+            .map_err(os_error)?;
+        let mut length = 0u32;
+        // SAFETY: a null buffer of length 0 asks only for the size needed.
+        let _ = unsafe { GetTokenInformation(token, TokenUser, None, 0, &mut length) };
+        let mut buffer = vec![0u64; (length as usize).div_ceil(8)];
+        // SAFETY: `buffer` holds at least `length` bytes, aligned for TOKEN_USER.
+        let read = unsafe {
+            GetTokenInformation(
+                token,
+                TokenUser,
+                Some(buffer.as_mut_ptr().cast()),
+                length,
+                &mut length,
+            )
+        };
+        // SAFETY: `token` was opened above and is closed once.
+        let _ = unsafe { CloseHandle(token) };
+        read.map_err(os_error)?;
+        // SAFETY: the call filled `buffer` with a TOKEN_USER and the SID it points at.
+        let user = unsafe { &*buffer.as_ptr().cast::<TOKEN_USER>() };
+        let mut sid_text = PWSTR::null();
+        // SAFETY: the SID lives in `buffer`; the string is allocated by the call
+        // and freed below.
+        unsafe { ConvertSidToStringSidW(user.User.Sid, &mut sid_text) }.map_err(os_error)?;
+        // SAFETY: the call returned a NUL-terminated string.
+        let sid = unsafe { sid_text.to_string() };
+        // SAFETY: `sid_text` came from ConvertSidToStringSidW and is freed once.
+        unsafe { LocalFree(Some(HLOCAL(sid_text.0.cast()))) };
+        let sid = sid.map_err(io::Error::other)?;
+
+        let rule: Vec<u16> = format!("D:P(A;;FA;;;{sid})")
+            .encode_utf16()
+            .chain(Some(0))
+            .collect();
+        let mut descriptor = PSECURITY_DESCRIPTOR::default();
+        // SAFETY: `rule` is NUL-terminated; `descriptor` is allocated by the
+        // call and freed below.
+        unsafe {
+            ConvertStringSecurityDescriptorToSecurityDescriptorW(
+                PCWSTR(rule.as_ptr()),
+                SDDL_REVISION_1,
+                &mut descriptor,
+                None,
+            )
+        }
+        .map_err(os_error)?;
+        let attributes = SECURITY_ATTRIBUTES {
+            nLength: std::mem::size_of::<SECURITY_ATTRIBUTES>() as u32,
+            lpSecurityDescriptor: descriptor.0,
+            bInheritHandle: false.into(),
+        };
+        let name: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
+        // SAFETY: `name` is NUL-terminated and `attributes` points at a
+        // descriptor that outlives the call.
+        let created = unsafe {
+            CreateFileW(
+                PCWSTR(name.as_ptr()),
+                FILE_GENERIC_READ.0 | FILE_GENERIC_WRITE.0,
+                FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                Some(&attributes),
+                CREATE_NEW,
+                FILE_ATTRIBUTE_NORMAL,
+                None,
+            )
+        };
+        // SAFETY: `descriptor` came from the conversion above and is freed once.
+        unsafe { LocalFree(Some(HLOCAL(descriptor.0))) };
+        let handle = created.map_err(os_error)?;
+        // SAFETY: the handle was just opened and nothing else owns it.
+        Ok(unsafe { std::fs::File::from_raw_handle(handle.0) })
+    }
+
+    /// The error a failed call reports, as the Windows error code it carries,
+    /// so a taken name reads as [`io::ErrorKind::AlreadyExists`].
+    fn os_error(error: windows::core::Error) -> io::Error {
+        let code = error.code().0 as u32;
+        if code & 0xFFFF_0000 == 0x8007_0000 {
+            io::Error::from_raw_os_error((code & 0xFFFF) as i32)
+        } else {
+            io::Error::other(error)
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        #[test]
+        fn a_name_that_is_taken_reads_as_taken() {
+            let dir = tempfile::TempDir::new().expect("temp dir");
+            let path = dir.path().join("taken");
+            drop(super::create_new(&path).expect("a free name"));
+
+            let error = super::create_new(&path).expect_err("the name is taken");
+
+            assert_eq!(error.kind(), std::io::ErrorKind::AlreadyExists);
+        }
+    }
 }
 
 /// A replacement for `target`, written and synced beside it and not yet moved

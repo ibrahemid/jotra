@@ -79,6 +79,8 @@ interface AnyAppRow {
   setProblem: (problem: WindowChordProblem | null) => void;
   isTaken: () => boolean;
   isUnsupported: () => boolean;
+  /** The other row's name, while its chord holds this row's keys. */
+  heldBy?: () => string | null;
 }
 
 /**
@@ -327,6 +329,10 @@ export default function ShortcutEditor() {
   }
 
   async function handleSave() {
+    // What the OS held before the save, which it goes back to when the config
+    // cannot record a chord it moved to.
+    const heldToggle = hotkeyStore.chord();
+    const heldCapture = captureHotkeyStore.chord();
     try {
       const nextToggle = globalDraft().trim();
       const toggleChanged = nextToggle !== "" && nextToggle !== configStore.config().hotkey.toggle;
@@ -390,6 +396,12 @@ export default function ShortcutEditor() {
         showToast("Shortcuts saved. The quick capture shortcut is unchanged.", "error");
       else showToast("Shortcuts saved", "success");
     } catch {
+      if (hotkeyStore.chord() !== heldToggle) {
+        await hotkeyStore.rebind(heldToggle).catch(() => false);
+      }
+      if (captureHotkeyStore.chord() !== heldCapture) {
+        await captureHotkeyStore.rebind(heldCapture).catch(() => false);
+      }
       showToast("Could not save the shortcuts", "error");
     }
   }
@@ -410,6 +422,13 @@ export default function ShortcutEditor() {
             <div class="shortcut-row-conflict" data-state="taken">
               Another app is using this shortcut.
             </div>
+          </Show>
+          <Show when={row.heldBy?.()}>
+            {(holder) => (
+              <div class="shortcut-row-conflict" data-state="taken">
+                {holder()} uses this shortcut.
+              </div>
+            )}
           </Show>
           <Show when={row.isUnsupported()}>
             <div class="shortcut-row-conflict" data-state="unsupported">
@@ -492,6 +511,7 @@ export default function ShortcutEditor() {
     setProblem: setCaptureProblem,
     isTaken: captureHotkeyStore.isTaken,
     isUnsupported: captureHotkeyStore.isUnsupported,
+    heldBy: () => (captureHotkeyStore.isHeldByOther() ? GLOBAL_ROW_LABEL : null),
   };
 
   /** A conflicting row is named the way its command is named on screen. */

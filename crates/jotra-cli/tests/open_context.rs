@@ -187,10 +187,9 @@ fn sockets_of(pid: u32) -> Vec<String> {
 /// with their owner's process id last.
 #[cfg(windows)]
 fn sockets_of(pid: u32) -> Vec<String> {
-    let output = Command::new("netstat")
-        .arg("-ano")
-        .output()
-        .expect("netstat");
+    let system = std::env::var_os("SystemRoot").unwrap_or_else(|| "C:\\Windows".into());
+    let netstat = Path::new(&system).join("System32").join("netstat.exe");
+    let output = Command::new(netstat).arg("-ano").output().expect("netstat");
     assert!(
         output.status.success(),
         "netstat answered {}",
@@ -205,6 +204,16 @@ fn sockets_of(pid: u32) -> Vec<String> {
         })
         .map(str::to_string)
         .collect()
+}
+
+#[test]
+fn the_socket_check_sees_a_socket_the_process_holds() {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("a socket");
+    assert!(
+        !sockets_of(std::process::id()).is_empty(),
+        "a bound listener is listed"
+    );
+    drop(listener);
 }
 
 #[test]

@@ -14,7 +14,8 @@
 //! The writes carry a [`crate::notes::WriteOrigin`] naming the consumer,
 //! and they do not write themselves: they go through the one guarded facade, so
 //! a note changed since the caller last saw it keeps what it holds and the text
-//! handed in lands beside it. What the caller last saw is a [`LastKnown`] the
+//! handed in lands beside it, unless the write was held for the person's
+//! answer, which sets nothing beside it. What the caller last saw is a [`LastKnown`] the
 //! caller has to name: a digest, the text this host last saw the note hold, or
 //! [`LastKnown::Overwrite`]. A write that replaces whatever the note holds is
 //! that third value and nothing else, so a consumer cannot make one by leaving
@@ -129,7 +130,8 @@ pub trait NoteHost {
     /// [`LastKnown::Hash`] and [`LastKnown::LastSeen`] the write is made only
     /// while the note still holds that text: a note somebody edited in between
     /// keeps what it holds, the text handed in is put beside it as a dated
-    /// copy, and [`HostError::Conflict`] names the copy. A note this host has
+    /// copy, and [`HostError::Conflict`] names the copy; a write held for the
+    /// person's answer puts nothing beside it. A note this host has
     /// not seen answers [`LastKnown::LastSeen`] with
     /// [`HostError::HashRequired`] and is left alone. [`LastKnown::Overwrite`]
     /// is made against whatever the file holds now.

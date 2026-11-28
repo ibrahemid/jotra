@@ -24,7 +24,6 @@ const mocks = vi.hoisted(() => ({
 vi.mock("../../services/tauri", () => ({
   previewListRenderers: vi.fn().mockResolvedValue([]),
   previewForceRender: mocks.forceRender,
-  previewRender: mocks.forceRender,
   previewClose: mocks.previewClose,
   previewGetLayout: mocks.previewGetLayout,
   previewSetLayout: mocks.previewSetLayout,

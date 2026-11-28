@@ -22,7 +22,7 @@ const base = import.meta.env.BASE_URL.replace(/\/$/, '');
   <h2>4. What stays as written</h2>
   <ul>
     <li>Callouts and <code>![[File]]</code> and <code>![[image.png]]</code> embeds show as the text they are.</li>
-    <li><code>.obsidian/</code>: appearance, hotkeys, plugin settings. Jotra skips the folder whole and writes nothing there on its own.</li>
+    <li><code>.obsidian/</code>: appearance, hotkeys, plugin settings. Jotra skips the folder whole and writes nothing there, on its own or for a connected program.</li>
     <li>Community plugins. None run. A file a plugin wrote shows the text it holds, so a Dataview query or a Templater tag reads as the characters it is.</li>
     <li><code>.canvas</code> files open as the text they hold.</li>
     <li><code>obsidian://</code> links are not opened. Rewrite the ones worth keeping as <code>[[File]]</code>.</li>

@@ -285,6 +285,22 @@ impl<'a> NoteHostImpl<'a> {
         Ok(file)
     }
 
+    /// The file a write names, refusing one the notes walk skips as well as
+    /// anything [`Self::note_file`] refuses: what `.obsidian` and the other
+    /// folders an app keeps for itself hold is that app's, not a note.
+    ///
+    /// Asked of the resolved path, which the filesystem spells as it stores
+    /// it, so `.OBSIDIAN/app.json` on a volume that folds case is refused too.
+    fn writable_note_file(&self, path: &str) -> Result<PathBuf, HostError> {
+        let file = self.note_file(path)?;
+        if jotra_core::workspace::path_has_notes_ignored_name(&self.notes_root, &file) {
+            return Err(HostError::SkippedName {
+                path: path.to_string(),
+            });
+        }
+        Ok(file)
+    }
+
     /// The index key of the note a path argument names.
     fn note_key(&self, path: &str) -> Result<String, HostError> {
         Ok(notes_index::index_key(&self.note_file(path)?))
@@ -879,7 +895,7 @@ impl NoteHost for NoteHostImpl<'_> {
         origin: WriteOrigin,
     ) -> Result<WriteReceipt, HostError> {
         self.permit(Capability::WriteNote)?;
-        let file = self.note_file(path)?;
+        let file = self.writable_note_file(path)?;
         let key = notes_index::index_key(&file);
         let expected = self.expected(path, &key, last_known)?;
         // Asked before the read below, because the read is what would pull an
@@ -974,7 +990,7 @@ impl NoteHost for NoteHostImpl<'_> {
         origin: WriteOrigin,
     ) -> Result<WriteReceipt, HostError> {
         self.permit(Capability::WriteNote)?;
-        let file = self.note_file(path)?;
+        let file = self.writable_note_file(path)?;
         let key = notes_index::index_key(&file);
         let expected = self.expected(path, &key, last_known)?;
         // Asked before the read below, because the read is what would pull an
@@ -1060,7 +1076,7 @@ impl NoteHost for NoteHostImpl<'_> {
         origin: WriteOrigin,
     ) -> Result<WriteReceipt, HostError> {
         self.permit(Capability::WriteNote)?;
-        let file = self.note_file(path)?;
+        let file = self.writable_note_file(path)?;
         // Asked before the read below, because the read is what would pull an
         // evicted file down (ADR-028 section 5).
         if is_not_downloaded(dataless_flags(&file)) {
@@ -1102,7 +1118,7 @@ impl NoteHost for NoteHostImpl<'_> {
         origin: WriteOrigin,
     ) -> Result<PassageReceipt, HostError> {
         self.permit(Capability::WriteNote)?;
-        let file = self.note_file(path)?;
+        let file = self.writable_note_file(path)?;
         if old.is_empty() {
             return Err(HostError::PassageEmpty {
                 path: path.to_string(),
@@ -1193,7 +1209,7 @@ impl NoteHost for NoteHostImpl<'_> {
         origin: WriteOrigin,
     ) -> Result<RenameReceipt, HostError> {
         self.permit(Capability::RenameNote)?;
-        let file = self.note_file(path)?;
+        let file = self.writable_note_file(path)?;
         // Maps a separator to a space, so a new name that spells a path names a
         // file in the folder the note is already in and cannot walk out of it.
         let stem = jotra_core::notes::rename_stem(&file, new_name).ok_or(HostError::NameEmpty)?;
@@ -1251,6 +1267,9 @@ fn write_error(path: &str, error: StorageError) -> HostError {
         StorageError::SourceNotDownloaded { .. } => HostError::NotDownloaded {
             path: path.to_string(),
         },
+        StorageError::SourceRemoved { .. } => HostError::NotFound {
+            path: path.to_string(),
+        },
         StorageError::NoteNameEmpty => HostError::NameEmpty,
         StorageError::NoteNameTaken { name, .. } => HostError::NameTaken { name },
         _ => HostError::Unwritable {
@@ -1261,14 +1280,16 @@ fn write_error(path: &str, error: StorageError) -> HostError {
 
 /// Opens the index read-only, or `None` when there is nothing to open.
 ///
-/// The schema check is `jotra`'s: a database older than this build has columns a
-/// read may not find, and a newer one was written by a build that knows more.
-/// Both are the same situation to a caller as an absent one, and none of the
-/// three is repaired here.
+/// The schema check is `jotra`'s: a database older than this build, or one
+/// missing a migration below the highest it records, has columns a read may not
+/// find, and a newer one was written by a build that knows more. Each is the
+/// same situation to a caller as an absent one, and none is repaired here.
 fn open_index(db_path: &Path) -> Option<NotesIndexStore> {
     if !db_path.is_file() {
         return None;
     }
     let store = NotesIndexStore::open_read_only(db_path).ok()?;
-    (store.schema_version().ok()? == binary_schema_version()).then_some(store)
+    let is_current = store.schema_version().ok()? == binary_schema_version()
+        && store.pending_schema_versions().ok()?.is_empty();
+    is_current.then_some(store)
 }

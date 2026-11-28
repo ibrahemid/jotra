@@ -9,21 +9,25 @@ use jotra_cli::mcp;
 use jotra_cli::verbs::{self, OpenPlan};
 use jotra_cli::{
     is_empty_payload, no_path_action, piped_note_stem, piped_text, read_files_config,
-    read_notes_root_from_config, resolve_app_notes_dir, resolve_notes_dir, resolve_targets,
-    split_line_targets, stdin_kind, write_piped_note, NoPathAction, OpenTarget, StdinKind,
+    read_notes_root_from_config, read_pipe, resolve_app_notes_dir, resolve_notes_dir,
+    resolve_targets, split_line_targets, stdin_kind, verb_stdin, write_piped_note, NoPathAction,
+    OpenTarget, VerbStdin,
 };
 use jotra_core::data_folder::{DataFolder, DataFolderSources};
 use jotra_core::mcp_dialect::{select_dialect, COMMAND_NAME_VAR};
 use jotra_core::user_variables::{read_user_variable, UserVariable};
 
 #[cfg(not(target_os = "macos"))]
-use jotra_cli::{is_failed_startup, resolve_gui_binary, GuiLaunch, GUI_BIN_ENV};
+use jotra_cli::{is_failed_startup, resolve_gui_launch, GuiLaunch, GUI_BIN_ENV};
 #[cfg(not(target_os = "macos"))]
 use std::path::Path;
 #[cfg(not(target_os = "macos"))]
 use std::thread;
 #[cfg(not(target_os = "macos"))]
 use std::time::Duration;
+
+#[cfg(target_os = "macos")]
+use jotra_cli::macos_open_args;
 
 #[cfg(target_os = "macos")]
 const MACOS_BUNDLE_ID: &str = "com.writ.editor";
@@ -190,8 +194,7 @@ fn jotra_paths() -> (DataFolder, PathBuf) {
 /// The data folder holding the index, `config.toml` and the requests the
 /// running app takes, chosen the way the app chooses it (ADR-059).
 fn data_folder() -> DataFolder {
-    let variable =
-        read_user_variable(UserVariable::DataDir, |name| std::env::var_os(name)).map(PathBuf::from);
+    let variable = data_dir_variable();
     let home = dirs::home_dir();
     let sources = DataFolderSources {
         variable: variable.as_deref(),
@@ -204,6 +207,11 @@ fn data_folder() -> DataFolder {
             process::exit(verbs::EXIT_FAILED);
         }
     }
+}
+
+/// The data folder the environment names, under either variable name.
+fn data_dir_variable() -> Option<PathBuf> {
+    read_user_variable(UserVariable::DataDir, |name| std::env::var_os(name)).map(PathBuf::from)
 }
 
 /// The notes folder the environment names, under either variable name.
@@ -285,7 +293,7 @@ fn run_verb(verb: verbs::Verb) -> ! {
     let (data_folder, notes_dir) = jotra_paths();
     let jotra_dir = data_folder.folder.clone();
     let stdin = if verb.reads_stdin() {
-        read_piped_stdin()
+        read_piped_stdin(verb.waits_for_stdin())
     } else {
         None
     };
@@ -318,16 +326,30 @@ fn run_verb(verb: verbs::Verb) -> ! {
 /// The text piped to stdin, or `None` when stdin is a terminal or nothing a
 /// pipe could fill.
 ///
-/// Bytes that are not text end the command with exit 1.
-fn read_piped_stdin() -> Option<String> {
-    if stdin_kind() != StdinKind::Payload {
-        return None;
-    }
-    let mut piped = Vec::new();
-    if let Err(e) = io::stdin().read_to_end(&mut piped) {
-        eprintln!("jotra: failed to read stdin: {e}");
-        process::exit(verbs::EXIT_FAILED);
-    }
+/// With `dash_given` a pipe is read until it ends, however long its writer
+/// takes, and stderr says the command is waiting once
+/// [`jotra_cli::PIPE_FIRST_BYTE_WAIT`] passes with nothing come. Without it, a
+/// pipe with nothing in it for that long ends the command with exit 1; `-`
+/// given with nothing piped exits 2. A failed read or bytes that are not text
+/// end the command with exit 1. Each of these exits before anything is written.
+fn read_piped_stdin(dash_given: bool) -> Option<String> {
+    let wait = match verb_stdin(stdin_kind(), dash_given) {
+        VerbStdin::Read(wait) => wait,
+        VerbStdin::Nothing => return None,
+        VerbStdin::NothingPiped => {
+            eprintln!("jotra: `-` was given but nothing is piped to stdin");
+            process::exit(verbs::EXIT_USAGE);
+        }
+    };
+    let piped = match read_pipe(io::stdin(), wait, || {
+        eprintln!("jotra: waiting for stdin to close")
+    }) {
+        Ok(bytes) => bytes,
+        Err(error) => {
+            eprintln!("jotra: {error}");
+            process::exit(verbs::EXIT_FAILED);
+        }
+    };
     match piped_text(&piped) {
         Some(text) => Some(text),
         None => {
@@ -337,6 +359,25 @@ fn read_piped_stdin() -> Option<String> {
     }
 }
 
+/// The `open` command that starts the app on the data folder this command
+/// uses ([`jotra_cli::macos_open_args`]).
+#[cfg(target_os = "macos")]
+fn macos_open(paths: &[PathBuf]) -> process::Command {
+    let named = data_dir_variable().map(|_| {
+        let folder = data_folder().folder;
+        std::path::absolute(&folder).unwrap_or(folder)
+    });
+    let held = named.as_deref().is_some_and(handoff::is_app_running);
+    let mut command = process::Command::new("open");
+    command.args(macos_open_args(
+        MACOS_BUNDLE_ID,
+        named.as_deref(),
+        held,
+        paths,
+    ));
+    command
+}
+
 /// Starts Jotra with nothing to open, for `jotra mcp`, answering whether it did.
 ///
 /// Every stream of the started process is closed: this process's stdout is
@@ -344,9 +385,7 @@ fn read_piped_stdin() -> Option<String> {
 /// session.
 #[cfg(target_os = "macos")]
 fn start_jotra_quietly() -> bool {
-    process::Command::new("open")
-        .arg("-b")
-        .arg(MACOS_BUNDLE_ID)
+    macos_open(&[])
         .stdin(process::Stdio::null())
         .stdout(process::Stdio::null())
         .stderr(process::Stdio::null())
@@ -363,9 +402,11 @@ fn start_jotra_quietly() -> bool {
 fn start_jotra_quietly() -> bool {
     let current_exe = std::env::current_exe().ok();
     let env_override = gui_bin_variable();
-    let GuiLaunch::Binary(bin) =
-        resolve_gui_binary(env_override.as_deref(), current_exe.as_deref())
-    else {
+    let GuiLaunch::Binary(bin) = resolve_gui_launch(
+        env_override.as_deref(),
+        current_exe.as_deref(),
+        recorded_app_image,
+    ) else {
         return false;
     };
     let mut command = process::Command::new(bin);
@@ -385,10 +426,7 @@ fn start_jotra_quietly() -> bool {
 /// Open `paths` in Jotra, or launch Jotra with no document when `paths` is empty.
 #[cfg(target_os = "macos")]
 fn launch_jotra(paths: &[PathBuf]) {
-    let mut command = process::Command::new("open");
-    command.arg("-b").arg(MACOS_BUNDLE_ID).args(paths);
-
-    match command.status() {
+    match macos_open(paths).status() {
         Ok(status) if status.success() => {}
         // `open` has already written its own diagnostic to stderr.
         Ok(_) => process::exit(1),
@@ -410,7 +448,11 @@ fn launch_jotra(paths: &[PathBuf]) {
     let current_exe = std::env::current_exe().ok();
     let env_override = gui_bin_variable();
 
-    match resolve_gui_binary(env_override.as_deref(), current_exe.as_deref()) {
+    match resolve_gui_launch(
+        env_override.as_deref(),
+        current_exe.as_deref(),
+        recorded_app_image,
+    ) {
         GuiLaunch::Binary(bin) => spawn_gui(&bin, paths),
         GuiLaunch::OsDefault => {
             if paths.is_empty() {
@@ -426,6 +468,19 @@ fn launch_jotra(paths: &[PathBuf]) {
             }
         }
     }
+}
+
+/// The AppImage the app recorded in the data folder this command uses.
+#[cfg(not(target_os = "macos"))]
+fn recorded_app_image() -> Option<PathBuf> {
+    let variable = data_dir_variable();
+    let home = dirs::home_dir();
+    let sources = DataFolderSources {
+        variable: variable.as_deref(),
+        home: home.as_deref(),
+    };
+    let data_folder = jotra_storage::data_folder::locate_data_folder(sources).ok()?;
+    jotra_storage::app_image::recorded_app_image(&data_folder.folder)
 }
 
 /// The app binary the environment names, under either variable name.

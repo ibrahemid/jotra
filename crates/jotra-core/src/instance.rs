@@ -10,8 +10,12 @@
 //! which file is open (ADR-053).
 
 use std::collections::BTreeMap;
+use std::path::Path;
 
 use serde::{Deserialize, Serialize};
+
+use crate::data_folder::DataFolderOrigin;
+use crate::user_variables::UserVariable;
 
 /// How long a request stays worth acting on, in milliseconds.
 ///
@@ -109,9 +113,10 @@ impl OpenRequest {
     /// The held write, when the request carries one still waited on at
     /// `now_ms` and whose token may name a file.
     pub fn review_ask(&self, now_ms: i64) -> Option<&ReviewAsk> {
-        let waited_ms =
-            i64::try_from(crate::write_review::REVIEW_WAIT.as_millis()).unwrap_or(i64::MAX);
         self.review.as_ref().filter(|ask| {
+            let waited_ms =
+                i64::try_from(crate::write_review::review_wait_for(&ask.program).as_millis())
+                    .unwrap_or(i64::MAX);
             is_wait_token(&ask.token) && now_ms.saturating_sub(self.sent_at_ms) <= waited_ms
         })
     }
@@ -235,8 +240,54 @@ impl WaitSet {
         done
     }
 
+    /// Records that the file at `from` is now at `to`, so a command waiting
+    /// on it waits for the tab that followed it.
+    pub fn moved(&mut self, from: &str, to: &str) {
+        if from == to {
+            return;
+        }
+        for paths in self.waiting.values_mut() {
+            if paths.remove(from) {
+                paths.insert(to.to_string());
+            }
+        }
+    }
+
     /// Whether any command is still waiting.
     pub fn is_empty(&self) -> bool {
         self.waiting.is_empty()
     }
+}
+
+/// What a launch does when another process holds its data folder.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HeldFolder {
+    /// Hand the launch's paths to the process holding the folder and exit.
+    HandOver,
+    /// Exit without handing anything over, saying which variable runs this
+    /// build on a folder of its own.
+    Refuse,
+}
+
+/// What a launch that finds `origin`'s folder held does.
+///
+/// A `tauri dev` build on the home folder refuses: handing over would give
+/// its paths to the installed app and end, and the build being worked on
+/// would never start. A folder a variable names was chosen for this launch,
+/// so a second copy on it hands over as an installed one does.
+pub fn on_held_folder(is_dev_build: bool, origin: DataFolderOrigin) -> HeldFolder {
+    if is_dev_build && origin == DataFolderOrigin::Home {
+        HeldFolder::Refuse
+    } else {
+        HeldFolder::HandOver
+    }
+}
+
+/// What a refused launch prints.
+pub fn held_folder_refusal(jotra_dir: &Path) -> String {
+    format!(
+        "jotra: another Jotra is running on {}. Set {} to another folder to run this build beside it.",
+        jotra_dir.display(),
+        UserVariable::DataDir.current_name()
+    )
 }

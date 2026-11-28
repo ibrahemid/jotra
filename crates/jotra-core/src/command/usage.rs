@@ -33,25 +33,26 @@ pub struct CommandUse {
 /// The `[commands.usage]` table a `config.toml` written before ADR-048
 /// carries, for the one-time move into the database.
 ///
-/// Tolerant like [`crate::config::FilesConfig::from_config_text`]: a file
-/// that does not parse, a missing table and an entry of the wrong shape give
-/// nothing for that part, so a broken config never stops the move of what
-/// does read.
-pub fn usage_from_config_text(text: &str) -> HashMap<String, CommandUsage> {
-    let Ok(document) = text.parse::<toml::Table>() else {
-        return HashMap::new();
-    };
+/// `None` when the text is not TOML: what it holds cannot be known, so the
+/// move waits for a launch that can read it. Otherwise tolerant like
+/// [`crate::config::FilesConfig::from_config_text`]: a missing table and an
+/// entry of the wrong shape give nothing for that part, so one bad entry
+/// never stops the move of what does read.
+pub fn usage_from_config_text(text: &str) -> Option<HashMap<String, CommandUsage>> {
+    let document = text.parse::<toml::Table>().ok()?;
     let Some(toml::Value::Table(usage)) = document
         .get("commands")
         .and_then(|commands| commands.get("usage"))
     else {
-        return HashMap::new();
+        return Some(HashMap::new());
     };
-    usage
-        .iter()
-        .filter_map(|(id, entry)| {
-            let entry: CommandUsage = entry.clone().try_into().ok()?;
-            Some((id.clone(), entry))
-        })
-        .collect()
+    Some(
+        usage
+            .iter()
+            .filter_map(|(id, entry)| {
+                let entry: CommandUsage = entry.clone().try_into().ok()?;
+                Some((id.clone(), entry))
+            })
+            .collect(),
+    )
 }

@@ -3,11 +3,13 @@ import { describe, it, expect, vi, beforeEach } from "vitest";
 const h = vi.hoisted(() => ({
   fetchDefaultAppTypes: vi.fn(),
   fetchDefaultAppStatus: vi.fn(),
+  fetchDefaultAppSupport: vi.fn(),
 }));
 
 vi.mock("../../stores/global/default-app", () => ({
   fetchDefaultAppTypes: h.fetchDefaultAppTypes,
   fetchDefaultAppStatus: h.fetchDefaultAppStatus,
+  fetchDefaultAppSupport: h.fetchDefaultAppSupport,
 }));
 
 import {
@@ -26,32 +28,40 @@ describe("default-app support registry", () => {
     clearDefaultAppSupport();
     h.fetchDefaultAppTypes.mockReset();
     h.fetchDefaultAppStatus.mockReset();
+    h.fetchDefaultAppSupport.mockReset();
   });
 
-  it("marks only non-unsupported types as supported after a probe", async () => {
+  it("marks every type supported from the system answer without reading any default", async () => {
     h.fetchDefaultAppTypes.mockResolvedValue([type("markdown"), type("source-code")]);
-    h.fetchDefaultAppStatus.mockImplementation((id: string) =>
-      Promise.resolve(id === "markdown" ? { status: "is_default" } : { status: "unsupported" }),
-    );
+    h.fetchDefaultAppSupport.mockResolvedValue(true);
 
     await probeDefaultAppSupport();
     expect(hasSupportedDefaultAppTypes()).toBe(true);
+    expect(h.fetchDefaultAppStatus).not.toHaveBeenCalled();
 
-    // Dropping the one type that reported supported empties the registry, which
-    // is only true if the unsupported one was never recorded.
     markDefaultAppTypeSupported("markdown", false);
+    expect(hasSupportedDefaultAppTypes()).toBe(true);
+    markDefaultAppTypeSupported("source-code", false);
+    expect(hasSupportedDefaultAppTypes()).toBe(false);
+  });
+
+  it("marks no type supported on a system that offers no default apps", async () => {
+    h.fetchDefaultAppTypes.mockResolvedValue([type("markdown")]);
+    h.fetchDefaultAppSupport.mockResolvedValue(false);
+    await probeDefaultAppSupport();
     expect(hasSupportedDefaultAppTypes()).toBe(false);
   });
 
   it("leaves the registry empty when listing types fails", async () => {
     h.fetchDefaultAppTypes.mockRejectedValue(new Error("no IPC"));
+    h.fetchDefaultAppSupport.mockResolvedValue(true);
     await probeDefaultAppSupport();
     expect(hasSupportedDefaultAppTypes()).toBe(false);
   });
 
-  it("treats a per-type status error as unsupported", async () => {
+  it("leaves the registry empty when the support check fails", async () => {
     h.fetchDefaultAppTypes.mockResolvedValue([type("markdown")]);
-    h.fetchDefaultAppStatus.mockRejectedValue(new Error("boom"));
+    h.fetchDefaultAppSupport.mockRejectedValue(new Error("boom"));
     await probeDefaultAppSupport();
     expect(hasSupportedDefaultAppTypes()).toBe(false);
   });
