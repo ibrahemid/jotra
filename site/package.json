@@ -15,15 +15,15 @@
     "test:dist": "vitest run --config vitest.dist.config.ts"
   },
   "dependencies": {
-    "@astrojs/sitemap": "^3.7.4",
-    "astro": "^7.4.7"
+    "@astrojs/sitemap": "^3.7.6",
+    "astro": "^7.4.13"
   },
   "devDependencies": {
     "@astrojs/check": "^0.9.12",
     "sharp": "0.35.5",
     "typescript": "^6.0.3",
     "ultrahtml": "1.7.0",
-    "vitest": "^5.1.0"
+    "vitest": "^5.1.1"
   },
   "pnpm": {
     "overrides": {
