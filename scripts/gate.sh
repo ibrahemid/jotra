@@ -1,7 +1,8 @@
 #!/bin/bash
 # Quiet quality gate: one line per check, failure detail only on failure.
 # Full logs: $JOTRA_GATE_LOG_DIR (default .status/gate-logs, gitignored).
-# Usage: scripts/gate.sh [fmt|test|clippy|tsc|build|vitest|quick]...   (default: all)
+# Usage: scripts/gate.sh [fmt|test|clippy|tsc|build|vitest|perf|quick]...   (default: fmt test clippy tsc build)
+# perf: the editor perf gate CI runs on Linux (docs/perf-budgets.md).
 # quick: fmt, clippy, tsc, the tests of the crates changed against origin/main,
 #        and the vitest files related to the changed TypeScript.
 
@@ -74,6 +75,14 @@ quick_gate() {
   fi
 }
 
+# shellcheck disable=SC2329
+perf_gate() {
+  JOTRA_PERF_GATE=1 pnpm exec vitest run src/__tests__/lib/document-counts-perf.test.ts \
+    -t "counting a 50 MiB document" --disable-console-intercept \
+    && pnpm exec playwright-core install --no-shell chromium \
+    && JOTRA_PERF_GATE=1 node scripts/perf-editor.mjs
+}
+
 GATES=("$@")
 [ ${#GATES[@]} -eq 0 ] && GATES=(fmt test clippy tsc build)
 
@@ -85,6 +94,7 @@ for g in "${GATES[@]}"; do
     tsc)    run_gate tsc npx tsc --noEmit ;;
     build)  run_gate build pnpm build ;;
     vitest) run_gate vitest npx vitest run --reporter=dot ;;
+    perf)   run_gate perf perf_gate ;;
     quick)  quick_gate ;;
     *) echo "unknown gate: $g" >&2; exit 2 ;;
   esac

@@ -4,6 +4,9 @@ import type { IndexStatus } from "../../../src/types/search";
 import type { Answer, CommandTable, DemoState } from "../state";
 import { HOME, NOTES_ROOT } from "../vfs";
 
+/** jotra_core::config::default_hotkey_capture. */
+export const DEFAULT_CAPTURE_CHORD = "CmdOrCtrl+Shift+Alt+Space";
+
 export function createConfigCommands(state: DemoState): CommandTable {
   const previewScriptsOn = new Set<string>();
   // jotra.db's command_usage table, for the length of the visit.
@@ -47,6 +50,11 @@ export function createConfigCommands(state: DemoState): CommandTable {
     dismiss_notes_migration_report: () => null,
     get_storage_info: () => ({ db_path: `${HOME}/.jotra/jotra.db`, dir: `${HOME}/.jotra` }),
     global_hotkey_status: () => ({ chord: state.config.hotkey.toggle, registered: true }),
+    capture_hotkey_status: (): Answer<"captureHotkeyStatus"> => ({
+      chord: state.config.hotkey.capture ?? DEFAULT_CAPTURE_CHORD,
+      registered: true,
+      unsupported: false,
+    }),
     cli_status: () => ({
       installed: true,
       path: "/usr/local/bin/jotra",

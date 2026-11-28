@@ -190,7 +190,8 @@ stops at the previous one.
 A note whose change exists only on some platforms carries `platforms`
 (`'macos'`, `'windows'`, `'linux'`, never all three), and the page tags it. A
 platform counts when the note opens with it ("on macOS, …", "on Windows and
-Linux, …") or names an artifact that exists only there ("the MSI …"): MSI and
+Linux, …"), names one of its versions ("Windows 11 snap layouts", "requires
+macOS 12") or names an artifact that exists only there ("the MSI …"): MSI and
 winget on Windows; AppImage, .deb, AUR, `install.sh` and the Secret Service on
 Linux; Homebrew, notarization, Gatekeeper, translocation and Apple Intelligence
 on macOS. The page shows the tags in place of that opening, so the rest of a
@@ -273,7 +274,9 @@ job restores or saves an Actions cache: every release build starts cold.
    release notes, grouped by `feat:` / `fix:` / other conventional-commit
    prefixes (`.github/scripts/release_notes.py`). A stable tag lists the
    commits since the previous stable `v*.*.*` tag, skipping candidates; a
-   candidate lists the commits since the previous tag of either kind.
+   candidate lists the commits since the previous tag of either kind. The
+   GitHub release keeps this commit list as its notes; the written notes for
+   a version are its `CHANGELOG.md` section and its `/changelog` entry.
 2. `build` runs the matrix with no secret and no write token:
    - `macos-latest`  universal binary (`aarch64` + `x86_64` merged), producing
      `Jotra.app`, ad-hoc signed, inside `Jotra_<version>_universal.dmg`.

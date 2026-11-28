@@ -2,6 +2,7 @@ import type { CommandArgs, CommandHandler, IpcBridge } from "../ipc";
 import { createAiChatCommands } from "./commands/ai-chat";
 import { createBufferCommands } from "./commands/buffers";
 import { createConfigCommands } from "./commands/config";
+import { createPromptCommands } from "./commands/prompt";
 import { createSearchCommands } from "./commands/search";
 import { createVersionCommands } from "./commands/versions";
 import { OPEN_AT_START } from "./seed";
@@ -63,6 +64,7 @@ export function createBackend(bridge: IpcBridge): DemoBackend {
     createVersionCommands(state),
     createSearchCommands(state),
     createAiChatCommands(state),
+    createPromptCommands(state),
   ]);
 
   for (const relative of OPEN_AT_START) state.openPath(`${NOTES_ROOT}/${relative}`);

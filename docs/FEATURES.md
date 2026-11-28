@@ -13,6 +13,7 @@ What Jotra does, at the level of detail that answers "does it do X".
 - Autosave writes one second after the last keystroke, and at once when the window loses focus or hides. A save that would overwrite a newer version on disk is refused, and your text is written beside the file as a dated conflict copy.
 - When a file changes outside Jotra, a tab with no unsaved edits takes the new text in one undoable step. A tab with unsaved edits asks which side to keep.
 - Jotra keeps a version of a file in its folder when it is saved, for up to 30 days or 200 versions, outside that folder; a run of saves inside ten seconds is one version. A file over 2 MB is not versioned. File > Revert To puts one back and names who wrote each version: Jotra, a connected program, chat or the jotra command.
+- In Revert To, Compare with current text shows how a version differs from the file as it is now, and Undo, after a restore, puts back the text the restore replaced.
 - Open tabs and unsaved text come back after a restart or a crash.
 - Binary files open as hex. Large files open with syntax colouring off.
 - A file over 50 MiB asks before it opens and says how large it is. A file over 500 MiB (524 MB) doesn't open, and Jotra says why. Jotra measures the tabs it restores at launch as it starts: one over 50 MiB asks when it is shown, and one over 500 MiB says why.
@@ -22,7 +23,7 @@ What Jotra does, at the level of detail that answers "does it do X".
 
 - A Markdown file opens in Inline mode: headings at heading sizes, bold, italic, strikethrough and inline code styled, links with the address hidden, images shown under their line, task lists as checkboxes, fenced code highlighted in its language, and tables, `$…$` and `$$…$$` math and `mermaid` diagrams drawn in place. The line you are editing shows its markup, and a table, formula or diagram shows its source while the cursor is in it.
 - A heading folds its section from the arrow beside it, and `Cmd+Option+[` and `Cmd+Option+]` (`Ctrl+Shift+[` and `Ctrl+Shift+]` on Windows and Linux) fold and unfold at the cursor. A source file folds from the gutter beside its line numbers.
-- The Inline | Source switch in the status bar shows the raw Markdown instead. Settings, Editor, Markdown opens in sets which one a Markdown file opens in.
+- The Inline | Source switch in the status bar shows the raw Markdown instead. Settings, Editor, “Markdown opens in” sets which one a Markdown file opens in.
 - `[[Name]]` links another file by name, completes from the files in the folder, and opens on `Cmd+click` or `Enter`. `[[Name#Heading]]` opens at the heading. A name two files share asks which one is meant.
 - `Cmd+B`, `Cmd+I`, `Cmd+Shift+X`, `Cmd+Shift+E` and `Cmd+K` format a selection. Settings, Editor, Markdown shortcuts turns them off.
 - A `.txt` file gets the plain editor, with no link completion.

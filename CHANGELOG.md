@@ -78,7 +78,7 @@ Files in other text encodings open and save in their own encoding, a capture win
 - The graph opens from a toolbar button or Cmd+Option+G (Ctrl+Alt+G on Windows and Linux), with a legend, Enter or a double-click to open a file, and trackpad pan and pinch zoom.
 - Each app's row and setup card in Settings, Apps lists where the app lives, with Open while it is on; an off app's shortcut opens its row, and an app switched on opens once when Settings closes.
 - A Markdown file with links or tags offers Connections or Tags once while they are off, as a notice with Turn on; Offer apps that are off in Settings, Apps stops these notices.
-- On Windows the MSI puts `writ.exe` on PATH, and on Linux the AppImage installs the `writ` command into `~/.local/bin`.
+- The MSI puts `writ.exe` on PATH, and from an AppImage, Settings, Integrations, Terminal command installs the `writ` command into `~/.local/bin`.
 - On Linux, an AI key is kept in the Secret Service (GNOME Keyring or KWallet), and for the session only when no Secret Service answers.
 - A Writ installed by a package manager announces a new version with "Update with your package manager." and no Install button, and a Writ left running checks for updates every 24 hours while automatic checks are on.
 - When Writ cannot start, a dialog names the step that failed, and a crash leaves a report in the logs folder with the code location and none of your text.
@@ -131,7 +131,7 @@ Files in other text encodings open and save in their own encoding, a capture win
 - A long conversation sends the latest turns that fit 8,192 tokens for a server on this machine or the local network and 128,000 for a hosted one, with a line for each earlier proposal; a note over the size limit is refused when attached, and attachments stop at 4 MB in all.
 - Running a command from the palette no longer rewrites `config.toml`; the palette's recent commands live in Writ's database and keep their order through the update.
 - `install.sh` checks the release's minisign signature with minisign or OpenSSL 3 and stops when it has neither unless `WRIT_INSTALL_SKIP_SIGNATURE=1` is set, and the AUR package checks the AppImage's signature.
-- The Linux AppImage's third-party licenses list the system libraries it bundles, with an offer of their source.
+- The AppImage's third-party licenses list the system libraries it bundles, with an offer of their source.
 
 ### Fixed
 
@@ -151,14 +151,14 @@ Files in other text encodings open and save in their own encoding, a capture win
 - A rebound shortcut kept its old chord in the menu bar and the Windows and Linux menus, where the old chord still ran the command; the menus show and run the new one now.
 - Enter that confirmed an input method's conversion in Chat, Rewrite or a rename also sent or committed the text; it only confirms the conversion now.
 - Show and hide Writ accepted a single key such as A, a failed rebind left it with no shortcut, and Reset went back to the last saved chord; the rule is stated, the old chord stays until the new one registers, and Reset restores Cmd+Shift+Space.
-- Ctrl+Shift+\ did not toggle Connections on Windows and Linux; it does now.
+- On Windows and Linux, Ctrl+Shift+\ did not toggle Connections; it does now.
 - Closing could wait without end on a save that never answered; it waits a set time now.
 - One unreadable entry made the sidebar fail to list its folder; the folder lists and says what it could not read.
 - Moving the notes folder to another disk reported a failure when the old folder could not be fully removed after the copy; it reports the move with what was left behind now.
 - A long editing session could push the version from before it out of Revert To…; that version is kept now.
 - Installing the `writ` command replaced any file at `/usr/local/bin/writ`; it replaces only Writ's own now.
 - Piped text titled in Arabic or with accents was named with underscores, and two pipes at once could overwrite each other; titles keep their letters and a pipe no longer replaces another's file.
-- Choosing Writ for a file type on Windows and Linux reported success and changed nothing; Linux registers Writ through `xdg-mime` now, and Windows opens Settings, Default apps.
+- On Windows and Linux, choosing Writ for a file type reported success and changed nothing; Linux registers Writ through `xdg-mime` now, and Windows opens Settings, Default apps.
 - A chat draft was lost on New chat; it carries over now.
 
 ### Removed
@@ -202,13 +202,13 @@ Text a save could not write now survives a crash, and the preview shows a docume
 - tauri 2.12.3, tao 0.37, wry 0.57.0, harper 2.11 and rmcp 3.5, built with Rust 1.99.0.
 - Release builds run without access to signing keys, signing happens in its own jobs, and every asset carries a build-provenance attestation that `gh attestation verify <asset> --repo ibrahemid/writ` checks.
 - Each release attaches CycloneDX SBOMs for the app, the `writ` command and the frontend, and `SHA256SUMS.txt.minisig`, a minisign signature over the checksums made with the updater key.
-- The Windows MSI is still unsigned.
+- The MSI is still unsigned.
 
 ### Fixed
 
 - A network share that stopped answering held up saves in every other tab; other tabs keep saving now.
 - A document in the preview could reach the network through a script, a resource hint, a meta refresh or a frame, and take a note's text with it; the preview now shows it in a sandboxed frame, and a file whose scripts are off sends nothing out.
-- The preview was blank on Windows; HTML, Markdown, Mermaid diagrams and math draw there now.
+- On Windows, the preview was blank; it draws HTML, Markdown, Mermaid diagrams and math now.
 - Find kept counting the previous tab after a tab switch; the count and highlights follow the tab in front now.
 - Word wrap and Tab size in Settings, Editor had no effect; they apply to open files at once now.
 - A `.txt` file holding a code fence was coloured as that language; `.txt` and `.text` files open as plain text now.
@@ -240,7 +240,7 @@ Two crashes and four ways typed text could miss its file, all found in 0.5.0. Co
 - `config.toml` is replaced in one step, so a crash mid-write cannot leave it empty. A `config.toml` that is a hard link cannot be saved; a symlinked one is followed.
 - Connected programs listed Markdown files only, so a plain-text folder looked empty to them. They now see every `.md`, `.markdown`, `.txt` and `.text` file.
 - A connected program replacing a file it has not read is refused until it reads it or asks to overwrite, and the replaced text is kept as a version under File, Revert To….
-- The Linux AppImage packed its launcher without the execute bit for other users, so it did not start under firejail.
+- The AppImage packed its launcher without the execute bit for other users, so it did not start under firejail.
 
 ### Changed
 
@@ -385,12 +385,12 @@ Notes now live as Markdown files in a notes folder (`~/Writ` by default). The fi
 
 ### Added
 
-- A Writ menu on the Windows and Linux titlebar, opening the same actions the macOS menu bar carries: open file, new tab, close tab, the command palette, and the update check, each with its shortcut.
+- On Windows and Linux, a Writ menu on the titlebar opens the same actions the macOS menu bar carries: open file, new tab, close tab, the command palette, and the update check, each with its shortcut.
 - Windows 11 snap layouts open from the titlebar's maximize button.
 
 ### Changed
 
-- The Windows window controls follow the Windows 11 caption treatment: hover and pressed states, the caption red on close, and a visible keyboard focus ring. The maximize button reflects the live window state, showing restore while the window is maximized.
+- The window controls follow the Windows 11 caption treatment: hover and pressed states, the caption red on close, and a visible keyboard focus ring. The maximize button reflects the live window state, showing restore while the window is maximized.
 
 ### Fixed
 
@@ -418,7 +418,7 @@ Notes now live as Markdown files in a notes folder (`~/Writ` by default). The fi
 - Consent for a hosted provider is asked when the first rewrite runs, and names the host receiving the text. It was previously reachable only from a notice at the foot of the AI settings section, which left a configured provider failing with no way forward.
 - Rewrite failures name the host and offer the setting that fixes them, and a failed rewrite can be retried without re-selecting the text.
 - The landing page was rebuilt around sections that render as the page scrolls, and its demo window now runs the search palette. The changelog page lists every release instead of a single list of notes.
-- The Linux install script checks the download against `SHA256SUMS.txt`, and against the minisign signature when minisign is on PATH. It installs the CLI as the `writ` command, so piping into `writ` reaches the CLI rather than the app.
+- `install.sh` checks its download against `SHA256SUMS.txt`, and against the minisign signature when minisign is on PATH. It installs the CLI as the `writ` command, so piping into `writ` reaches the CLI rather than the app.
 
 ### Fixed
 
@@ -427,9 +427,9 @@ Notes now live as Markdown files in a notes folder (`~/Writ` by default). The fi
 - The OS keychain is consulted once per provider per session rather than on every rewrite, which on macOS raised a password prompt each time. A local endpoint never consults it.
 - The endpoint reachability check is gated on the same per-host consent as a rewrite, and reports a missing consent as its result rather than as a connection failure. Picking a hosted preset previously sent a request with the API key attached before any dialog appeared. The consent text names the key and the check.
 - A `.deb` install can update itself. The update feed serves the signed `.deb`; every Linux install was previously offered the AppImage, so the update failed after downloading it.
-- The macOS `.pkg` is signed with a Developer ID Installer certificate, notarized, and stapled. A release that has the installer certificate set but produces an unsigned pkg now fails instead of publishing it.
+- The installer `.pkg` is signed with a Developer ID Installer certificate, notarized, and stapled, so Gatekeeper opens it without a warning. A release that has the installer certificate set but produces an unsigned pkg now fails instead of publishing it.
 - On the AUR package, `/usr/bin/writ` is the CLI, so piping and `--title` work. It previously pointed at the app, which reads argv as paths and ignores stdin. The desktop entry still launches the app.
-- `writ <file>` opens the file in Writ on Linux and Windows. It previously went through the desktop default handler, which could open another editor, since Writ registers its file associations at Alternate rank.
+- On Linux and Windows, `writ <file>` opens the file in Writ. It previously went through the desktop default handler, which could open another editor, since Writ registers its file associations at Alternate rank.
 - An empty piped payload opens nothing. It previously wrote a zero-byte file and opened a blank buffer.
 - `writ --version` reports the installed version. It printed 0.1.0 on every release since the CLI landed.
 

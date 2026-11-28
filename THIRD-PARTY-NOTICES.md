@@ -11004,11 +11004,11 @@ OTHER DEALINGS IN THE FONT SOFTWARE.
 
 ## Packages inside the Mermaid bundle
 
-`src-tauri/assets/mermaid/mermaid.min.js` is a single file that carries the packages Mermaid depends on at run time. They are listed at the versions pnpm resolves for the `mermaid` devDependency in package.json; the bundle was built against releases within the same version ranges. Each block is one distinct licence text and the packages it covers.
+`src-tauri/assets/mermaid/mermaid.min.js` is a single file that carries the packages Mermaid depends on at run time. A package whose licence banner in the bundle names its version is listed at that version. The others are listed at the versions pnpm resolves for the `mermaid` devDependency in package.json; the bundle was built against releases within the same version ranges. Each block is one distinct licence text and the packages it covers.
 
 ### Apache-2.0
 
-@chevrotain/types 11.1.2, dompurify 3.4.17
+@chevrotain/types 11.1.2, dompurify 3.4.12
 
 ```
                                  Apache License
