@@ -570,6 +570,17 @@ export async function saveBufferContent(id: string, content: string): Promise<st
 }
 
 /**
+ * Writes the note in UTF-8 whatever encoding its file is in, and the note's
+ * later saves and reads use UTF-8 (ADR-049). Sent and answered like
+ * [`saveBufferContent`]; the encoding moves only once the write has landed.
+ */
+export async function saveBufferAsUtf8(id: string, content: string): Promise<string | null> {
+  return invoke("save_buffer_as_utf8", new TextEncoder().encode(content), {
+    headers: { [NOTE_ID_HEADER]: id },
+  });
+}
+
+/**
  * Writes the note as `changes` (CodeMirror's `ChangeSet.toJSON()`) applied to
  * the text whose digest is `base`, the digest a write of it or the open's
  * [`noteDiskState`] answered with. `length` is the length in UTF-16 code units

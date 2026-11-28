@@ -6,12 +6,15 @@
 //! tab's buffer: an apply to a file outside the notes folder goes through that
 //! tab's save path, and a tab holding a file a proposal changed is told so.
 
+use std::cell::Cell;
 use std::path::Path;
 
 use jotra_ai::chat::{self, PaneFrame, TabLookup};
 use jotra_core::chat::{ChatError, ProposalStatus};
 use jotra_core::config::AiConfig;
+use jotra_core::hash::Sha256Digest;
 use jotra_core::polish;
+use jotra_core::serial::Turn;
 use jotra_storage::chat_store::{ChatStore, ConversationSummary};
 use jotra_storage::paths::file_name_only;
 use tauri::{AppHandle, Manager, State};
@@ -514,15 +517,52 @@ fn apply_proposal_blocking(
     outcome
 }
 
+/// The file `path` names, and the turn ([`AppState::buffer_writes`]) of the
+/// tab holding it when one does.
+///
+/// The file is resolved again once the turn is held: a write that landed
+/// while the turn was awaited can have moved the tab, and the write is judged
+/// against the file as the tabs hold it now. A tab that changed hands in that
+/// wait is waited for in its turn.
+fn context_in_turn(
+    state: &AppState,
+    notes_root: &Path,
+    path: &str,
+) -> (Option<chat::ContextFile>, Option<Turn>) {
+    let open_tabs = state.open_tabs();
+    let resolve = || chat::resolve_context_file(notes_root, &Tabs(&open_tabs), path).ok();
+    let holder = |context: &chat::ContextFile| match &context.scope {
+        chat::ContextScope::OpenTab { tab_id } => Some(tab_id.clone()),
+        chat::ContextScope::Notes => open_tabs.note_at(&context.file),
+    };
+    let mut wanted = resolve().as_ref().and_then(holder);
+    for _ in 0..CONTEXT_TURN_ATTEMPTS {
+        let turn = wanted.as_deref().map(|id| state.buffer_writes.turn(id));
+        let context = resolve();
+        let holding = context.as_ref().and_then(holder);
+        if holding == wanted {
+            return (context, turn);
+        }
+        drop(turn);
+        wanted = holding;
+    }
+    (None, None)
+}
+
+/// How many times [`context_in_turn`] follows a file from tab to tab before
+/// it gives up on writing it.
+const CONTEXT_TURN_ATTEMPTS: usize = 3;
+
 /// Writes one proposal against the app's state, and tells the tab holding the
 /// file what it now holds.
 ///
-/// A file only an open tab reaches is written through that tab's save, and the
-/// tab's turn ([`AppState::buffer_writes`]) is held from the read that checks
-/// the offer to the notice that follows the write. A save of the tab is then
-/// either landed before the check, which refuses the offer, or waits until the
-/// write is told. What such a file held before the write is kept in
-/// `earlier` for its card's Undo.
+/// The turn of the tab holding the file ([`AppState::buffer_writes`]) is held
+/// from the read that checks the offer to the notice that follows the write,
+/// for a file only that tab reaches and for a note in the folder alike. A save
+/// of the tab is then either landed before the check, which refuses the
+/// offer, or waits until the write is told. A file only an open tab reaches is
+/// written through that tab's save, and what it held before the write is kept
+/// in `earlier` for its card's Undo.
 pub fn apply_proposal_to_state(
     state: &AppState,
     earlier: &EarlierTexts,
@@ -532,8 +572,8 @@ pub fn apply_proposal_to_state(
     before_hash: &str,
 ) -> Result<ProposalOutcome, String> {
     let notes_root = state.notes_root();
+    let target = CardTarget::resolve(state, &notes_root, path);
     let open_tabs = state.open_tabs();
-    let target = CardTarget::resolve(state, &notes_root, &open_tabs, path);
     let outcome = chat::apply_proposal_in_session(
         earlier,
         &notes_root,
@@ -545,34 +585,34 @@ pub fn apply_proposal_to_state(
         before_hash,
         Some(&state.note_history),
         |tab_id, content, verified| target.write_tab(state, tab_id, content, verified),
-    );
+    )
+    .map(|applied| target.holding(applied));
     // Only a write that moved bytes has something to tell a tab. An apply of
     // the text the note already holds leaves the file exactly as the tab has
     // it, so an event about it would be a notice about nothing.
     if outcome.as_ref().is_ok_and(|applied| applied.changed) {
-        target.announce(state, new_content);
+        target.announce(state, Some(new_content));
     }
     drop(target);
     outcome
 }
 
-/// The file a card's Apply or Undo writes, resolved once before the write.
+/// The file a card's Apply or Undo writes, resolved in the turn of the tab
+/// holding it ([`context_in_turn`]), which is held from here to the notice
+/// that follows the write.
 ///
-/// A file only an open tab reaches is written through that tab's save, with
-/// the tab's turn held from here to the notice that follows the write.
+/// A file only an open tab reaches is written through that tab's save.
 struct CardTarget {
     context: Option<chat::ContextFile>,
-    tab_turn: Option<jotra_core::serial::Turn>,
+    tab_turn: Option<Turn>,
     name: String,
+    /// The digest of the bytes the tab's save wrote, once it has.
+    written: Cell<Option<Sha256Digest>>,
 }
 
 impl CardTarget {
-    fn resolve(state: &AppState, notes_root: &Path, open_tabs: &dyn OpenNotes, path: &str) -> Self {
-        let context = chat::resolve_context_file(notes_root, &Tabs(open_tabs), path).ok();
-        let tab_turn = match context.as_ref().map(|context| &context.scope) {
-            Some(chat::ContextScope::OpenTab { tab_id }) => Some(state.buffer_writes.turn(tab_id)),
-            _ => None,
-        };
+    fn resolve(state: &AppState, notes_root: &Path, path: &str) -> Self {
+        let (context, tab_turn) = context_in_turn(state, notes_root, path);
         let name = context
             .as_ref()
             .map_or_else(|| file_name_only(path), chat::context_name);
@@ -580,6 +620,22 @@ impl CardTarget {
             context,
             tab_turn,
             name,
+            written: Cell::new(None),
+        }
+    }
+
+    /// `outcome` naming what the file holds once the tab's save wrote it.
+    ///
+    /// The save keeps the file's line ending, byte order mark and encoding, so
+    /// the bytes that landed are not the text the write was handed, and the
+    /// digest Undo checks the file against has to be of the bytes.
+    fn holding(&self, outcome: ProposalOutcome) -> ProposalOutcome {
+        match self.written.get() {
+            Some(digest) => ProposalOutcome {
+                hash: jotra_core::hash::digest_hex(digest),
+                ..outcome
+            },
+            None => outcome,
         }
     }
 
@@ -603,27 +659,36 @@ impl CardTarget {
             state.record_disk_state_bytes(tab_id, &context.file, verified);
         }
         crate::commands::buffer::save_in_turn(state, turn, content)
-            .map(|_| ())
-            .map_err(|error| save_error_sentence(&self.name, &error))
+            .map_err(|error| save_error_sentence(&self.name, &error))?;
+        // The save recorded the state it wrote, and the turn held here keeps
+        // any other record of this tab from landing before it is read.
+        self.written
+            .set(state.disk_state(tab_id).map(|disk| disk.hash));
+        Ok(())
     }
 
-    /// Tells the tab holding the file what it now holds. `written` is the
-    /// text a note in the folder was written with.
-    fn announce(&self, state: &AppState, written: &str) {
+    /// Tells the tab holding the file what it now holds.
+    ///
+    /// The write keeps the line ending and the encoding the file keeps, so
+    /// what landed is not always the string that was written, and the tab is
+    /// told what the file holds. `written` stands in for a file that cannot be
+    /// read back.
+    fn announce(&self, state: &AppState, written: Option<&str>) {
         let Some(context) = self.context.as_ref() else {
             return;
         };
+        let Some(bytes) = std::fs::read(&context.file)
+            .ok()
+            .or_else(|| written.map(|text| text.as_bytes().to_vec()))
+        else {
+            return;
+        };
         match &context.scope {
-            // The buffer store keeps the line ending the file keeps, so what
-            // landed is not always the string that was offered. The tab is
-            // told what the file holds.
             chat::ContextScope::OpenTab { tab_id } => {
-                let bytes =
-                    std::fs::read(&context.file).unwrap_or_else(|_| written.as_bytes().to_vec());
                 announce_note_change(state, tab_id, &context.file, &bytes);
             }
             chat::ContextScope::Notes => {
-                announce_applied_note(state, &context.file, written.as_bytes());
+                announce_applied_note(state, &context.file, &bytes);
             }
         }
     }
@@ -677,8 +742,8 @@ pub fn undo_proposal_to_state(
     applied_hash: &str,
 ) -> Result<ProposalOutcome, String> {
     let notes_root = state.notes_root();
+    let target = CardTarget::resolve(state, &notes_root, path);
     let open_tabs = state.open_tabs();
-    let target = CardTarget::resolve(state, &notes_root, &open_tabs, path);
     let mut put_back = String::new();
     let outcome = chat::undo_proposal_in_session(
         earlier,
@@ -694,18 +759,15 @@ pub fn undo_proposal_to_state(
             put_back = content.to_string();
             target.write_tab(state, tab_id, content, verified)
         },
-    );
+    )
+    .map(|undone| target.holding(undone));
     if outcome.as_ref().is_ok_and(|undone| undone.changed) {
         // A note was written by the note host, not through `put_back`.
         let written = match target.context.as_ref() {
-            Some(context) if matches!(context.scope, chat::ContextScope::Notes) => {
-                std::fs::read_to_string(&context.file).ok()
-            }
-            _ => Some(put_back),
+            Some(context) if matches!(context.scope, chat::ContextScope::Notes) => None,
+            _ => Some(put_back.as_str()),
         };
-        if let Some(written) = written {
-            target.announce(state, &written);
-        }
+        target.announce(state, written);
     }
     drop(target);
     outcome

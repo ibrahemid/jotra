@@ -142,7 +142,7 @@ fn first_note(state: &AppState) -> Result<Option<BufferDocument>, String> {
 
 /// Whether the last session left tabs for the frontend to restore.
 fn has_open_notes(state: &AppState) -> Result<bool, String> {
-    let store = state.store.lock().map_err(|e| e.to_string())?;
+    let store = state.lock_store();
     let open = store
         .list_by_status(jotra_core::buffer::document::BufferStatus::Active)
         .map_err(|e| e.to_string())?;

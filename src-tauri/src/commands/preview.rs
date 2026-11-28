@@ -35,7 +35,7 @@ use jotra_core::preview::{
 use tracing::{info, warn};
 
 use jotra_storage::buffer_store::BufferStore;
-use jotra_storage::errors::StorageResult;
+use jotra_storage::errors::{StorageError, StorageResult};
 use jotra_storage::layout_state::LayoutStateRecord;
 
 use crate::commands::materialise::{materialise_with, read_and_verify_with};
@@ -114,7 +114,7 @@ pub fn preview_get_scripts(state: State<'_, AppState>, buffer_id: String) -> Res
 /// file or wrote to it. No file is read, so the status bar never waits on one
 /// that does not answer. An id the store does not hold answers off.
 pub fn preview_get_scripts_inner(state: &AppState, buffer_id: &str) -> Result<bool, String> {
-    let store = state.store.lock().map_err(|e| e.to_string())?;
+    let store = state.lock_store();
     scripts_may_run(state, &store, buffer_id).map_err(|e| e.to_string())
 }
 
@@ -140,7 +140,7 @@ pub fn preview_set_scripts_inner(
     buffer_id: &str,
     enabled: bool,
 ) -> Result<(), String> {
-    let store = state.store.lock().map_err(|e| e.to_string())?;
+    let store = state.lock_store();
     if enabled {
         return store
             .enable_preview_scripts(buffer_id, bytes_jotra_holds(state, buffer_id))
@@ -320,10 +320,13 @@ pub enum PreviewRenderResult {
 ///
 /// `None` for a buffer with no file on disk — a scratch note embeds nothing,
 /// because there is no folder to resolve a relative reference against.
-/// ADR-035.
+/// ADR-035. `None` too once a panic was held through the store (ADR-045).
 fn asset_scope(state: &AppState, buffer_id: &str) -> Option<AssetScope> {
     let source_path = {
-        let store = state.store.lock().ok()?;
+        let store = state.lock_store();
+        if store.was_held_through_a_panic() {
+            return None;
+        }
         store.get(buffer_id).ok()?.source_path?
     };
     // The buffer's recorded scope keeps its token across re-renders and the
@@ -387,19 +390,13 @@ pub fn render_into_cache(
                 assets,
                 scripts_enabled,
             };
-            let scripts_enabled = match state.store.lock() {
-                Ok(store) => {
-                    let scripts_enabled =
-                        scripts_may_run(state, &store, buffer_id).unwrap_or(false);
-                    state
-                        .preview_render_cache
-                        .put(buffer_id, doc(scripts_enabled));
-                    scripts_enabled
-                }
-                Err(_) => {
-                    state.preview_render_cache.put(buffer_id, doc(false));
-                    false
-                }
+            let scripts_enabled = {
+                let store = state.lock_store();
+                let scripts_enabled = scripts_may_run(state, &store, buffer_id).unwrap_or(false);
+                state
+                    .preview_render_cache
+                    .put(buffer_id, doc(scripts_enabled));
+                scripts_enabled
             };
             CachedRender::Rendered {
                 used_fallback_stylesheet: output.used_fallback_stylesheet,
@@ -869,13 +866,17 @@ fn read_head(path: &std::path::Path) -> std::io::Result<Vec<u8>> {
 
 /// The folder an open buffer's images resolve against: the one holding its
 /// file, or the notes folder for a buffer with none. `None` when no open tab
-/// is that buffer. The store is let go before any file is touched.
+/// is that buffer. The store is let go before any file is touched. An error
+/// once a panic was held through the store (ADR-045).
 fn open_buffer_folder(
     state: &AppState,
     buffer_id: &str,
 ) -> Result<Option<std::path::PathBuf>, String> {
     let row = {
-        let store = state.store.lock().map_err(|e| e.to_string())?;
+        let store = state.lock_store();
+        if store.was_held_through_a_panic() {
+            return Err(StorageError::HeldThroughAPanic.to_string());
+        }
         store.find(buffer_id).map_err(|e| e.to_string())?
     };
     let Some(row) = row.filter(|row| row.status == BufferStatus::Active) else {

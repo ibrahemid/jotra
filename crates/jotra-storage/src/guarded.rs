@@ -30,7 +30,10 @@ use jotra_core::notes::line_ending::LineEnding;
 use jotra_core::notes::WriteOrigin;
 use tracing::warn;
 
-use crate::atomic::{prepare_replacement, write_new, AtomicWriteError};
+use crate::atomic::{
+    persist_retry_delay, prepare_replacement, write_new, AtomicWriteError, PlaceFailure,
+    PlacedReplacement, PreparedReplacement,
+};
 use crate::buffer_store::{
     dataless_flags, read_disk_state, taken_names, BeforeWrite, DatalessProbe,
 };
@@ -329,71 +332,112 @@ pub fn write_note_guarded(
 /// The bytes read under the lock are what the version store keeps as the text
 /// this write replaced, so the version is the text that was there, not the
 /// text an earlier read found.
+///
+/// A rename Windows refuses because another program has the file open lets
+/// the lock go before it waits, and the next attempt takes it again and reads
+/// the file again: a writer in another process is never held behind the wait.
 fn land(
     req: GuardedWrite<'_>,
     decided_on: Option<DiskState>,
     incoming: Sha256Digest,
     before_write: BeforeWrite<'_>,
 ) -> StorageResult<WriteOutcome> {
+    land_with(
+        req,
+        decided_on,
+        incoming,
+        before_write,
+        PreparedReplacement::try_place,
+        |attempt| std::thread::sleep(persist_retry_delay(attempt)),
+    )
+}
+
+/// [`land`], with the rename and the wait between its attempts handed in.
+fn land_with(
+    req: GuardedWrite<'_>,
+    decided_on: Option<DiskState>,
+    incoming: Sha256Digest,
+    before_write: BeforeWrite<'_>,
+    mut try_place: impl FnMut(
+        PreparedReplacement,
+        &Path,
+        u32,
+    ) -> Result<PlacedReplacement, PlaceFailure>,
+    mut wait: impl FnMut(u32),
+) -> StorageResult<WriteOutcome> {
     let target = req.target;
-    let prepared = prepare_replacement(target, req.bytes)
+    let mut prepared = prepare_replacement(target, req.bytes)
         .map_err(|error| refusal_as_storage_error(target, error))?;
-    let held = req.lock.and_then(WriteLock::hold);
-    let current = read_current(target)?;
-    let found = current.as_ref().map(|(_, state)| *state);
-    let decision = if same_text(decided_on, found) {
-        SaveDecision::Proceed
-    } else {
-        decide_again(&req, found, incoming)
-    };
-    match (decision, found) {
-        (SaveDecision::AlreadyIdentical, Some(state)) => Ok(WriteOutcome {
-            disk_state: state,
+    let mut attempt = 0;
+    loop {
+        let held = req.lock.and_then(WriteLock::hold);
+        let current = read_current(target)?;
+        let found = current.as_ref().map(|(_, state)| *state);
+        let decision = if same_text(decided_on, found) {
+            SaveDecision::Proceed
+        } else {
+            decide_again(&req, found, incoming)
+        };
+        match (decision, found) {
+            (SaveDecision::AlreadyIdentical, Some(state)) => {
+                return Ok(WriteOutcome {
+                    disk_state: state,
+                    found,
+                    decision,
+                    conflict_copy: None,
+                })
+            }
+            (SaveDecision::Refuse, Some(state)) => {
+                drop(held);
+                drop(prepared);
+                return Err(refuse(
+                    target,
+                    &state,
+                    req.bytes,
+                    req.on_conflict,
+                    &req.origin,
+                    before_write,
+                ));
+            }
+            _ => {}
+        }
+        crate::atomic::refuse_unreplaceable_destination(target)
+            .map_err(|error| refusal_as_storage_error(target, error))?;
+        if let Some(stamp) = before_write {
+            stamp(target, req.bytes);
+        }
+        let placed = match try_place(prepared, target, attempt) {
+            Ok(placed) => placed,
+            Err(PlaceFailure::Failed(error)) => {
+                return Err(refusal_as_storage_error(target, error))
+            }
+            Err(PlaceFailure::InUse(back)) => {
+                drop(held);
+                wait(attempt);
+                prepared = back;
+                attempt += 1;
+                continue;
+            }
+        };
+        drop(held);
+        placed.finish();
+        let after = written_state(target, incoming, req.bytes.len() as u64);
+        if let Some(hook) = req.history {
+            hook(WriteCapture {
+                target,
+                origin: &req.origin,
+                before: current.as_ref().map(|(bytes, _)| bytes.as_slice()),
+                bytes: req.bytes,
+                after: &after,
+                before_hash: found.map(|state| state.hash),
+            });
+        }
+        return Ok(WriteOutcome {
+            disk_state: after,
             found,
             decision,
             conflict_copy: None,
-        }),
-        (SaveDecision::Refuse, Some(state)) => {
-            drop(held);
-            drop(prepared);
-            Err(refuse(
-                target,
-                &state,
-                req.bytes,
-                req.on_conflict,
-                &req.origin,
-                before_write,
-            ))
-        }
-        _ => {
-            crate::atomic::refuse_unreplaceable_destination(target)
-                .map_err(|error| refusal_as_storage_error(target, error))?;
-            if let Some(stamp) = before_write {
-                stamp(target, req.bytes);
-            }
-            let placed = prepared
-                .place(target)
-                .map_err(|error| refusal_as_storage_error(target, error))?;
-            drop(held);
-            placed.finish();
-            let after = written_state(target, incoming, req.bytes.len() as u64);
-            if let Some(hook) = req.history {
-                hook(WriteCapture {
-                    target,
-                    origin: &req.origin,
-                    before: current.as_ref().map(|(bytes, _)| bytes.as_slice()),
-                    bytes: req.bytes,
-                    after: &after,
-                    before_hash: found.map(|state| state.hash),
-                });
-            }
-            Ok(WriteOutcome {
-                disk_state: after,
-                found,
-                decision,
-                conflict_copy: None,
-            })
-        }
+        });
     }
 }
 
@@ -568,17 +612,33 @@ pub fn guard_rename(
     }
 
     let on_disk = read_disk_state(from)?;
+    check_rename(from, &last_known, on_disk.as_ref(), &origin)
+}
+
+/// [`guard_rename`]'s verdict on a file the caller already read: `on_disk` is
+/// what `from` holds, or `None` when nothing is there.
+///
+/// # Errors
+///
+/// [`StorageError::SourceChangedOnDisk`] with no copy beside the note when the
+/// file changed under Jotra.
+pub(crate) fn check_rename(
+    from: &Path,
+    last_known: &DiskState,
+    on_disk: Option<&DiskState>,
+    origin: &WriteOrigin,
+) -> StorageResult<()> {
     // Only one answer is read here — whether the guard refuses — so it does
     // not matter which of the two permissive answers a file Jotra last saw
     // unchanged comes back with.
     if let Some(state) = on_disk {
-        if decide_save(Some(&last_known), Some(&state), last_known.hash) == SaveDecision::Refuse {
+        if decide_save(Some(last_known), Some(state), last_known.hash) == SaveDecision::Refuse {
             return Err(refuse(
                 from,
-                &state,
+                state,
                 &[],
                 ConflictPolicy::RefuseOnly,
-                &origin,
+                origin,
                 None,
             ));
         }
@@ -790,5 +850,87 @@ fn refusal_as_storage_error(target: &Path, error: AtomicWriteError) -> StorageEr
             path: target.display().to_string(),
         },
         AtomicWriteError::Io(e) => StorageError::Io(e),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Duration;
+
+    fn write_to<'a>(target: &'a Path, bytes: &'a [u8], lock: &'a WriteLock) -> GuardedWrite<'a> {
+        let state = read_disk_state(target).expect("read");
+        GuardedWrite {
+            target,
+            bytes,
+            last_known: state,
+            on_disk: DiskRead::Read(state),
+            dataless: None,
+            origin: WriteOrigin::Editor,
+            on_conflict: ConflictPolicy::RefuseOnly,
+            history: None,
+            lock: Some(lock),
+        }
+    }
+
+    #[test]
+    fn a_rename_refused_as_in_use_lets_the_lock_go_while_it_waits() {
+        let dir = tempfile::TempDir::new().expect("temp dir");
+        let target = dir.path().join("Plan.md");
+        std::fs::write(&target, b"before\n").expect("seed");
+        let lock = WriteLock::in_data_folder(dir.path());
+        let bytes = b"after\n";
+        let req = write_to(&target, bytes, &lock);
+        let decided_on = req.last_known;
+        let mut free_while_waiting = Vec::new();
+        let outcome = land_with(
+            req,
+            decided_on,
+            jotra_core::hash::sha256_bytes(bytes),
+            None,
+            |prepared, target, attempt| {
+                if attempt < 2 {
+                    Err(PlaceFailure::InUse(prepared))
+                } else {
+                    prepared.try_place(target, attempt)
+                }
+            },
+            |_| free_while_waiting.push(lock.hold_within(Duration::ZERO).is_some()),
+        )
+        .expect("lands");
+        assert_eq!(free_while_waiting, [true, true]);
+        assert_eq!(outcome.decision, SaveDecision::Proceed);
+        assert_eq!(std::fs::read(&target).expect("read"), bytes);
+    }
+
+    #[test]
+    fn a_write_landed_while_a_rename_waits_is_read_before_the_next_attempt() {
+        let dir = tempfile::TempDir::new().expect("temp dir");
+        let target = dir.path().join("Plan.md");
+        std::fs::write(&target, b"before\n").expect("seed");
+        let lock = WriteLock::in_data_folder(dir.path());
+        let bytes = b"after\n";
+        let req = write_to(&target, bytes, &lock);
+        let decided_on = req.last_known;
+        let error = land_with(
+            req,
+            decided_on,
+            jotra_core::hash::sha256_bytes(bytes),
+            None,
+            |prepared, target, attempt| {
+                if attempt == 0 {
+                    Err(PlaceFailure::InUse(prepared))
+                } else {
+                    prepared.try_place(target, attempt)
+                }
+            },
+            |_| std::fs::write(&target, b"another program\n").expect("write"),
+        )
+        .expect_err("refused");
+        assert!(
+            matches!(error, StorageError::SourceChangedOnDisk { .. }),
+            "{error}"
+        );
+        assert_eq!(std::fs::read(&target).expect("read"), b"another program\n");
     }
 }

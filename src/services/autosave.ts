@@ -18,9 +18,10 @@ type AutosaveErrorListener = (
 // `diskHash` is the digest of what the note's file holds now, or null when the
 // note had nothing in it and no file yet to write it to.
 /**
- * `viaWriteBack` says the write went through a writer of its own rather than
- * the ordinary save. Only the put-a-deleted-file-back command does, and only
- * that write proves there is a file at the note's path now.
+ * `viaWriteBack` says the write went through a writer of its own that puts a
+ * file at the note's path: the put-a-deleted-file-back command and Save As.
+ * Only such a write proves there is a file at the note's path now
+ * ([`saveNowInPlace`] writes through one that does not).
  */
 type AutosaveSuccessListener = (
   bufferId: string,
@@ -102,6 +103,12 @@ interface QueuedContent {
    * backend will refuse again.
    */
   writer?: SaveWriter;
+  /**
+   * Whether a landing of `writer` proves there is a file at the note's path
+   * now. False for a writer that, like the ordinary save, is refused when the
+   * file is gone.
+   */
+  putsFileBack: boolean;
   /**
    * Set for a note in the editor's large tiers: a snapshot is then sent as the
    * changes since the document the note's last write landed with or its tab
@@ -436,6 +443,11 @@ export function currentSaveGeneration(bufferId: string): number {
   return generations.get(bufferId) ?? 0;
 }
 
+/** The generation of the note's write on its way to the file, if one is. */
+export function inFlightSaveGeneration(bufferId: string): number | undefined {
+  return inFlight.get(bufferId)?.generation;
+}
+
 function bumpGeneration(bufferId: string): number {
   const next = (generations.get(bufferId) ?? 0) + 1;
   generations.set(bufferId, next);
@@ -455,6 +467,7 @@ function queueContent(
   content: ContentSource,
   writer?: SaveWriter,
   encodeChanges?: ChangeEncoder,
+  putsFileBack: boolean = writer !== undefined,
 ) {
   // The note is writing again, so the queue is the newer record of its text
   // and anything held for it is the older one. The write answers to the
@@ -468,6 +481,7 @@ function queueContent(
     source: content,
     generation: bumpGeneration(bufferId),
     writer,
+    putsFileBack,
     encodeChanges,
   });
 }
@@ -633,6 +647,22 @@ export async function saveNow(
   return runPendingSave(bufferId);
 }
 
+/**
+ * [`saveNow`] through `writer`, a command that writes the note's file where
+ * the ordinary save does and is refused, as it is, when the file is gone. Its
+ * landing tells the success listeners what the ordinary save's does: the write
+ * went through no writer that puts a file back.
+ */
+export async function saveNowInPlace(
+  bufferId: string,
+  content: ContentSource,
+  writer: SaveWriter,
+): Promise<SaveResult> {
+  clearTimer(bufferId);
+  queueContent(bufferId, content, writer, undefined, false);
+  return runPendingSave(bufferId);
+}
+
 // One write per buffer at a time. Concurrent writes for one buffer race on the
 // file and on the retry queue, and a caller that returns while a write is still
 // outstanding lets the close path drop text that never reached disk. A caller
@@ -747,7 +777,7 @@ async function writeQueued(bufferId: string, queued: QueuedContent): Promise<Sav
       generation: queued.generation,
     };
     for (const listener of successListeners) {
-      listener(bufferId, diskHash, queued.writer !== undefined, write);
+      listener(bufferId, diskHash, queued.putsFileBack, write);
     }
     return SAVE_OK;
   } catch (error) {
@@ -767,6 +797,7 @@ async function writeQueued(bufferId: string, queued: QueuedContent): Promise<Sav
         source: typeof queued.source === "object" ? queued.source : text,
         generation: queued.generation,
         writer: queued.writer,
+        putsFileBack: queued.putsFileBack,
         encodeChanges: queued.encodeChanges,
       });
       // A keystroke or flush in the meantime writes it sooner; this is for

@@ -28,7 +28,7 @@ pub struct SearchResults {
 
 #[tauri::command]
 pub fn list_history(state: State<'_, AppState>) -> Result<Vec<BufferDocument>, String> {
-    let store = state.store.lock().map_err(|e| e.to_string())?;
+    let store = state.lock_store();
     store
         .list_by_status(BufferStatus::History)
         .map_err(|e| e.to_string())
@@ -96,7 +96,7 @@ pub fn restore_buffer_confirmed_inner(
 
 fn reopen_closed(state: &AppState, id: &str, confirmed: bool) -> Result<FileOpenResult, String> {
     let (doc, mode, size_bytes, reopened) = {
-        let store = state.store.lock().map_err(|e| e.to_string())?;
+        let store = state.lock_store();
         let closed = store.get(id).map_err(|e| e.to_string())?;
         if let Some(open) = open_elsewhere(&store, &closed)? {
             let mode = file_ops::classify_file(open.size_bytes, open.read_only).once_open();
@@ -178,7 +178,7 @@ pub fn clear_history(state: State<'_, AppState>) -> Result<(), String> {
 /// they named that no open tab still holds.
 pub fn clear_history_inner(state: &AppState) -> Result<(), String> {
     let released: Vec<String> = {
-        let store = state.store.lock().map_err(|e| e.to_string())?;
+        let store = state.lock_store();
         let history = store
             .list_by_status(BufferStatus::History)
             .map_err(|e| e.to_string())?;
@@ -240,7 +240,7 @@ pub fn search_buffers_inner(state: &AppState, query: &str) -> Result<SearchResul
         .search_count(&planned)
         .map_err(|e| e.to_string())?;
 
-    let store = state.store.lock().map_err(|e| e.to_string())?;
+    let store = state.lock_store();
     for hit in &mut hits {
         let Some(path) = hit.path.as_deref() else {
             continue;

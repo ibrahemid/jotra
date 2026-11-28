@@ -517,10 +517,10 @@ fn review_answer_returns_its_thread_while_its_work_waits() {
     );
 }
 
-/// Saves of one note sent one after the other land in that order, even when
-/// all of them are waiting on an earlier write of the note when they arrive.
+/// Saves of one note land in the order they took their places, even when all
+/// of them are waiting on an earlier write of the note when they arrive.
 #[test]
-fn saves_to_one_note_land_in_the_order_they_were_sent() {
+fn saves_to_one_note_land_in_the_order_they_took_their_places() {
     let dir = TempDir::new().unwrap();
     let (app, window) = mock_app(make_state(&dir));
     let path = dir.path().join("a.md");

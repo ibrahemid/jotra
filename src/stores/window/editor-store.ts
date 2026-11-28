@@ -17,6 +17,7 @@ import {
   recordOpenedText,
   releaseUnsavedContent,
   saveNow as saveNowService,
+  saveNowInPlace,
   materializeContent,
   type ChangeEncoder,
   type ContentSource,
@@ -29,6 +30,7 @@ import {
   noteDiskState,
   noteFileUnchanged,
   restoreNoteFile,
+  saveBufferAsUtf8,
   saveNoteTo,
   setBufferViewPosition,
   type NoteDiskAnswer,
@@ -1295,6 +1297,15 @@ export function createEditorStore(options: EditorStoreOptions = {}) {
     return null;
   }
 
+  /** Any pane's read of note `id` in flight, this pane's included. */
+  function readInFlight(id: string): Promise<void> | null {
+    for (const pane of PANE_IDS) {
+      const read = slots[pane].reading;
+      if (read !== null && read.id === id) return read.done;
+    }
+    return null;
+  }
+
   /**
    * A pane opening a note the other pane already shows takes that note's
    * record as it stands, and keeps a document to compare from when the
@@ -1751,6 +1762,26 @@ export function createEditorStore(options: EditorStoreOptions = {}) {
     return written;
   }
 
+  /**
+   * Writes the note's newest text in UTF-8, for a save its file's encoding
+   * refused (`ERR_ENCODING_LOSSY`): its later saves and reads use UTF-8 once
+   * the write lands (ADR-049).
+   *
+   * The text is the live document, else what autosave holds for the note, so
+   * the bar of a note that is not in the editor writes too. A note under a
+   * question of its own writes nothing, as [`retrySave`] does not. A failure
+   * reports to the same bar every other save does.
+   */
+  function saveAsUtf8(id: string): Promise<SaveResult> {
+    if (savesAreHeld(id)) return Promise.resolve(NOTHING_TO_SAVE);
+    const text = outstandingTextOf(id);
+    if (text === undefined) return Promise.resolve(NOTHING_TO_SAVE);
+    saveStatusStore.noteRequestedSave(id);
+    const written = saveNowInPlace(id, text.content, saveBufferAsUtf8);
+    if (text.current) noteWriteOfCurrentText(id);
+    return written;
+  }
+
   /** What the backend can say about the note's file right now. */
   function readDiskState(id: string): Promise<NoteDiskAnswer> {
     return noteDiskState(id);
@@ -1815,6 +1846,7 @@ export function createEditorStore(options: EditorStoreOptions = {}) {
       saveActiveBuffer: () => saveActiveBuffer(slotOf()),
       savesAreHeld,
       retrySave,
+      saveAsUtf8,
       readDiskState,
       detectFromDocument,
       noteOpened,
@@ -1865,6 +1897,7 @@ export function createEditorStore(options: EditorStoreOptions = {}) {
       liveDocElsewhere: (id: string) => liveDocElsewhere(slot, id),
       beginRead: (id: string) => beginRead(slot, id),
       readElsewhere: (id: string) => readElsewhere(slot, id),
+      readInFlight,
       /** Ends this pane's read, for an editor going away mid-read. */
       endRead: () => slot.reading?.end(),
       noteShownTwice,
