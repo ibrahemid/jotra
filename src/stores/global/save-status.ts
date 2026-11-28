@@ -1,6 +1,7 @@
 import { createSignal, createRoot } from "solid-js";
 import {
   currentSaveGeneration,
+  inFlightSaveGeneration,
   onAutosaveError,
   onAutosaveStart,
   onAutosaveSuccess,
@@ -43,9 +44,11 @@ function createSaveStatusStore() {
     new Set(),
   );
   const savedTimers = new Map<string, ReturnType<typeof setTimeout>>();
-  // Notes whose next write the person asked for. Only such a write reports
-  // `saved`: an autosave landing every pause is not news.
-  const requestedSaves = new Set<string>();
+  // Notes whose next write the person asked for, with the generation of the
+  // write on its way when they asked (0 for none). Only a newer write reports
+  // `saved`: an autosave landing every pause is not news, and one in flight
+  // when the person asked does not carry what they asked to save.
+  const requestedSaves = new Map<string, number>();
   // Per note, the newest write generation whose failure says nothing about the
   // note any more ([`forgetWritesSoFar`]). Read only when a failure arrives.
   const answeredWrites = new Map<string, number>();
@@ -95,10 +98,11 @@ function createSaveStatusStore() {
     addTo(setWriting, id);
   });
 
-  onAutosaveSuccess((id) => {
+  onAutosaveSuccess((id, _diskHash, _viaWriteBack, write) => {
     removeFrom(setWriting, id);
     withoutId(setFailures, id);
-    if (!requestedSaves.delete(id)) return;
+    if (!answersRequestedSave(id, write.generation)) return;
+    requestedSaves.delete(id);
     clearSavedTimer(id);
     addTo(setJustSaved, id);
     savedTimers.set(
@@ -116,12 +120,26 @@ function createSaveStatusStore() {
     removeFrom(setWriting, id);
     clearSavedTimer(id);
     removeFrom(setJustSaved, id);
-    requestedSaves.delete(id);
+    if (answersRequestedSave(id, generation)) requestedSaves.delete(id);
     if (writeWasAnsweredFor(id, generation)) return;
     setFailures((current) =>
       new Map(current).set(id, describeSaveFailure(error)),
     );
   });
+
+  /**
+   * Whether the write of `generation` is newer than the one that was on its
+   * way when the person asked for a save.
+   *
+   * A mark above the note's current generation means the counter was reset
+   * underneath it, as in [`writeWasAnsweredFor`], and any write answers it.
+   */
+  function answersRequestedSave(id: string, generation: number): boolean {
+    const issuedBefore = requestedSaves.get(id);
+    if (issuedBefore === undefined) return false;
+    if (currentSaveGeneration(id) < issuedBefore) return true;
+    return generation > issuedBefore;
+  }
 
   /**
    * Whether the write that failed is one something has already answered for.
@@ -208,7 +226,7 @@ function createSaveStatusStore() {
 
   /** Marks the note's next write as one the person asked for. */
   function noteRequestedSave(id: string) {
-    requestedSaves.add(id);
+    requestedSaves.set(id, inFlightSaveGeneration(id) ?? 0);
   }
 
   /** Drops everything held for a note whose tab has gone. */

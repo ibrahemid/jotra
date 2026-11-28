@@ -13,8 +13,10 @@
 //! Jotra defaults, the root `.gitignore`/`.ignore`, and the global gitignore. It
 //! does not read `.gitignore`s nested in subdirectories (the `ignore` crate has
 //! no single-path query over the full nested stack); a full rebuild is the
-//! convergence backstop for that gap.
+//! convergence backstop for that gap. [`walk_index_within`] answers for a set of
+//! paths with the full stack, by walking from the root down to them only.
 
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
 use ignore::gitignore::{Gitignore, GitignoreBuilder};
@@ -34,6 +36,14 @@ pub struct IndexWalk {
 /// Jotra's default-ignored directories pruned. Used by both the name index walk
 /// and the content grep so the two apply one ignore policy.
 pub fn build_walk(root: &Path) -> WalkBuilder {
+    walk_entering(root, |_| true)
+}
+
+/// [`build_walk`], entering only the entries `enters` accepts.
+fn walk_entering(
+    root: &Path,
+    enters: impl Fn(&Path) -> bool + Send + Sync + 'static,
+) -> WalkBuilder {
     let mut builder = WalkBuilder::new(root);
     builder
         .hidden(false)
@@ -47,7 +57,7 @@ pub fn build_walk(root: &Path) -> WalkBuilder {
     let ignores = jotra_core::workspace::default_ignored_dirs();
     builder.filter_entry(move |entry| {
         let name = entry.file_name().to_string_lossy();
-        !ignores.iter().any(|ig| *ig == name)
+        !ignores.iter().any(|ig| *ig == name) && enters(entry.path())
     });
     builder
 }
@@ -69,10 +79,44 @@ fn relative_path(root: &Path, path: &Path) -> Option<String> {
 /// Walks `root` and collects up to `cap` workspace-relative file paths under the
 /// union ignore policy. On overflow the walk stops and `truncated` is `true`.
 pub fn walk_index(root: &Path, cap: usize) -> IndexWalk {
+    collect_walk(build_walk(root), root, cap)
+}
+
+/// [`walk_index`] over only what `targets` name: each target, everything under
+/// it, and the folders on the way down to it. A file comes back exactly when
+/// the whole walk would list it, since the walk reaches it through the same
+/// folders and reads the same rule files on the way, nested ones included.
+/// A target that is outside `root`, gone, or ignored yields nothing.
+pub fn walk_index_within(root: &Path, targets: &[PathBuf], cap: usize) -> IndexWalk {
+    let targets: HashSet<PathBuf> = targets
+        .iter()
+        .filter(|target| target.starts_with(root) && target.as_path() != root)
+        .cloned()
+        .collect();
+    if targets.is_empty() {
+        return IndexWalk {
+            paths: Vec::new(),
+            truncated: false,
+        };
+    }
+    let on_the_way: HashSet<PathBuf> = targets
+        .iter()
+        .flat_map(|target| target.ancestors().skip(1))
+        .filter(|folder| folder.starts_with(root))
+        .map(Path::to_path_buf)
+        .collect();
+    let enters = move |path: &Path| {
+        on_the_way.contains(path) || path.ancestors().any(|at| targets.contains(at))
+    };
+    collect_walk(walk_entering(root, enters), root, cap)
+}
+
+/// Collects up to `cap` workspace-relative file paths from `walk`.
+fn collect_walk(walk: WalkBuilder, root: &Path, cap: usize) -> IndexWalk {
     let mut paths = Vec::new();
     let mut truncated = false;
 
-    for result in build_walk(root).build() {
+    for result in walk.build() {
         let Ok(entry) = result else { continue };
         match entry.file_type() {
             Some(ft) if ft.is_file() => {}
@@ -132,10 +176,7 @@ impl WorkspaceIgnore {
     /// Whether `path` is one of the root's own rule files, a change to which
     /// means the policy has to be read again.
     pub fn is_rules_file(&self, path: &Path) -> bool {
-        path.parent() == Some(self.root.as_path())
-            && path
-                .file_name()
-                .is_some_and(|name| name == ".gitignore" || name == ".ignore")
+        path.parent() == Some(self.root.as_path()) && is_rules_file_name(path)
     }
 
     /// Returns `true` when `path` belongs in the name index: it is under the
@@ -171,6 +212,13 @@ impl WorkspaceIgnore {
             .matched_path_or_any_parents(rel, is_dir)
             .is_ignore()
     }
+}
+
+/// Whether `path` is named like a rule file the walk reads in every folder it
+/// enters, which governs every path under that folder.
+pub fn is_rules_file_name(path: &Path) -> bool {
+    path.file_name()
+        .is_some_and(|name| name == ".gitignore" || name == ".ignore")
 }
 
 /// Returns `true` when `path` belongs in the name index under `root`, reading
@@ -297,6 +345,90 @@ mod tests {
         assert!(!rebuilt.is_indexed(&root.join("b.log")));
     }
 
+    fn within(root: &Path, targets: &[&str], cap: usize) -> IndexWalk {
+        let targets: Vec<PathBuf> = targets.iter().map(|rel| root.join(rel)).collect();
+        let mut walk = walk_index_within(root, &targets, cap);
+        walk.paths.sort();
+        walk
+    }
+
+    #[test]
+    fn a_walk_within_targets_lists_what_the_whole_walk_lists_there() {
+        let dir = TempDir::new().unwrap();
+        let root = dir.path();
+        write(root, ".gitignore", "*.tmp\n");
+        write(root, "top.rs", "x");
+        write(root, "a/.gitignore", "gen/\n!keep.tmp\n");
+        write(root, "a/one.rs", "x");
+        write(root, "a/drop.tmp", "x");
+        write(root, "a/keep.tmp", "x");
+        write(root, "a/gen/out.rs", "x");
+        write(root, "a/b/two.rs", "x");
+        write(root, "a/b/node_modules/pkg.js", "x");
+        write(root, "c/three.rs", "x");
+
+        let walk = within(root, &["a"], 100);
+        assert_eq!(
+            walk.paths,
+            vec![
+                "a/.gitignore".to_string(),
+                "a/b/two.rs".to_string(),
+                "a/keep.tmp".to_string(),
+                "a/one.rs".to_string(),
+            ]
+        );
+        let mut whole = walk_index(root, 100).paths;
+        whole.retain(|path| path.starts_with("a/"));
+        whole.sort();
+        assert_eq!(walk.paths, whole);
+        assert!(!walk.truncated);
+    }
+
+    #[test]
+    fn a_walk_within_a_file_target_lists_it_only_when_it_is_indexed() {
+        let dir = TempDir::new().unwrap();
+        let root = dir.path();
+        write(root, "web/.gitignore", "generated/\n");
+        write(root, "web/main.ts", "x");
+        write(root, "web/other.ts", "x");
+        write(root, "web/generated/app.js", "x");
+
+        let walk = within(root, &["web/main.ts", "web/generated/app.js"], 100);
+        assert_eq!(walk.paths, vec!["web/main.ts".to_string()]);
+    }
+
+    #[test]
+    fn a_walk_within_gone_ignored_or_outside_targets_lists_nothing() {
+        let dir = TempDir::new().unwrap();
+        let root = dir.path();
+        write(root, "keep.rs", "x");
+        write(root, "node_modules/pkg/a.js", "x");
+        let other = TempDir::new().unwrap();
+        write(other.path(), "x.rs", "x");
+
+        let targets = vec![
+            root.join("gone"),
+            root.join("node_modules"),
+            other.path().join("x.rs"),
+            root.to_path_buf(),
+        ];
+        let walk = walk_index_within(root, &targets, 100);
+        assert!(walk.paths.is_empty());
+        assert!(!walk.truncated);
+    }
+
+    #[test]
+    fn a_walk_within_targets_marks_truncated_at_cap() {
+        let dir = TempDir::new().unwrap();
+        let root = dir.path();
+        for i in 0..5 {
+            write(root, &format!("a/f{i}.txt"), "x");
+        }
+        let walk = within(root, &["a"], 3);
+        assert_eq!(walk.paths.len(), 3);
+        assert!(walk.truncated);
+    }
+
     #[test]
     fn only_the_roots_own_rule_files_ask_for_a_rebuild() {
         let dir = TempDir::new().unwrap();
@@ -306,5 +438,13 @@ mod tests {
         assert!(policy.is_rules_file(&root.join(".ignore")));
         assert!(!policy.is_rules_file(&root.join("src/.gitignore")));
         assert!(!policy.is_rules_file(&root.join("gitignore")));
+    }
+
+    #[test]
+    fn a_rule_file_is_known_by_its_name_at_any_depth() {
+        assert!(is_rules_file_name(Path::new("/w/.gitignore")));
+        assert!(is_rules_file_name(Path::new("/w/src/deep/.ignore")));
+        assert!(!is_rules_file_name(Path::new("/w/src/gitignore")));
+        assert!(!is_rules_file_name(Path::new("/w/src/.gitignore.bak")));
     }
 }

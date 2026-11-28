@@ -69,14 +69,8 @@ jotra-proposal:\n\n",
     let path = context
         .first()
         .map_or(EXAMPLE_PATH, |note| note.prompt_path.as_str());
-    let quote = match path.contains('"') {
-        true => '\'',
-        false => '"',
-    };
     out.push_str("```jotra-proposal path=");
-    out.push(quote);
-    out.push_str(path);
-    out.push(quote);
+    out.push_str(&write_path_attribute(path));
     out.push_str(" summary=\"Fold the two intros together\"\n");
     out.push_str(BODY_PLACEHOLDER);
     out.push_str("\n```\n\n");
@@ -108,9 +102,9 @@ pub(super) fn context_block(context: &[AttachedNote]) -> String {
     let suffix = frame_suffix(context);
     let mut out = format!("<attached-notes{suffix}>");
     for note in context {
-        out.push_str(&format!("\n<note{suffix} path=\""));
-        out.push_str(&note.prompt_path);
-        out.push_str("\">\n");
+        out.push_str(&format!("\n<note{suffix} path="));
+        out.push_str(&write_path_attribute(&note.prompt_path));
+        out.push_str(">\n");
         out.push_str(&note.text);
         out.push_str(&format!("\n</note{suffix}>"));
     }
@@ -118,15 +112,88 @@ pub(super) fn context_block(context: &[AttachedNote]) -> String {
     out
 }
 
-/// The suffix the frame's tags carry for one request: none, unless an attached
-/// note's own text closes a frame, and then the first `-N` that no text does.
+/// The character references [`write_path_attribute`] writes, and what each
+/// stands for.
+const PATH_REFERENCES: [(&str, char); 5] = [
+    ("&amp;", '&'),
+    ("&quot;", '"'),
+    ("&apos;", '\''),
+    ("&#10;", '\n'),
+    ("&#13;", '\r'),
+];
+
+/// A `path` attribute's value as the prompt writes it, quotes included.
 ///
-/// The check ignores ASCII case, since a model reads `</Note>` as the same
-/// tag. A note's text holds finitely many tags, so the search ends.
+/// A name is carried verbatim where it can be, since that is what a model
+/// copies back exactly: in double quotes, or in single quotes when it holds a
+/// double quote and no single one. A character reference stands in only for
+/// what would end the value or its line: a line break, both quotes when the
+/// name holds both kinds, and `&` always, so [`read_path_attribute`] undoes
+/// every reference it meets.
+pub(super) fn write_path_attribute(path: &str) -> String {
+    let holds_double = path.contains('"');
+    let holds_single = path.contains('\'');
+    let (quote, escapes_quotes) = match (holds_double, holds_single) {
+        (true, false) => ('\'', false),
+        (true, true) => ('"', true),
+        (false, _) => ('"', false),
+    };
+    let mut out = String::with_capacity(path.len() + 2);
+    out.push(quote);
+    for character in path.chars() {
+        let reference = PATH_REFERENCES
+            .iter()
+            .find(|(_, stands_for)| *stands_for == character)
+            .filter(|_| escapes_quotes || (character != '"' && character != '\''));
+        match reference {
+            Some((reference, _)) => out.push_str(reference),
+            None => out.push(character),
+        }
+    }
+    out.push(quote);
+    out
+}
+
+/// The name a `path` attribute's value spells: the inverse of
+/// [`write_path_attribute`] once the quotes are off.
+///
+/// An `&` that starts none of its references is kept as written, so a name
+/// copied back with a bare ampersand still reads as that name.
+pub(super) fn read_path_attribute(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    let mut rest = value;
+    while let Some(at) = rest.find('&') {
+        out.push_str(&rest[..at]);
+        let tail = &rest[at..];
+        match PATH_REFERENCES
+            .iter()
+            .find(|(reference, _)| tail.starts_with(reference))
+        {
+            Some((reference, character)) => {
+                out.push(*character);
+                rest = &tail[reference.len()..];
+            }
+            None => {
+                out.push('&');
+                rest = &tail['&'.len_utf8()..];
+            }
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
+/// The suffix the frame's tags carry for one request: none, unless an attached
+/// note's own text or name closes a frame, and then the first `-N` that none
+/// does.
+///
+/// The check reads a tag the way a model does: ASCII case aside, and with
+/// whitespace around the slash or before the bracket (`</ Note >`). A note's
+/// text holds finitely many tags, so the search ends.
 fn frame_suffix(context: &[AttachedNote]) -> String {
-    let bodies: Vec<String> = context
+    let texts: Vec<&str> = context
         .iter()
-        .map(|note| note.text.to_ascii_lowercase())
+        .flat_map(|note| [note.text.as_str(), note.prompt_path.as_str()])
         .collect();
     (0usize..)
         .map(|n| match n {
@@ -134,13 +201,39 @@ fn frame_suffix(context: &[AttachedNote]) -> String {
             n => format!("-{n}"),
         })
         .find(|suffix| {
-            let closes = [
-                format!("</note{suffix}>"),
-                format!("</attached-notes{suffix}>"),
-            ];
-            bodies
+            let names = [format!("note{suffix}"), format!("attached-notes{suffix}")];
+            texts
                 .iter()
-                .all(|body| closes.iter().all(|close| !body.contains(close.as_str())))
+                .all(|text| names.iter().all(|name| !closes_tag(text, name)))
         })
         .unwrap_or_default()
+}
+
+/// Whether `text` holds a closing tag for `name`: `<`, `/`, the name in any
+/// ASCII case and `>`, with any ASCII whitespace between them.
+fn closes_tag(text: &str, name: &str) -> bool {
+    let bytes = text.as_bytes();
+    let name = name.as_bytes();
+    let skip_space = |mut at: usize| {
+        while bytes.get(at).is_some_and(u8::is_ascii_whitespace) {
+            at += 1;
+        }
+        at
+    };
+    bytes
+        .iter()
+        .enumerate()
+        .filter(|(_, byte)| **byte == b'<')
+        .any(|(open, _)| {
+            let slash = skip_space(open + 1);
+            if bytes.get(slash) != Some(&b'/') {
+                return false;
+            }
+            let start = skip_space(slash + 1);
+            let Some(word) = bytes.get(start..start + name.len()) else {
+                return false;
+            };
+            word.eq_ignore_ascii_case(name)
+                && bytes.get(skip_space(start + name.len())) == Some(&b'>')
+        })
 }

@@ -63,6 +63,7 @@ fn a_link_is_rewritten_in_place() {
         None,
         None,
         None,
+        None,
     )
     .expect("the rewrite should land");
 
@@ -86,11 +87,98 @@ fn a_file_naming_the_note_nowhere_is_not_written() {
         None,
         None,
         None,
+        None,
     )
     .expect("nothing to do is not a failure");
 
     assert_eq!(written, LinkRewrite::NoLink);
     assert_eq!(recorded(&path).hash, before.hash);
+}
+
+#[test]
+fn a_rewrite_keeps_the_files_own_encoding() {
+    // "café" in Windows-1252 is one byte for the é, and not UTF-8.
+    let root = TempDir::new().expect("temp dir");
+    let path = root.path().join("Linking note.md");
+    std::fs::write(&path, b"caf\xe9, see [[Old note]]\n").expect("seed");
+    let (target, all) = folder(&path, "Old note");
+    let last_known = recorded(&path);
+
+    let written = note_ops::rewrite_links_in_file(
+        &path,
+        &renaming(&target, "New note", &all),
+        Some(last_known),
+        None,
+        None,
+        None,
+        None,
+    )
+    .expect("the rewrite should land");
+
+    assert_eq!(written, LinkRewrite::Written);
+    assert_eq!(
+        std::fs::read(&path).expect("read"),
+        b"caf\xe9, see [[New note]]\n"
+    );
+}
+
+#[test]
+fn a_rewrite_the_files_encoding_cannot_hold_writes_nothing() {
+    let root = TempDir::new().expect("temp dir");
+    let path = root.path().join("Linking note.md");
+    std::fs::write(&path, b"caf\xe9, see [[Old note]]\n").expect("seed");
+    let (target, all) = folder(&path, "Old note");
+
+    let error = note_ops::rewrite_links_in_file(
+        &path,
+        &renaming(&target, "\u{65e5}\u{8a18}", &all),
+        None,
+        None,
+        None,
+        None,
+        None,
+    )
+    .expect_err("a name Windows-1252 has no bytes for should be refused");
+
+    assert!(
+        matches!(error, StorageError::EncodingLossy { .. }),
+        "expected a lossy encoding, got {error}"
+    );
+    assert_eq!(
+        std::fs::read(&path).expect("read"),
+        b"caf\xe9, see [[Old note]]\n"
+    );
+}
+
+#[test]
+fn a_rewrite_of_a_file_with_damaged_bytes_writes_nothing() {
+    let root = TempDir::new().expect("temp dir");
+    let path = root.path().join("Linking note.md");
+    let seed = "caf\u{e9} na\u{ef}ve r\u{e9}sum\u{e9}, see [[Old note]] \u{2014} \u{fc}ber "
+        .repeat(4)
+        .into_bytes()
+        .into_iter()
+        .chain([0xff])
+        .collect::<Vec<u8>>();
+    std::fs::write(&path, &seed).expect("seed");
+    let (target, all) = folder(&path, "Old note");
+
+    let error = note_ops::rewrite_links_in_file(
+        &path,
+        &renaming(&target, "New note", &all),
+        None,
+        None,
+        None,
+        None,
+        None,
+    )
+    .expect_err("a file holding a byte that is not UTF-8 should be refused");
+
+    assert!(
+        matches!(error, StorageError::NotInEncoding { .. }),
+        "expected bytes not in the file's encoding, got {error}"
+    );
+    assert_eq!(std::fs::read(&path).expect("read"), seed);
 }
 
 #[test]
@@ -106,6 +194,7 @@ fn a_file_that_is_not_downloaded_is_refused_before_it_is_read() {
         &renaming(&target, "New note", &all),
         None,
         Some(&probe),
+        None,
         None,
         None,
     )
@@ -135,6 +224,7 @@ fn a_file_changed_underneath_is_refused() {
         &path,
         &renaming(&target, "New note", &all),
         Some(last_known),
+        None,
         None,
         None,
         None,
@@ -179,6 +269,7 @@ fn a_refused_rewrite_leaves_its_side_of_the_race_on_disk() {
         None,
         None,
         None,
+        None,
     )
     .expect_err("a file changed underneath should be refused");
 
@@ -215,6 +306,7 @@ fn a_file_unchanged_since_jotra_read_it_is_rewritten() {
         None,
         None,
         None,
+        None,
     )
     .expect("the guard should let this through");
 
@@ -237,6 +329,7 @@ fn a_read_only_file_is_refused() {
     let error = note_ops::rewrite_links_in_file(
         &path,
         &renaming(&target, "New note", &all),
+        None,
         None,
         None,
         None,
@@ -284,6 +377,7 @@ fn the_rewrite_is_stamped_before_it_lands() {
         None,
         Some(&stamp),
         None,
+        None,
     )
     .expect("the rewrite should land");
 
@@ -317,6 +411,7 @@ fn the_reverse_rewrite_restores_the_file_byte_for_byte() {
             None,
             None,
             None,
+            None,
             None
         )
         .expect("the rewrite should land"),
@@ -328,6 +423,7 @@ fn the_reverse_rewrite_restores_the_file_byte_for_byte() {
         note_ops::rewrite_links_in_file(
             &path,
             &renaming(&new, "Old note", &all),
+            None,
             None,
             None,
             None,
@@ -364,6 +460,7 @@ fn a_name_a_file_outside_the_candidate_list_answers_to_is_refused() {
             candidates: &all,
             unindexed: &[index_key(&elsewhere)],
         },
+        None,
         None,
         None,
         None,
@@ -508,6 +605,7 @@ fn a_rename_to_a_name_with_link_syntax_keeps_every_backlink_resolving() {
     note_ops::rewrite_links_in_file(
         &path,
         &renaming(&target, &new_name, &all),
+        None,
         None,
         None,
         None,

@@ -2,7 +2,8 @@ use std::time::{Duration, SystemTime};
 
 use jotra_core::hash::sha256_bytes;
 use jotra_core::notes::guard::{
-    decide_save, is_not_downloaded, DiskState, SaveDecision, SF_DATALESS,
+    decide_save, is_fine_grained_mtime, is_not_downloaded, metadata_matches_record, DiskState,
+    SaveDecision, SF_DATALESS,
 };
 
 fn state_of(content: &str) -> DiskState {
@@ -139,4 +140,71 @@ fn a_file_with_no_dataless_flag_is_downloaded() {
 #[test]
 fn a_platform_with_no_such_flag_never_reports_a_file_as_not_downloaded() {
     assert!(!is_not_downloaded(None));
+}
+
+fn at(secs: u64, nanos: u32) -> SystemTime {
+    SystemTime::UNIX_EPOCH + Duration::new(secs, nanos)
+}
+
+#[test]
+fn a_time_with_digits_below_the_millisecond_is_fine_grained() {
+    assert!(is_fine_grained_mtime(at(1_700_000_000, 123_456_789)));
+    assert!(
+        is_fine_grained_mtime(at(1_700_000_000, 100)),
+        "NTFS keeps 100 ns"
+    );
+}
+
+#[test]
+fn a_whole_second_or_hundredth_is_coarse() {
+    assert!(!is_fine_grained_mtime(at(1_700_000_000, 0)), "FAT, HFS+");
+    assert!(
+        !is_fine_grained_mtime(at(1_700_000_000, 10_000_000)),
+        "exFAT"
+    );
+    assert!(!is_fine_grained_mtime(
+        SystemTime::UNIX_EPOCH - Duration::from_secs(1)
+    ));
+}
+
+#[test]
+fn a_fine_time_and_the_same_size_match_the_record() {
+    let mtime = at(1_700_000_000, 123_456_789);
+    let last = DiskState {
+        mtime: Some(mtime),
+        ..state_of("abcd")
+    };
+
+    assert!(metadata_matches_record(&last, 4, Some(mtime)));
+    assert!(
+        !metadata_matches_record(&last, 5, Some(mtime)),
+        "size moved"
+    );
+    assert!(
+        !metadata_matches_record(&last, 4, Some(at(1_700_000_002, 123_456_789))),
+        "time moved"
+    );
+    assert!(!metadata_matches_record(&last, 4, None), "no time on disk");
+}
+
+#[test]
+fn a_coarse_time_never_vouches_for_a_same_size_file() {
+    // A same-size edit inside one FAT tick leaves both as Jotra recorded them.
+    let mtime = at(1_700_000_000, 0);
+    let last = DiskState {
+        mtime: Some(mtime),
+        ..state_of("abcd")
+    };
+
+    assert!(!metadata_matches_record(&last, 4, Some(mtime)));
+}
+
+#[test]
+fn a_record_with_no_time_matches_nothing() {
+    let last = DiskState {
+        mtime: None,
+        ..state_of("abcd")
+    };
+
+    assert!(!metadata_matches_record(&last, 4, None));
 }

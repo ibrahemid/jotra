@@ -334,17 +334,16 @@ fn identity_of_note(state: &AppState, note_id: &str) -> Option<FileIdentity> {
 }
 
 /// The text encoding the note's row reads its file in, UTF-8 for a row that
-/// names none or cannot be read. Takes the store lock, so it is never asked
-/// with that lock held.
+/// names none or cannot be read. Read through [`AppState::tab_rows`], never
+/// the store's lock.
 pub(crate) fn encoding_of_note(state: &AppState, note_id: &str) -> TextEncoding {
-    let store =
-        crate::poison::recover_poison(state.store.lock(), "watcher::moves::encoding_of_note");
-    store
-        .find(note_id)
-        .ok()
-        .flatten()
-        .and_then(|doc| doc.encoding)
-        .unwrap_or_else(TextEncoding::utf8)
+    match state.tab_rows.encoding(note_id) {
+        Ok(encoding) => encoding.unwrap_or_else(TextEncoding::utf8),
+        Err(error) => {
+            tracing::warn!(note = %note_id, %error, "a tab's encoding could not be read");
+            TextEncoding::utf8()
+        }
+    }
 }
 
 /// What became of a note whose file was found at another path.
@@ -372,7 +371,8 @@ pub enum MoveOutcome {
 /// The store lock is released before the folder watch is taken. The save path
 /// takes them in that order — a first save attaches a file and then follows it
 /// — so taking them the other way round here is how a watcher thread and a
-/// keystroke deadlock.
+/// keystroke deadlock. The text the index records for the file is read before
+/// the store is taken.
 ///
 /// The bytes did not move, so the record of what Jotra last read or wrote
 /// stays as it is, size and modification time with it. Reading again would
@@ -390,19 +390,27 @@ fn apply_move(state: &AppState, note_id: &str, from: &Path, to: &Path) -> MoveOu
         );
         return MoveOutcome::Failed;
     };
+    let Ok(doc) = state.lock_store().get(note_id) else {
+        return MoveOutcome::Failed;
+    };
+    if doc.source_path.as_deref() == Some(destination) {
+        return MoveOutcome::AlreadyThere;
+    }
+    let text = jotra_storage::buffer_store::indexable_text_at(&doc, to);
     {
-        let Ok(store) = state.store.lock() else {
-            return MoveOutcome::Failed;
-        };
+        let store = state.lock_store();
         let Ok(doc) = store.get(note_id) else {
             return MoveOutcome::Failed;
         };
         if doc.source_path.as_deref() == Some(destination) {
             return MoveOutcome::AlreadyThere;
         }
-        if let Err(e) =
-            store.rename_to_file(note_id, destination, &crate::commands::notes::note_name(to))
-        {
+        if let Err(e) = store.rename_to_file(
+            note_id,
+            destination,
+            &crate::commands::notes::note_name(to),
+            &text,
+        ) {
             tracing::warn!(note = %note_id, error = %e, "a note's row could not follow its file");
             return MoveOutcome::Failed;
         }

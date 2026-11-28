@@ -54,6 +54,7 @@ describe("the provider table and endpoint rules", () => {
       is_consented: true,
       provider: "ollama",
       key_state: NO_KEY,
+      sends_key: false,
       is_on_device: false,
     });
     expect(getChatState(base(), NO_KEY)).toMatchObject({ enabled: false, model: "", is_consented: true });

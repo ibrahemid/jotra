@@ -23,6 +23,7 @@
 //!   strings shown to the user.
 
 use std::collections::HashMap;
+use std::convert::Infallible;
 use std::sync::Mutex;
 use std::time::Duration;
 
@@ -39,8 +40,10 @@ use jotra_core::polish::{self, PolishAction, PolishError};
 use serde::Serialize;
 use tokio_util::sync::CancellationToken;
 
-use crate::keys::{compute_key_state, platform_key_store, resolve_key_from, resolve_stored_key};
-pub use crate::keys::{AiKeyState, KeyStore, MemoryKeyStore};
+use crate::keys::{
+    compute_key_state, platform_key_store, resolve_held_key, resolve_key_from, resolve_stored_key,
+};
+pub use crate::keys::{AiKeyState, KeyStore, KeyStoreUnread, MemoryKeyStore};
 use crate::poison::recover_poison;
 
 /// Connect timeout: a local Ollama that is not running should fail fast.
@@ -127,6 +130,14 @@ impl AiState {
     pub fn key(&self, account: &str) -> Option<String> {
         let memory = recover_poison(self.keys.lock(), "jotra_ai::connection::key");
         resolve_key(self, &memory, account)
+    }
+
+    /// The key for one account from what this session already holds, without
+    /// reading the store ([`resolve_held_key`]).
+    pub fn held_key(&self, account: &str) -> Result<Option<String>, KeyStoreUnread> {
+        let memory = recover_poison(self.keys.lock(), "jotra_ai::connection::held_key");
+        let cache = recover_poison(self.key_cache.lock(), "jotra_ai::connection::held_key");
+        resolve_held_key(&cache, &memory, account)
     }
 
     /// Whether a key is stored for one account, and whether it is confined to
@@ -267,6 +278,10 @@ pub struct AiEndpointState {
     pub is_consented: bool,
     /// Whether a key is stored for the current provider, and where it lives.
     pub key_state: AiKeyState,
+    /// A request carries the stored key: one is set and the target takes it
+    /// ([`polish::EndpointTarget::takes_key`]), which an https address on a
+    /// private network does.
+    pub sends_key: bool,
     /// The connection's provider id, so the UI names the row it is reporting.
     pub provider: String,
     /// The connection is Apple's on-device model: no address, no key, no
@@ -308,6 +323,7 @@ pub fn endpoint_state_from(cfg: &AiConfig, key_state: AiKeyState) -> AiEndpointS
     match polish::resolve_endpoint(&cfg.effective_base_url()) {
         Ok(target) => AiEndpointState {
             is_consented: !target.is_hosted || is_consented(cfg, &target.host),
+            sends_key: key_state.is_set && target.takes_key(),
             host: Some(target.host),
             host_port: Some(target.host_port),
             is_hosted: target.is_hosted,
@@ -325,6 +341,7 @@ pub fn endpoint_state_from(cfg: &AiConfig, key_state: AiKeyState) -> AiEndpointS
             is_allowed: false,
             is_consented: false,
             key_state,
+            sends_key: false,
             provider,
             is_on_device,
         },
@@ -561,6 +578,71 @@ impl OnDeviceReply {
                 tracing::warn!(reason = failure.as_str(), "on-device rewrite failed");
                 Some(StreamEvent::Error(failure.to_string()))
             }
+        }
+    }
+}
+
+/// How long the on-device model may go without reporting before a rewrite is
+/// given up: the same silence an HTTP stream is allowed ([`READ_TIMEOUT`]).
+pub const ON_DEVICE_IDLE_TIMEOUT: Duration = READ_TIMEOUT;
+
+/// The bridge's side of one on-device request: the events it reports, and the
+/// way to stop it.
+pub trait OnDeviceEvents {
+    /// The next event, or `None` once the bridge has closed the stream.
+    fn next(&mut self) -> impl std::future::Future<Output = Option<OnDeviceEvent>> + Send;
+    /// Asks the bridge to end the request.
+    fn stop(&self);
+}
+
+/// Streams one on-device rewrite into `on_event`: each piece, then the end or
+/// a failure.
+///
+/// `cancel` stops the request wherever it is, and nothing further is emitted.
+/// A bridge that reports nothing for `idle` is stopped and the rewrite ends
+/// with [`OnDeviceFailure::Stalled`].
+pub async fn stream_on_device<E: OnDeviceEvents>(
+    events: &mut E,
+    cancel: &CancellationToken,
+    idle: Duration,
+    mut on_event: impl FnMut(StreamEvent),
+) {
+    let mut reply = OnDeviceReply::default();
+    loop {
+        let next = cancel
+            .run_until_cancelled(tokio::time::timeout(idle, events.next()))
+            .await;
+        // A stop that lands with an event is a stop: nothing follows it.
+        let Some(next) = next.filter(|_| !cancel.is_cancelled()) else {
+            events.stop();
+            return;
+        };
+        let Ok(next) = next else {
+            tracing::warn!(
+                reason = OnDeviceFailure::Stalled.as_str(),
+                "on-device rewrite failed"
+            );
+            events.stop();
+            on_event(StreamEvent::Error(OnDeviceFailure::Stalled.to_string()));
+            return;
+        };
+        let Some(event) = next else {
+            // The bridge ended the stream without a reply or a reason, which
+            // only a stop it did not hear about from here can do.
+            on_event(StreamEvent::Error(OnDeviceFailure::Failed.to_string()));
+            return;
+        };
+        let last = !matches!(event, OnDeviceEvent::Snapshot(_));
+        if let Some(stream_event) = reply.event(event) {
+            let failed = matches!(stream_event, StreamEvent::Error(_));
+            on_event(stream_event);
+            if failed {
+                events.stop();
+                return;
+            }
+        }
+        if last {
+            return;
         }
     }
 }
@@ -1335,11 +1417,15 @@ fn build_local_probe_client() -> Result<reqwest::Client, String> {
         .map_err(|e| sanitize_ai_error(&e.to_string()))
 }
 
-/// Whether something answered at `url`. Any 2xx is "running"; the body is not
-/// read.
+/// Whether something answered at `url`. Any 2xx is "running", and so is a
+/// refusal of the keyless knock: a server set to require its own key is
+/// running. The body is not read.
 async fn knock(client: &reqwest::Client, url: &str) -> bool {
     match client.get(url).send().await {
-        Ok(response) => response.status().is_success(),
+        Ok(response) => matches!(
+            list_error_for_status(response.status().as_u16()),
+            None | Some(ModelListError::Unauthorized)
+        ),
         Err(_) => false,
     }
 }
@@ -1469,18 +1555,48 @@ pub async fn read_catalog(
     cfg: &AiConfig,
     read_key: impl FnOnce(&str) -> Option<String>,
 ) -> ModelCatalog {
+    match read_catalog_with(cfg, |account| Ok::<_, Infallible>(read_key(account))).await {
+        Ok(catalog) => catalog,
+        Err(never) => match never {},
+    }
+}
+
+/// [`read_catalog`] for a surface that opened rather than one a person asked
+/// to read: `None` when the list would need a key the store has not answered
+/// this session, and nothing is sent.
+pub async fn read_catalog_unprompted(
+    cfg: &AiConfig,
+    held_key: impl FnOnce(&str) -> Result<Option<String>, KeyStoreUnread>,
+) -> Option<ModelCatalog> {
+    read_catalog_with(cfg, held_key).await.ok()
+}
+
+async fn read_catalog_with<E>(
+    cfg: &AiConfig,
+    lookup: impl FnOnce(&str) -> Result<Option<String>, E>,
+) -> Result<ModelCatalog, E> {
     // The on-device model has one model and no list to read.
     if on_device::is_on_device(&cfg.provider) {
-        return ModelCatalog::live(&cfg.provider, Vec::new());
+        return Ok(ModelCatalog::live(&cfg.provider, Vec::new()));
     }
-    let (targets, api_key) = match gated_list_key(cfg, read_key) {
+    let mut declined = None;
+    let gated = gated_list_key(cfg, |account| {
+        lookup(account).unwrap_or_else(|reason| {
+            declined = Some(reason);
+            None
+        })
+    });
+    if let Some(reason) = declined {
+        return Err(reason);
+    }
+    let (targets, api_key) = match gated {
         Ok(pair) => pair,
-        Err(error) => return catalog_for(&cfg.provider, Err(error)),
+        Err(error) => return Ok(catalog_for(&cfg.provider, Err(error))),
     };
 
     let client = match build_http_client(MODEL_LIST_TIMEOUT, targets.list.is_private_network) {
         Ok(client) => client,
-        Err(_) => return catalog_for(&cfg.provider, Err(ModelListError::Unreachable)),
+        Err(_) => return Ok(catalog_for(&cfg.provider, Err(ModelListError::Unreachable))),
     };
     let ids = fetch_model_ids(
         &client,
@@ -1504,7 +1620,7 @@ pub async fn read_catalog(
             "the model list could not be read"
         ),
     }
-    catalog_for(&cfg.provider, ids)
+    Ok(catalog_for(&cfg.provider, ids))
 }
 
 /// Which local runtimes are running, so the provider rows can say so before
@@ -1521,49 +1637,100 @@ pub async fn check_connection(
     cfg: &AiConfig,
     read_key: impl FnOnce(&str) -> Option<String>,
 ) -> AiConnectionStatus {
+    match check_connection_with(cfg, |account| Ok::<_, Infallible>(read_key(account))).await {
+        Ok(status) => status,
+        Err(never) => match never {},
+    }
+}
+
+/// [`check_connection`] for a surface that opened rather than one a person
+/// asked to check: `None` when the check would need a key the store has not
+/// answered this session, and nothing is sent.
+pub async fn check_connection_unprompted(
+    cfg: &AiConfig,
+    held_key: impl FnOnce(&str) -> Result<Option<String>, KeyStoreUnread>,
+) -> Option<AiConnectionStatus> {
+    check_connection_with(cfg, held_key).await.ok()
+}
+
+async fn check_connection_with<E>(
+    cfg: &AiConfig,
+    lookup: impl FnOnce(&str) -> Result<Option<String>, E>,
+) -> Result<AiConnectionStatus, E> {
     // The on-device row is checked by asking the system
     // ([`on_device_status`]); there is no address to probe.
     if on_device::is_on_device(&cfg.provider) {
-        return on_device_status(OnDeviceAvailability::Unsupported);
+        return Ok(on_device_status(OnDeviceAvailability::Unsupported));
     }
     // Same resolver as the rewrite guard and the consent recorder — the probe
     // must never disagree with them about where the endpoint points.
     let base_url = cfg.effective_base_url();
     let target = match polish::resolve_endpoint(&base_url) {
         Ok(t) if t.is_allowed => t,
-        _ => return AiConnectionStatus::new(false, None, "invalid_url", String::new()),
+        _ => {
+            return Ok(AiConnectionStatus::new(
+                false,
+                None,
+                "invalid_url",
+                String::new(),
+            ))
+        }
     };
 
     // Before the key is read, so a blocked probe raises no keychain prompt and
     // no credential exists to leak.
     if let Err(err) = probe_gate(cfg, &target) {
-        return blocked_probe_status(&err, &target.host);
+        return Ok(blocked_probe_status(&err, &target.host));
     }
 
     let host_port = target.host_port.clone();
-    let api_key = stored_key_for(&target, &cfg.provider, read_key);
+    let mut declined = None;
+    let api_key = stored_key_for(&target, &cfg.provider, |account| {
+        lookup(account).unwrap_or_else(|reason| {
+            declined = Some(reason);
+            None
+        })
+    });
+    if let Some(reason) = declined {
+        return Err(reason);
+    }
     // A hosted provider with no key would answer 401 and read as a broken
     // endpoint; the row is a missing key and says so. A server on a private
     // network may run without one.
     if target.needs_key() && api_key.is_none() {
-        return AiConnectionStatus::new(false, None, "key_required", target.host.clone());
+        return Ok(AiConnectionStatus::new(
+            false,
+            None,
+            "key_required",
+            target.host.clone(),
+        ));
     }
 
     let Some(list_url) = providers::models_url_for(&cfg.provider, &base_url) else {
-        return AiConnectionStatus::new(false, None, "invalid_url", String::new());
+        return Ok(AiConnectionStatus::new(
+            false,
+            None,
+            "invalid_url",
+            String::new(),
+        ));
     };
     // The guard runs on the list URL too: one row lists from a host of its own,
     // and a hand-typed base reaches both.
     if allowed_target(&list_url).is_err() {
-        return AiConnectionStatus::new(false, None, "invalid_url", String::new());
+        return Ok(AiConnectionStatus::new(
+            false,
+            None,
+            "invalid_url",
+            String::new(),
+        ));
     }
 
     let client = match build_probe_client(target.is_private_network) {
         Ok(c) => c,
-        Err(detail) => return AiConnectionStatus::new(false, None, "error", detail),
+        Err(detail) => return Ok(AiConnectionStatus::new(false, None, "error", detail)),
     };
 
-    run_connection_check(
+    Ok(run_connection_check(
         &client,
         &cfg.provider,
         &list_url,
@@ -1572,7 +1739,7 @@ pub async fn check_connection(
         cfg.chat_model().trim(),
         &host_port,
     )
-    .await
+    .await)
 }
 
 #[cfg(test)]
@@ -1868,6 +2035,110 @@ mod tests {
         );
     }
 
+    /// A bridge that reports `events` in order, then either closes the stream
+    /// or goes silent.
+    struct ScriptedBridge {
+        events: std::collections::VecDeque<OnDeviceEvent>,
+        goes_silent: bool,
+        stopped: AtomicBool,
+    }
+
+    impl ScriptedBridge {
+        fn new(events: Vec<OnDeviceEvent>, goes_silent: bool) -> Self {
+            Self {
+                events: events.into(),
+                goes_silent,
+                stopped: AtomicBool::new(false),
+            }
+        }
+    }
+
+    impl OnDeviceEvents for ScriptedBridge {
+        fn next(&mut self) -> impl std::future::Future<Output = Option<OnDeviceEvent>> + Send {
+            let event = self.events.pop_front();
+            let silent = event.is_none() && self.goes_silent;
+            async move {
+                if silent {
+                    std::future::pending::<()>().await;
+                }
+                event
+            }
+        }
+
+        fn stop(&self) {
+            self.stopped.store(true, Ordering::SeqCst);
+        }
+    }
+
+    async fn streamed(bridge: &mut ScriptedBridge, cancel: &CancellationToken) -> Vec<StreamEvent> {
+        let mut seen = Vec::new();
+        stream_on_device(bridge, cancel, Duration::from_millis(20), |event| {
+            seen.push(event)
+        })
+        .await;
+        seen
+    }
+
+    #[test]
+    fn the_on_device_model_gets_the_silence_an_http_stream_gets() {
+        assert_eq!(ON_DEVICE_IDLE_TIMEOUT, Duration::from_secs(120));
+        assert_eq!(ON_DEVICE_IDLE_TIMEOUT, READ_TIMEOUT);
+    }
+
+    #[tokio::test]
+    async fn a_silent_on_device_model_ends_the_rewrite_and_stops_the_bridge() {
+        let mut bridge = ScriptedBridge::new(vec![OnDeviceEvent::Snapshot("Th".to_string())], true);
+        let seen = streamed(&mut bridge, &CancellationToken::new()).await;
+        assert_eq!(
+            seen,
+            vec![
+                StreamEvent::Chunk("Th".to_string()),
+                StreamEvent::Error("The on-device model stopped answering. Try again.".to_string()),
+            ]
+        );
+        assert!(bridge.stopped.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn an_on_device_reply_that_keeps_arriving_streams_to_its_end() {
+        let mut bridge = ScriptedBridge::new(
+            vec![
+                OnDeviceEvent::Snapshot("Hel".to_string()),
+                OnDeviceEvent::Snapshot("Hello".to_string()),
+                OnDeviceEvent::Done,
+            ],
+            true,
+        );
+        let seen = streamed(&mut bridge, &CancellationToken::new()).await;
+        assert_eq!(
+            seen,
+            vec![
+                StreamEvent::Chunk("Hel".to_string()),
+                StreamEvent::Chunk("lo".to_string()),
+                StreamEvent::Done,
+            ]
+        );
+        assert!(!bridge.stopped.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn a_stopped_on_device_rewrite_emits_nothing() {
+        let cancel = CancellationToken::new();
+        cancel.cancel();
+        let mut bridge = ScriptedBridge::new(vec![OnDeviceEvent::Snapshot("Th".to_string())], true);
+        assert!(streamed(&mut bridge, &cancel).await.is_empty());
+        assert!(bridge.stopped.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn an_on_device_stream_closed_without_an_end_reads_as_failed() {
+        let mut bridge = ScriptedBridge::new(Vec::new(), false);
+        assert_eq!(
+            streamed(&mut bridge, &CancellationToken::new()).await,
+            vec![StreamEvent::Error(OnDeviceFailure::Failed.to_string())]
+        );
+    }
+
     #[test]
     fn the_on_device_status_is_what_the_system_reports() {
         let ok = on_device_status(OnDeviceAvailability::Available);
@@ -1886,6 +2157,58 @@ mod tests {
         assert_eq!(catalog.provider, "apple");
         assert!(catalog.models.is_empty() && catalog.error.is_none());
         let status = check_connection(&cfg, |_| panic!("no key is read")).await;
+        assert_eq!(status.kind, "on_device_unavailable");
+    }
+
+    #[test]
+    fn a_held_key_is_answered_only_from_what_the_session_already_read() {
+        let ai = AiState::with_store(Box::new(MemoryKeyStore::default()));
+        ai.store.set("groq", "sk-x").expect("seeded");
+        assert_eq!(ai.held_key("groq"), Err(KeyStoreUnread));
+        assert_eq!(ai.held_key("ollama"), Ok(None));
+        assert_eq!(ai.key("groq").as_deref(), Some("sk-x"));
+        assert_eq!(ai.held_key("groq"), Ok(Some("sk-x".to_string())));
+
+        assert_eq!(ai.key("deepseek"), None);
+        assert_eq!(ai.held_key("deepseek"), Ok(None));
+
+        recover_poison(ai.keys.lock(), "test").insert("mistral".to_string(), "sk-m".to_string());
+        assert_eq!(ai.held_key("mistral"), Ok(Some("sk-m".to_string())));
+    }
+
+    #[tokio::test]
+    async fn an_unprompted_check_or_list_sends_nothing_until_the_key_store_is_read() {
+        let mut cfg = hosted_cfg();
+        cfg.consented_hosts = vec!["api.groq.com".to_string()];
+        assert!(check_connection_unprompted(&cfg, |_| Err(KeyStoreUnread))
+            .await
+            .is_none());
+        assert!(read_catalog_unprompted(&cfg, |_| Err(KeyStoreUnread))
+            .await
+            .is_none());
+
+        let read_empty = check_connection_unprompted(&cfg, |_| Ok(None))
+            .await
+            .expect("answered from the session");
+        assert_eq!(read_empty.kind, "key_required");
+    }
+
+    #[tokio::test]
+    async fn an_unprompted_check_answers_what_needs_no_key() {
+        let cfg = hosted_cfg();
+        let blocked = check_connection_unprompted(&cfg, |_| panic!("no key is read"))
+            .await
+            .expect("a consent needs no key");
+        assert_eq!(blocked.kind, "consent_required");
+        let listed = read_catalog_unprompted(&cfg, |_| panic!("no key is read"))
+            .await
+            .expect("a consent needs no key");
+        assert_eq!(listed.error, Some(ModelListError::ConsentRequired));
+
+        let on_device = on_device_cfg();
+        let status = check_connection_unprompted(&on_device, |_| panic!("no key is read"))
+            .await
+            .expect("the system answers");
         assert_eq!(status.kind, "on_device_unavailable");
     }
 
@@ -1987,6 +2310,25 @@ mod tests {
         let public = endpoint_state_from(&custom_cfg("http://8.8.8.8/v1"), no_key);
         assert!(!public.is_allowed);
         assert!(!public.is_private_network);
+    }
+
+    #[test]
+    fn endpoint_state_says_when_a_stored_key_goes_with_the_request() {
+        let key = AiKeyState {
+            is_set: true,
+            memory_only: false,
+        };
+        let no_key = AiKeyState {
+            is_set: false,
+            memory_only: false,
+        };
+        let encrypted = custom_cfg("https://10.0.0.5/v1");
+        let state = endpoint_state_from(&encrypted, key);
+        assert!(state.is_private_network && state.sends_key);
+        assert!(!endpoint_state_from(&encrypted, no_key).sends_key);
+        assert!(!endpoint_state_from(&custom_cfg("http://10.0.0.5:11434/v1"), key).sends_key);
+        assert!(!endpoint_state_from(&custom_cfg("http://localhost:11434/v1"), key).sends_key);
+        assert!(endpoint_state_from(&custom_cfg("https://api.example.com/v1"), key).sends_key);
     }
 
     #[test]
@@ -3241,6 +3583,21 @@ mod tests {
             jan: &dead,
         }));
         assert!(!probe.ollama);
+    }
+
+    #[test]
+    fn a_runtime_that_refuses_the_keyless_knock_is_running() {
+        let (wants_key, _seen) = spawn_knock_target("HTTP/1.1 401 Unauthorized");
+        let (forbids, _seen_forbids) = spawn_knock_target("HTTP/1.1 403 Forbidden");
+        let dead = dead_url();
+        let probe = block_on(probe_local_at(LocalProbeUrls {
+            ollama: &dead,
+            lmstudio: &forbids,
+            llamacpp: &dead,
+            jan: &wants_key,
+        }));
+        assert!(probe.jan && probe.lmstudio);
+        assert!(!probe.ollama && !probe.llamacpp);
     }
 
     #[test]
