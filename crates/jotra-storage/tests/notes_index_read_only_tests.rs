@@ -6,7 +6,7 @@ use std::path::Path;
 
 use jotra_storage::database::connection::{open_database, open_database_read_only};
 use jotra_storage::database::migrations::{
-    applied_schema_version, binary_schema_version, run_migrations,
+    applied_schema_version, binary_schema_version, pending_schema_versions, run_migrations,
 };
 use jotra_storage::notes_index::{self, IndexedBy, NotesIndex, NotesIndexStore};
 use rusqlite::Connection;
@@ -85,6 +85,37 @@ fn a_migrated_database_reports_the_version_this_binary_embeds() {
         store.schema_version().expect("version"),
         binary_schema_version()
     );
+}
+
+#[test]
+fn a_migrated_database_has_no_migration_pending() {
+    let (_dir, db_path, _notes) = fixture();
+    let store = NotesIndexStore::open_read_only(&db_path).expect("open_read_only");
+    assert_eq!(
+        store.pending_schema_versions().expect("pending"),
+        Vec::<i32>::new()
+    );
+}
+
+#[test]
+fn a_migration_missing_below_the_highest_is_pending_though_the_highest_matches() {
+    let (_dir, db_path, _notes) = fixture();
+    let conn = Connection::open(&db_path).expect("open");
+    let skipped: i32 = conn
+        .query_row(
+            "SELECT version FROM schema_version ORDER BY version DESC LIMIT 1 OFFSET 1",
+            [],
+            |row| row.get(0),
+        )
+        .expect("a version below the highest");
+    conn.execute("DELETE FROM schema_version WHERE version = ?1", [skipped])
+        .expect("forget one migration");
+
+    assert_eq!(
+        applied_schema_version(&conn).expect("version"),
+        binary_schema_version()
+    );
+    assert_eq!(pending_schema_versions(&conn).expect("pending"), [skipped]);
 }
 
 #[test]

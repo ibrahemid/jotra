@@ -1,5 +1,6 @@
 ---
 import Site from './Site.astro';
+import { DOCS_INDEX_PATH, DOCS_INDEX_TITLE, isDocsTopicPath } from '../data/docs-topics';
 
 interface Props {
   title: string;
@@ -10,10 +11,12 @@ interface Props {
 }
 
 const { title, description, path, lead, unlisted = false } = Astro.props;
+const base = import.meta.env.BASE_URL.replace(/\/$/, '');
 ---
 <Site title={title} description={description} path={path} unlisted={unlisted}>
   <main id="content" class="wrap">
     <article class="prose">
+      {isDocsTopicPath(path) && <nav class="up" aria-label="Docs"><a href={`${base}${DOCS_INDEX_PATH}`}>{DOCS_INDEX_TITLE}</a></nav>}
       <h1>{title}</h1>
       {lead && <p class="lead">{lead}</p>}
       <slot />

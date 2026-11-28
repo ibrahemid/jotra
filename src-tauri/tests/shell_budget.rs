@@ -8,31 +8,18 @@
 //! unless `JOTRA_PERF_GATE` is set; `scripts/perf-gate.sh` runs them in release,
 //! one at a time.
 
+#[path = "support/app_state.rs"]
+mod app_state;
+
+use app_state::AppStateBuilder;
 use std::path::Path;
-use std::sync::atomic::AtomicBool;
 use std::sync::mpsc::{self, Receiver};
-use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
 
-use jotra_core::config::JotraConfig;
-use jotra_core::events::bus::EventBus;
-use jotra_core::preview::ContentRendererRegistry;
-use jotra_core::update::UpdatePhase;
-use jotra_core::watcher::reconcile::ReconcileGate;
-use jotra_plugin::transform::TransformRegistry;
-use jotra_storage::buffer_store::BufferStore;
-use jotra_storage::config_store::ConfigStore;
-use jotra_storage::database::connection::open_database;
-use jotra_storage::database::migrations::run_migrations;
-use jotra_storage::layout_state::LayoutStateStore;
-use jotra_storage::notes_index::NotesIndexStore;
 use jotra_tauri_lib::commands::buffer::NOTE_ID_HEADER;
 use jotra_tauri_lib::commands::file::open_file_from_path;
-use jotra_tauri_lib::preview::handler::RenderCache;
-use jotra_tauri_lib::quit::QuitState;
-use jotra_tauri_lib::security::{canonicalize_for_authorization, AuthorizedPaths};
+use jotra_tauri_lib::security::canonicalize_for_authorization;
 use jotra_tauri_lib::state::AppState;
-use jotra_tauri_lib::watcher::handler::create_ignore_set;
 use serde_json::{json, Value};
 use tauri::http::{HeaderMap, HeaderValue};
 use tauri::ipc::{CallbackFn, InvokeBody, InvokeResponse, InvokeResponseBody};
@@ -56,85 +43,10 @@ fn perf_gate() -> bool {
 }
 
 fn make_state(dir: &TempDir) -> AppState {
-    let jotra_dir = dir.path().join("data");
-    let buffers_dir = jotra_dir.join("buffers");
-    std::fs::create_dir_all(&buffers_dir).expect("buffers dir");
-    let notes_root = dir.path().join("Jotra");
-    std::fs::create_dir_all(&notes_root).expect("notes folder");
-    let notes_root = jotra_tauri_lib::security::canonicalize_root(&notes_root).expect("canonical");
-
-    let db_path = jotra_dir.join("jotra.db");
-    let conn = open_database(&db_path).expect("open db");
-    run_migrations(&conn).expect("migrations");
-    let notes_index = Arc::new(NotesIndexStore::open(&db_path).expect("notes index db"));
-    let mut store = BufferStore::new(conn, buffers_dir.clone());
-    store.set_notes_root(notes_root.clone());
-    store.set_notes_index(Arc::clone(&notes_index));
-    let note_history = Arc::new(
-        jotra_storage::note_history::NoteHistoryStore::open(&jotra_dir).expect("version store"),
-    );
-    let mut registry = ContentRendererRegistry::new();
-    jotra_tauri_lib::preview::renderers::register_builtins(&mut registry, Arc::clone(&notes_index))
-        .expect("renderers");
-
-    AppState {
-        store: Mutex::new(store),
-        config_store: ConfigStore::new(jotra_dir.join("config.toml")),
-        config: Mutex::new(JotraConfig::default()),
-        jotra_dir,
-        buffers_dir,
-        notes_root: RwLock::new(notes_root),
-        first_run: false,
-        first_run_finished: AtomicBool::new(false),
-        menu_apps: Mutex::new(None),
-        retitle_watch: Arc::new(jotra_tauri_lib::first_run::RetitleWatch::new()),
-        notes_root_fallback: RwLock::new(None),
-        watcher_ignore: create_ignore_set(),
-        watcher: Mutex::new(None),
-        notes_watcher: Mutex::new(None),
-        open_file_watcher: Mutex::new(None),
-        file_tracking: Mutex::new(None),
-        notes_index,
-        note_history,
-        notes_index_cancel: Arc::new(AtomicBool::new(false)),
-        notes_reconcile: Arc::new(ReconcileGate::new()),
-        quit: Arc::new(QuitState::new()),
-        removal_holds: Default::default(),
-        pending_opens: Mutex::new(Vec::new()),
-        pending_lines: Mutex::new(Default::default()),
-        cli_waits: Mutex::new(Default::default()),
-        frontend_ready: AtomicBool::new(false),
-        window_revealed: AtomicBool::new(false),
-        window_dismissed: AtomicBool::new(false),
-        transforms: RwLock::new(TransformRegistry::new()),
-        event_bus: Arc::new(EventBus::new()),
-        update_phase: Mutex::new(UpdatePhase::default()),
-        authorized_paths: AuthorizedPaths::new(),
-        preview_registry: Arc::new(RwLock::new(registry)),
-        preview_render_cache: Arc::new(RenderCache::new()),
-        layout_state: LayoutStateStore::new(open_database(&db_path).expect("layout db")),
-        tab_rows: jotra_storage::tab_rows::TabRowStore::new(
-            open_database(&db_path).expect("tab rows db"),
-        ),
-        command_usage: jotra_storage::command_usage::CommandUsageStore::new(
-            open_database(&db_path).expect("usage db"),
-        ),
-        config_diagnostics: Mutex::new(Vec::new()),
-        recovered_buffers: Mutex::new(Vec::new()),
-        was_dirty_shutdown: false,
-        workspace_root: Mutex::new(None),
-        workspace_watcher: Mutex::new(None),
-        inbox_root: Mutex::new(None),
-        inbox_watcher: Mutex::new(None),
-        fts_scheduler: jotra_tauri_lib::fts_scheduler::FtsScheduler::new(),
-        workspace_index: Arc::new(RwLock::new(
-            jotra_tauri_lib::workspace_index::WorkspaceIndex::new(None),
-        )),
-        search_generation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
-        last_disk_hash: Mutex::new(std::collections::HashMap::new()),
-        source_records: Mutex::new(std::collections::HashMap::new()),
-        buffer_writes: Default::default(),
-    }
+    AppStateBuilder::new(&dir.path().join("data"))
+        .notes_dir(dir.path().join("Jotra"))
+        .builtin_renderers()
+        .build()
 }
 
 /// An app on the mock runtime holding `state`, with the budgeted commands
@@ -150,7 +62,7 @@ fn mock_app(state: AppState) -> (tauri::App<MockRuntime>, WebviewWindow<MockRunt
             jotra_tauri_lib::commands::buffer::peek_buffer_content,
             jotra_tauri_lib::commands::buffer::save_buffer_content,
             jotra_tauri_lib::commands::buffer::save_buffer_changes,
-            jotra_tauri_lib::commands::preview::preview_render,
+            jotra_tauri_lib::commands::preview::preview_force_render,
             jotra_tauri_lib::commands::workspace::search_workspace_files,
             jotra_tauri_lib::commands::prompt::prompt_context_pack,
             jotra_tauri_lib::commands::workspace::list_workspace_dir,
@@ -377,7 +289,7 @@ fn save_buffer_changes_returns_its_thread_while_its_work_waits() {
 }
 
 #[test]
-fn preview_render_returns_its_thread_while_its_work_waits() {
+fn preview_force_render_returns_its_thread_while_its_work_waits() {
     let dir = TempDir::new().unwrap();
     let (app, window) = mock_app(make_state(&dir));
 
@@ -388,7 +300,7 @@ fn preview_render_returns_its_thread_while_its_work_waits() {
         .wait();
     let sent = dispatch(
         &window,
-        "preview_render",
+        "preview_force_render",
         json!({
             "bufferId": "b1",
             "contentType": "markdown",
@@ -653,7 +565,7 @@ fn shell_budget_of_preview_render_of_a_long_note() {
     let start = Instant::now();
     let sent = dispatch(
         &window,
-        "preview_render",
+        "preview_force_render",
         json!({
             "bufferId": id,
             "contentType": "markdown",
@@ -666,7 +578,7 @@ fn shell_budget_of_preview_render_of_a_long_note() {
     sent.answer().expect("render");
     let work = start.elapsed();
     eprintln!(
-        "shell budget: preview_render of 5 MB with {links} wikilinks (held / work) {} / {} ms",
+        "shell budget: preview_force_render of 5 MB with {links} wikilinks (held / work) {} / {} ms",
         millis(held),
         millis(work)
     );

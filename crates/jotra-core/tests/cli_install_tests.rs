@@ -1,21 +1,23 @@
 use std::path::{Path, PathBuf};
 
+use jotra_core::bundle_rename::BUNDLE_IDENTIFIER;
 use jotra_core::cli_install::{
-    carries_cli_signature, client_command, install_target, is_in_appimage_mount,
-    is_jotra_command_target, is_translocated, may_replace, ClientCommandFacts, InstallFacts,
-    InstallTarget, InstalledEntry, CLI_SIGNATURE, SYSTEM_LINK,
+    app_bundle_of_command, carries_cli_signature, client_command, install_target,
+    is_in_appimage_mount, is_jotra_command_target, is_translocated, may_replace,
+    ClientCommandFacts, InstallFacts, InstallTarget, InstalledEntry, CLI_SIGNATURE, SYSTEM_LINK,
 };
 
 fn facts(windows: bool, in_appimage: bool, home: Option<&Path>) -> InstallFacts<'_> {
     InstallFacts {
         windows,
         in_appimage,
+        linux_package: false,
         home,
     }
 }
 
 #[test]
-fn macos_and_linux_packages_link_into_usr_local_bin() {
+fn macos_and_linux_outside_a_package_link_into_usr_local_bin() {
     assert_eq!(
         install_target(facts(false, false, Some(Path::new("/home/a")))),
         Some(InstallTarget::Link(PathBuf::from(SYSTEM_LINK)))
@@ -31,6 +33,15 @@ fn an_appimage_copies_into_the_users_own_bin_folder() {
         )))
     );
     assert_eq!(install_target(facts(false, true, None)), None);
+}
+
+#[test]
+fn a_linux_package_leaves_the_command_where_the_package_put_it() {
+    let packaged = InstallFacts {
+        linux_package: true,
+        ..facts(false, false, Some(Path::new("/home/a")))
+    };
+    assert_eq!(install_target(packaged), Some(InstallTarget::ByInstaller));
 }
 
 #[test]
@@ -103,10 +114,12 @@ fn only_writs_own_entry_or_nothing_may_be_replaced() {
     assert!(may_replace(&InstalledEntry::Link {
         target: PathBuf::from("/Applications/Jotra.app/Contents/MacOS/jotra"),
         beside_app: false,
+        bundle_identifier: None,
     }));
     assert!(!may_replace(&InstalledEntry::Link {
         target: PathBuf::from("/opt/tools/jotra"),
         beside_app: false,
+        bundle_identifier: None,
     }));
     assert!(may_replace(&InstalledEntry::File {
         is_jotra_command: true
@@ -115,6 +128,26 @@ fn only_writs_own_entry_or_nothing_may_be_replaced() {
         is_jotra_command: false
     }));
     assert!(!may_replace(&InstalledEntry::Other));
+}
+
+#[test]
+fn a_link_into_another_apps_bundle_is_left_alone() {
+    let link = |bundle_identifier: Option<&str>| InstalledEntry::Link {
+        target: PathBuf::from("/Applications/Other.app/Contents/MacOS/jotra"),
+        beside_app: false,
+        bundle_identifier: bundle_identifier.map(str::to_owned),
+    };
+    assert!(!may_replace(&link(Some("com.example.other"))));
+    assert!(may_replace(&link(Some(BUNDLE_IDENTIFIER))));
+    assert!(
+        may_replace(&link(None)),
+        "a link into a bundle since deleted is still Jotra's"
+    );
+    assert_eq!(
+        app_bundle_of_command(Path::new("/Applications/Other.app/Contents/MacOS/jotra")),
+        Some(Path::new("/Applications/Other.app"))
+    );
+    assert_eq!(app_bundle_of_command(Path::new("/usr/bin/jotra")), None);
 }
 
 #[test]

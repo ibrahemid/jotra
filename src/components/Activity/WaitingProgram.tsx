@@ -47,6 +47,14 @@ export function WaitingChoices(props: { client: PendingClient; onDenied?: (name:
     }
   }
 
+  async function approveContext() {
+    try {
+      await activityStore.setContext(props.client.name, true);
+    } catch {
+      showToast("Could not save the approval", "error");
+    }
+  }
+
   async function deny() {
     const name = props.client.name;
     try {
@@ -64,6 +72,9 @@ export function WaitingChoices(props: { client: PendingClient; onDenied?: (name:
       </Button>
       <Button data-action="approve-write" onClick={() => void approve(true)}>
         Approve reading and writing
+      </Button>
+      <Button data-action="approve-context" onClick={() => void approveContext()}>
+        Let it see the open file
       </Button>
       <Button variant="ghost" data-action="refuse" onClick={() => void deny()}>
         Don't allow

@@ -11,7 +11,8 @@ use jotra_core::workspace::WorkspaceKind;
 use jotra_storage::paths::file_name_only;
 use notify::{RecommendedWatcher, RecursiveMode};
 use notify_debouncer_mini::{
-    new_debouncer_opt, Config as DebounceConfig, DebounceEventResult, Debouncer,
+    new_debouncer_opt, Config as DebounceConfig, DebounceEventResult, DebouncedEvent,
+    DebouncedEventKind, Debouncer,
 };
 use std::cell::RefCell;
 use std::collections::HashSet;
@@ -143,11 +144,38 @@ fn new_changes_debouncer(
 /// Opaque owner of the file watcher's debouncer.
 ///
 /// Held by `AppState` so the watcher lives as long as the application.
-/// Dropping this handle drops the inner `Debouncer`, which closes the
-/// event channel and causes the watcher thread to exit cleanly.
+/// Dropping this handle drops the inner `Debouncer` and the handle's own
+/// sender, which closes the event channel and causes the watcher thread to
+/// exit cleanly.
 pub struct WatcherHandle {
     _debouncer: Debouncer<ChangesWatcher>,
+    deliveries: mpsc::Sender<DebounceEventResult>,
 }
+
+impl WatcherHandle {
+    /// Hands the watcher's thread `paths` as one delivery, on the channel the
+    /// debouncer hands it what the platform reported, so a test decides what
+    /// arrives and in which batch without waiting on the platform.
+    pub fn deliver(&self, paths: &[PathBuf]) -> Result<(), WatcherStopped> {
+        let events = paths
+            .iter()
+            .map(|path| DebouncedEvent::new(path.clone(), DebouncedEventKind::Any))
+            .collect();
+        self.deliveries.send(Ok(events)).map_err(|_| WatcherStopped)
+    }
+}
+
+/// The watcher's thread has exited, so a delivery has nowhere to go.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WatcherStopped;
+
+impl std::fmt::Display for WatcherStopped {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("the watcher's thread has exited")
+    }
+}
+
+impl std::error::Error for WatcherStopped {}
 
 /// Watches the config file, and the list of programs waiting to be approved,
 /// through the folder that holds them.
@@ -183,55 +211,24 @@ pub fn start_file_watcher(
     pending_path: PathBuf,
     ignore_set: IgnoreSet,
 ) -> Result<WatcherHandle, Box<dyn std::error::Error>> {
-    let ttl = DEFAULT_IGNORE_TTL;
-    let config_path = ignore_key_path(&config_path);
-    let pending_path = ignore_key_path(&pending_path);
-    let folder = parent_of(&config_path)?;
-    let pending_folder = parent_of(&pending_path)?;
-    let off_call_path = jotra_storage::off_calls::path(&pending_folder);
+    let mut reports = ConfigFolderEvents::new(&config_path, &pending_path, ignore_set)?;
     let (tx, rx) = mpsc::channel::<DebounceEventResult>();
 
-    let mut debouncer = new_changes_debouncer(Duration::from_millis(500), tx)?;
-    debouncer
-        .watcher()
-        .watch(&folder, RecursiveMode::NonRecursive)?;
-    if pending_folder != folder {
+    let mut debouncer = new_changes_debouncer(Duration::from_millis(500), tx.clone())?;
+    for folder in reports.folders() {
         debouncer
             .watcher()
-            .watch(&pending_folder, RecursiveMode::NonRecursive)?;
+            .watch(folder, RecursiveMode::NonRecursive)?;
     }
 
-    info!(folder = %file_name_only(&folder.to_string_lossy()), "config watcher started");
+    info!(folder = %file_name_only(&reports.folders()[0].to_string_lossy()), "config watcher started");
 
     std::thread::spawn(move || {
-        let mut seen = LastSeen::new();
         while let Ok(result) = rx.recv() {
             match result {
                 Ok(events) => {
                     for event in events {
-                        let now = Instant::now();
-                        let reported = report_config_event(
-                            &event.path,
-                            &config_path,
-                            &ignore_set,
-                            &mut seen,
-                            ttl,
-                            now,
-                        )
-                        .or_else(|| {
-                            report_pending_event(
-                                &event.path,
-                                &pending_path,
-                                &ignore_set,
-                                &mut seen,
-                                ttl,
-                                now,
-                            )
-                        })
-                        .or_else(|| {
-                            report_off_call_event(&event.path, &off_call_path, &mut seen, now)
-                        });
-                        if let Some(domain_event) = reported {
+                        if let Some(domain_event) = reports.report(&event.path, Instant::now()) {
                             bus.emit(domain_event);
                         }
                     }
@@ -246,7 +243,78 @@ pub fn start_file_watcher(
 
     Ok(WatcherHandle {
         _debouncer: debouncer,
+        deliveries: tx,
     })
+}
+
+/// What the config watcher makes of each path the platform reports in the
+/// folders it watches: the config, the waiting list and the off-call file, each
+/// through its own report, with one record of what was last seen across every
+/// delivery.
+pub struct ConfigFolderEvents {
+    config_path: PathBuf,
+    pending_path: PathBuf,
+    off_call_path: PathBuf,
+    ignore_set: IgnoreSet,
+    seen: LastSeen,
+    folders: Vec<PathBuf>,
+}
+
+impl ConfigFolderEvents {
+    /// Resolves both paths once ([`ignore_key_path`]), as the watcher does
+    /// when it starts.
+    pub fn new(
+        config_path: &Path,
+        pending_path: &Path,
+        ignore_set: IgnoreSet,
+    ) -> Result<Self, std::io::Error> {
+        let config_path = ignore_key_path(config_path);
+        let pending_path = ignore_key_path(pending_path);
+        let folder = parent_of(&config_path)?;
+        let pending_folder = parent_of(&pending_path)?;
+        let off_call_path = jotra_storage::off_calls::path(&pending_folder);
+        let mut folders = vec![folder];
+        if !folders.contains(&pending_folder) {
+            folders.push(pending_folder);
+        }
+        Ok(Self {
+            config_path,
+            pending_path,
+            off_call_path,
+            ignore_set,
+            seen: LastSeen::new(),
+            folders,
+        })
+    }
+
+    /// The folders to watch, the config's first.
+    pub fn folders(&self) -> &[PathBuf] {
+        &self.folders
+    }
+
+    /// What one delivered `path` is worth saying, or nothing.
+    pub fn report(&mut self, path: &Path, now: Instant) -> Option<JotraEvent> {
+        let ttl = DEFAULT_IGNORE_TTL;
+        report_config_event(
+            path,
+            &self.config_path,
+            &self.ignore_set,
+            &mut self.seen,
+            ttl,
+            now,
+        )
+        .or_else(|| {
+            report_pending_event(
+                path,
+                &self.pending_path,
+                &self.ignore_set,
+                &mut self.seen,
+                ttl,
+                now,
+            )
+        })
+        .or_else(|| report_off_call_event(path, &self.off_call_path, &mut self.seen, now))
+    }
 }
 
 fn parent_of(path: &Path) -> Result<PathBuf, std::io::Error> {
@@ -283,7 +351,7 @@ pub fn start_workspace_watcher(
 ) -> Result<WatcherHandle, Box<dyn std::error::Error>> {
     let (tx, rx) = mpsc::channel::<DebounceEventResult>();
 
-    let mut debouncer = new_changes_debouncer(Duration::from_millis(500), tx)?;
+    let mut debouncer = new_changes_debouncer(Duration::from_millis(500), tx.clone())?;
     debouncer.watcher().watch(&root, RecursiveMode::Recursive)?;
 
     info!(root = %file_name_only(&root.to_string_lossy()), "workspace watcher started");
@@ -334,6 +402,7 @@ pub fn start_workspace_watcher(
 
     Ok(WatcherHandle {
         _debouncer: debouncer,
+        deliveries: tx,
     })
 }
 
@@ -412,35 +481,26 @@ pub fn start_inbox_watcher(
 ) -> Result<WatcherHandle, Box<dyn std::error::Error>> {
     let (tx, rx) = mpsc::channel::<DebounceEventResult>();
 
-    let mut debouncer = new_changes_debouncer(Duration::from_millis(500), tx)?;
+    let mut debouncer = new_changes_debouncer(Duration::from_millis(500), tx.clone())?;
     debouncer.watcher().watch(&root, RecursiveMode::Recursive)?;
 
     // Snapshot AFTER the watch is registered: a file landing during the scan
     // is suppressed (it is in the snapshot) rather than double-reported, and
     // nothing created after the scan can be missed.
-    let preexisting = snapshot_files(&root);
+    let mut inbox = InboxEvents::new(root.clone(), ignore_set);
 
     info!(
         root = %file_name_only(&root.to_string_lossy()),
-        preexisting = preexisting.len(),
+        preexisting = inbox.preexisting(),
         "inbox watcher started"
     );
 
     std::thread::spawn(move || {
-        let mut seen = LastSeen::new();
         while let Ok(result) = rx.recv() {
             match result {
                 Ok(events) => {
                     for event in events {
-                        if let Some(domain_event) = report_inbox_event(
-                            &event.path,
-                            &root,
-                            &preexisting,
-                            &ignore_set,
-                            &mut seen,
-                            DEFAULT_IGNORE_TTL,
-                            Instant::now(),
-                        ) {
+                        if let Some(domain_event) = inbox.report(&event.path, Instant::now()) {
                             bus.emit(domain_event);
                         }
                     }
@@ -455,7 +515,50 @@ pub fn start_inbox_watcher(
 
     Ok(WatcherHandle {
         _debouncer: debouncer,
+        deliveries: tx,
     })
+}
+
+/// What the inbox watcher's thread holds between deliveries, and what it makes
+/// of each delivered path: the thread feeds it what the debouncer delivers,
+/// and a test feeds it the same by hand.
+pub struct InboxEvents {
+    root: PathBuf,
+    preexisting: std::collections::HashSet<PathBuf>,
+    ignore_set: IgnoreSet,
+    seen: LastSeen,
+}
+
+impl InboxEvents {
+    /// Takes the snapshot of what `root` holds now, which is the arrival
+    /// discriminator, so it is made after the watch is registered.
+    pub fn new(root: PathBuf, ignore_set: IgnoreSet) -> Self {
+        let preexisting = snapshot_files(&root);
+        Self {
+            root,
+            preexisting,
+            ignore_set,
+            seen: LastSeen::new(),
+        }
+    }
+
+    /// How many files the snapshot holds.
+    pub fn preexisting(&self) -> usize {
+        self.preexisting.len()
+    }
+
+    /// What one delivered path is worth saying, or nothing.
+    pub fn report(&mut self, path: &Path, now: Instant) -> Option<JotraEvent> {
+        report_inbox_event(
+            path,
+            &self.root,
+            &self.preexisting,
+            &self.ignore_set,
+            &mut self.seen,
+            DEFAULT_IGNORE_TTL,
+            now,
+        )
+    }
 }
 
 /// Collects every regular file under `root`, recursively. The snapshot is
@@ -617,50 +720,19 @@ pub fn start_notes_watcher(
 ) -> Result<WatcherHandle, Box<dyn std::error::Error>> {
     let (tx, rx) = mpsc::channel::<DebounceEventResult>();
 
-    let mut debouncer = new_changes_debouncer(NOTES_DEBOUNCE_WINDOW, tx)?;
+    let mut debouncer = new_changes_debouncer(NOTES_DEBOUNCE_WINDOW, tx.clone())?;
     debouncer.watcher().watch(&root, RecursiveMode::Recursive)?;
 
     info!(root = %file_name_only(&root.to_string_lossy()), "notes watcher started");
 
+    let mut deliveries = NotesDeliveries::new(root, ignore_set, open_notes, tracking);
     std::thread::spawn(move || {
-        let mut budget = EmissionBudget::new();
-        // Outside the batch loop: a change delivered twice arrives in a later
-        // batch the second time, so a record scoped to one batch would never
-        // see it.
-        let mut seen = LastSeen::new();
-        // A removal waits for the delivery that might answer it, so the wait
-        // ends at its deadline as well as at the sweep's.
-        let pending = RefCell::new(PendingRemovals::publishing_to(
-            hold_window(NOTES_DEBOUNCE_WINDOW),
-            tracking.holds.clone(),
-        ));
         loop {
-            // A change the budget dropped was covered by a sweep that had
-            // already gone out, and the walk that sweep started may have read
-            // the file before it changed. If the folder then falls quiet,
-            // nothing else will ever raise it, so the wait ends at the moment
-            // that sweep stops standing and the folder is swept once more.
-            let due = [budget.owed_sweep_at(), pending.borrow().deadline()]
-                .into_iter()
-                .flatten()
-                .min();
-            let result = match due {
+            let result = match deliveries.deadline() {
                 Some(due) => match rx.recv_timeout(due.saturating_duration_since(Instant::now())) {
                     Ok(result) => result,
                     Err(mpsc::RecvTimeoutError::Timeout) => {
-                        let now = Instant::now();
-                        let answers =
-                            answer_held_removals(&mut pending.borrow_mut(), &[], &tracking, now);
-                        for (_, event) in answers {
-                            bus.emit(event);
-                        }
-                        if budget.take_owed_sweep(now) {
-                            info!(
-                                root = %file_name_only(&root.to_string_lossy()),
-                                "the notes folder fell quiet mid-sweep; sweeping once more"
-                            );
-                            bus.emit(notes_swept(&root));
-                        }
+                        deliveries.on_deadline(Instant::now(), |event| bus.emit(event));
                         continue;
                     }
                     Err(mpsc::RecvTimeoutError::Disconnected) => break,
@@ -672,74 +744,7 @@ pub fn start_notes_watcher(
             };
             match result {
                 Ok(events) => {
-                    // One tab message per note per delivered batch, the same
-                    // rule the open-file watcher runs on, off the same code: a
-                    // note moved inside the notes folder arrives as its old
-                    // path leaving and its new one appearing in the same
-                    // window, and the removal this delivery answers is that
-                    // note's message for it.
-                    let (batch, mut told, answers) =
-                        open_delivery(&events, &pending, &tracking, Instant::now());
-                    for event in answers {
-                        bus.emit(event);
-                    }
-                    for event in &events {
-                        let now = Instant::now();
-                        let domain_event = match report_notes_event(
-                            &event.path,
-                            &root,
-                            &ignore_set,
-                            &mut seen,
-                            DEFAULT_IGNORE_TTL,
-                            now,
-                        ) {
-                            NotesReport::Change(domain_event) => domain_event,
-                            // The path is the tab's business even where the
-                            // classifier has nothing to say about it, and the
-                            // route reads it, so it runs only on a sighting
-                            // that is news.
-                            NotesReport::Suppressed => {
-                                if let Some(for_tab) = route_replaced_note_to_open_tab(
-                                    &event.path,
-                                    &root,
-                                    open_notes.as_ref(),
-                                    &mut told,
-                                    &VanishedContext {
-                                        batch: &batch,
-                                        tracking: &tracking,
-                                        hold: &pending,
-                                    },
-                                ) {
-                                    bus.emit(for_tab);
-                                }
-                                continue;
-                            }
-                            NotesReport::NothingNew => continue,
-                        };
-                        if let Some(for_tab) = route_notes_change_to_open_tab(
-                            &domain_event,
-                            open_notes.as_ref(),
-                            &mut told,
-                            &VanishedContext {
-                                batch: &batch,
-                                tracking: &tracking,
-                                hold: &pending,
-                            },
-                        ) {
-                            bus.emit(for_tab);
-                        }
-                        match budget.admit(now) {
-                            Emission::Name => bus.emit(domain_event),
-                            Emission::Sweep => {
-                                info!(
-                                    root = %file_name_only(&root.to_string_lossy()),
-                                    "notes folder changed faster than it can be listed; sweeping"
-                                );
-                                bus.emit(notes_swept(&root));
-                            }
-                            Emission::Drop => {}
-                        }
-                    }
+                    deliveries.deliver(&events, Instant::now, |event| bus.emit(event));
                 }
                 Err(e) => {
                     error!("notes watcher error: {:?}", e);
@@ -751,7 +756,156 @@ pub fn start_notes_watcher(
 
     Ok(WatcherHandle {
         _debouncer: debouncer,
+        deliveries: tx,
     })
+}
+
+/// What the notes watcher's thread holds between deliveries, and what it makes
+/// of each one: the thread feeds it what the debouncer delivers and the moment
+/// a held removal or an owed sweep comes due, and a test feeds it the same by
+/// hand.
+pub struct NotesDeliveries {
+    root: PathBuf,
+    ignore_set: IgnoreSet,
+    open_notes: Arc<dyn OpenNotes>,
+    tracking: FileTracking,
+    budget: EmissionBudget,
+    /// Across deliveries: a change delivered twice arrives in a later batch
+    /// the second time, so a record scoped to one batch would never see it.
+    seen: LastSeen,
+    /// A removal waits for the delivery that might answer it, so the wait ends
+    /// at its deadline as well as at the sweep's.
+    pending: RefCell<PendingRemovals>,
+}
+
+impl NotesDeliveries {
+    pub fn new(
+        root: PathBuf,
+        ignore_set: IgnoreSet,
+        open_notes: Arc<dyn OpenNotes>,
+        tracking: FileTracking,
+    ) -> Self {
+        let pending = RefCell::new(PendingRemovals::publishing_to(
+            hold_window(NOTES_DEBOUNCE_WINDOW),
+            tracking.holds.clone(),
+        ));
+        Self {
+            root,
+            ignore_set,
+            open_notes,
+            tracking,
+            budget: EmissionBudget::new(),
+            seen: LastSeen::new(),
+            pending,
+        }
+    }
+
+    /// The next moment something is owed without a delivery: a held removal's
+    /// answer, or a sweep.
+    ///
+    /// A change the budget dropped was covered by a sweep that had already gone
+    /// out, and the walk that sweep started may have read the file before it
+    /// changed. If the folder then falls quiet, nothing else will ever raise
+    /// it, so the wait ends at the moment that sweep stops standing and the
+    /// folder is swept once more.
+    pub fn deadline(&self) -> Option<Instant> {
+        [
+            self.budget.owed_sweep_at(),
+            self.pending.borrow().deadline(),
+        ]
+        .into_iter()
+        .flatten()
+        .min()
+    }
+
+    /// Emits what is owed at `now` with no delivery to answer it.
+    pub fn on_deadline(&mut self, now: Instant, mut emit: impl FnMut(JotraEvent)) {
+        let answers =
+            answer_held_removals(&mut self.pending.borrow_mut(), &[], &self.tracking, now);
+        for (_, event) in answers {
+            emit(event);
+        }
+        if self.budget.take_owed_sweep(now) {
+            info!(
+                root = %file_name_only(&self.root.to_string_lossy()),
+                "the notes folder fell quiet mid-sweep; sweeping once more"
+            );
+            emit(notes_swept(&self.root));
+        }
+    }
+
+    /// Emits what one delivery says, in order, each event classified at the
+    /// moment `now` gives.
+    pub fn deliver(
+        &mut self,
+        events: &[DebouncedEvent],
+        mut now: impl FnMut() -> Instant,
+        mut emit: impl FnMut(JotraEvent),
+    ) {
+        // One tab message per note per delivered batch, the same rule the
+        // open-file watcher runs on, off the same code: a note moved inside the
+        // notes folder arrives as its old path leaving and its new one
+        // appearing in the same window, and the removal this delivery answers
+        // is that note's message for it.
+        let (batch, mut told, answers) =
+            open_delivery(events, &self.pending, &self.tracking, now());
+        for event in answers {
+            emit(event);
+        }
+        let vanished = VanishedContext {
+            batch: &batch,
+            tracking: &self.tracking,
+            hold: &self.pending,
+        };
+        for event in events {
+            let at = now();
+            let domain_event = match report_notes_event(
+                &event.path,
+                &self.root,
+                &self.ignore_set,
+                &mut self.seen,
+                DEFAULT_IGNORE_TTL,
+                at,
+            ) {
+                NotesReport::Change(domain_event) => domain_event,
+                // The path is the tab's business even where the classifier has
+                // nothing to say about it, and the route reads it, so it runs
+                // only on a sighting that is news.
+                NotesReport::Suppressed => {
+                    if let Some(for_tab) = route_replaced_note_to_open_tab(
+                        &event.path,
+                        &self.root,
+                        self.open_notes.as_ref(),
+                        &mut told,
+                        &vanished,
+                    ) {
+                        emit(for_tab);
+                    }
+                    continue;
+                }
+                NotesReport::NothingNew => continue,
+            };
+            if let Some(for_tab) = route_notes_change_to_open_tab(
+                &domain_event,
+                self.open_notes.as_ref(),
+                &mut told,
+                &vanished,
+            ) {
+                emit(for_tab);
+            }
+            match self.budget.admit(at) {
+                Emission::Name => emit(domain_event),
+                Emission::Sweep => {
+                    info!(
+                        root = %file_name_only(&self.root.to_string_lossy()),
+                        "notes folder changed faster than it can be listed; sweeping"
+                    );
+                    emit(notes_swept(&self.root));
+                }
+                Emission::Drop => {}
+            }
+        }
+    }
 }
 
 /// The tab event a classified notes change becomes, when the file it names is

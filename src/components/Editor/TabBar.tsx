@@ -14,7 +14,7 @@ import { notesStore } from "../../stores/global/notes";
 import { workspaceStore } from "../../stores/global/workspace";
 import { clipboardStore } from "../../stores/global/clipboard";
 import { executeCommand } from "../../commands/registry";
-import { commandChord, withChord } from "../../lib/command-chord";
+import { commandChord } from "../../lib/command-chord";
 import { pathInRoots, tabFolderHints } from "../../lib/tab-labels";
 import { displayFileName, renameSeed } from "../../lib/display-name";
 import { resolvePlatform } from "../../lib/platform";
@@ -69,9 +69,9 @@ export default function TabBar(props: Props) {
   // The downloads keep their tabs in the left pane's strip, where their pane shows.
   const downloads = () => (pane() === "left" ? win.downloads.pending() : []);
   let stripRef: HTMLDivElement | undefined;
-  // The strip's empty stretch answers a double-click as the title bar does.
-  // Tabs keep their own press for moving between panes, so it does not drag.
-  const emptyStrip = createTitleBarRegion({ drag: false });
+  // The strip's empty stretch drags the window and answers a double-click as
+  // the title bar does. A tab is a control, so its press stays its own.
+  const emptyStrip = createTitleBarRegion({ drag: true });
 
   let listRef: HTMLDivElement | undefined;
   let overflowButton: HTMLButtonElement | undefined;
@@ -327,11 +327,11 @@ export default function TabBar(props: Props) {
     if (draggedTab() !== null) endTabDrag(null, null);
   }
 
-  function onTabClick(tabId: string) {
-    if (suppressClick) {
-      suppressClick = false;
-      return;
-    }
+  function onTabClick(e: MouseEvent, tabId: string) {
+    const endsDrag = suppressClick;
+    suppressClick = false;
+    // A click with no detail came from the keyboard, which no drag ends in.
+    if (endsDrag && e.detail !== 0) return;
     win.tabs.selectIn(pane(), tabId);
   }
 
@@ -401,7 +401,7 @@ export default function TabBar(props: Props) {
                       aria-label={accessibleName()}
                       tabIndex={isActive() ? 0 : -1}
                       classList={{ "is-dragged": draggedTab()?.id === tab.id && draggedTab()?.from === pane() }}
-                      onClick={() => onTabClick(tab.id)}
+                      onClick={(e) => onTabClick(e, tab.id)}
                       onPointerDown={(e) => onTabPointerDown(e, tab.id)}
                       onPointerMove={onTabPointerMove}
                       onPointerUp={onTabPointerUp}
@@ -435,7 +435,7 @@ export default function TabBar(props: Props) {
                 </Show>
                 <SaveMarker noteId={tab.id} />
                 {/* A sibling of the tab, never a button nested inside one. */}
-                <Tooltip label={withChord("Close", "buffer.close")} anchorRole="none">
+                <Tooltip label="Close" kbd="buffer.close" anchorRole="none">
                   <button
                     type="button"
                     class="tab-close"

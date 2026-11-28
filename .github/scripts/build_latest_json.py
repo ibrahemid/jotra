@@ -33,7 +33,9 @@ def match_one(patterns: list[str], root: pathlib.Path) -> pathlib.Path | None:
     The signature requirement is what distinguishes an updater artifact:
     Tauri v2 signs the platform installer directly (`.msi`, `.AppImage`)
     instead of wrapping it (`.msi.zip`, `.AppImage.tar.gz`), so extension
-    alone no longer identifies the updater payload.
+    alone no longer identifies the updater payload. The patterns name only
+    the bare installers: the app's updater is built without its `zip`
+    feature and cannot unpack a wrapped one.
     """
     for pattern in patterns:
         rx = re.compile(pattern)
@@ -69,24 +71,14 @@ def main() -> int:
         platforms["darwin-aarch64"] = {"signature": signature, "url": url}
         platforms["darwin-x86_64"] = {"signature": signature, "url": url}
 
-    windows_asset = match_one(
-        [
-            r"_x64-setup\.nsis\.zip$",
-            r"_x64-setup\.exe\.zip$",
-            r"_en-US\.msi\.zip$",
-            r"\.msi\.zip$",
-            r"_en-US\.msi$",
-            r"\.msi$",
-        ],
-        root,
-    )
+    windows_asset = match_one([r"_en-US\.msi$", r"\.msi$"], root)
     if windows_asset:
         platforms["windows-x86_64"] = {
             "signature": read_sig(windows_asset),
             "url": f"https://github.com/{repo}/releases/download/{tag}/{windows_asset.name}",
         }
 
-    linux_asset = match_one([r"\.AppImage\.tar\.gz$", r"\.AppImage$"], root)
+    linux_asset = match_one([r"\.AppImage$"], root)
     if linux_asset:
         platforms["linux-x86_64"] = {
             "signature": read_sig(linux_asset),

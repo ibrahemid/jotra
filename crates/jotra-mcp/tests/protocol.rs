@@ -10,7 +10,9 @@ use tokio::io::{AsyncBufReadExt, AsyncWrite, AsyncWriteExt, BufReader};
 
 use jotra_core::mcp_dialect::Dialect;
 use jotra_mcp::consent::{ConfigGate, DenyAll, EnabledReads};
-use jotra_mcp::tools::{FixedAppFolder, ToolHost, CONTEXT_TOOLS, READ_TOOLS, WRITE_TOOLS};
+use jotra_mcp::tools::{
+    FixedAppFolder, ToolHost, CONTEXT_TOOLS, READ_TOOLS, SHOW_TOOLS, WRITE_TOOLS,
+};
 
 /// The version this test speaks. rmcp negotiates from its known list.
 const PROTOCOL_VERSION: &str = "2025-06-18";
@@ -151,7 +153,10 @@ async fn a_client_initialises_lists_the_tools_and_calls_one() {
         let name = tool["name"].as_str().expect("a name");
         let hints = &tool["annotations"];
         assert_eq!(hints["openWorldHint"], false, "{name}");
-        if READ_TOOLS.contains(&name) || CONTEXT_TOOLS.contains(&name) {
+        if SHOW_TOOLS.contains(&name) {
+            assert_eq!(hints["readOnlyHint"], false, "{name} starts Jotra");
+            assert_eq!(hints["destructiveHint"], false, "{name}");
+        } else if READ_TOOLS.contains(&name) || CONTEXT_TOOLS.contains(&name) {
             assert_eq!(hints["readOnlyHint"], true, "{name}");
         } else {
             assert_eq!(hints["readOnlyHint"], false, "{name}");

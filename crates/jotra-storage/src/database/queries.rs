@@ -524,9 +524,9 @@ pub fn update_size(conn: &Connection, id: &str, size_bytes: u64) -> StorageResul
 /// `updated_at` to now.
 ///
 /// The stamp is the point: it records when Jotra last learned what the file
-/// holds. The one comparison that reads it is the carry-over of a 0.5
-/// snapshot (`crate::recovery::legacy`), which leaves alone a note read after
-/// that snapshot was taken.
+/// holds. The carry-over of a 0.5 snapshot (`crate::recovery::legacy`)
+/// compares against it, leaving alone a note read after that snapshot was
+/// taken, and [`find_history_by_source_path`] orders by it.
 pub fn update_size_and_timestamp(
     conn: &Connection,
     id: &str,

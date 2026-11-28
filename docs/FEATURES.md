@@ -13,6 +13,7 @@ What Jotra does, at the level of detail that answers "does it do X".
 - Autosave writes one second after the last keystroke, and at once when the window loses focus or hides. A save that would overwrite a newer version on disk is refused, and your text is written beside the file as a dated conflict copy.
 - When a file changes outside Jotra, a tab with no unsaved edits takes the new text in one undoable step. A tab with unsaved edits asks which side to keep.
 - Jotra keeps a version of a file in its folder when it is saved, for up to 30 days or 200 versions, outside that folder; a run of saves inside ten seconds is one version. A file over 2 MB is not versioned. File > Revert To puts one back and names who wrote each version: Jotra, a connected program, chat or the jotra command.
+- In Revert To, Compare with current text shows how a version differs from the file as it is now, and Undo, after a restore, puts back the text the restore replaced.
 - Open tabs and unsaved text come back after a restart or a crash.
 - Binary files open as hex. Large files open with syntax colouring off.
 - A file over 50 MiB asks before it opens and says how large it is. A file over 500 MiB (524 MB) doesn't open, and Jotra says why. Jotra measures the tabs it restores at launch as it starts: one over 50 MiB asks when it is shown, and one over 500 MiB says why.
@@ -22,7 +23,7 @@ What Jotra does, at the level of detail that answers "does it do X".
 
 - A Markdown file opens in Inline mode: headings at heading sizes, bold, italic, strikethrough and inline code styled, links with the address hidden, images shown under their line, task lists as checkboxes, fenced code highlighted in its language, and tables, `$…$` and `$$…$$` math and `mermaid` diagrams drawn in place. The line you are editing shows its markup, and a table, formula or diagram shows its source while the cursor is in it.
 - A heading folds its section from the arrow beside it, and `Cmd+Option+[` and `Cmd+Option+]` (`Ctrl+Shift+[` and `Ctrl+Shift+]` on Windows and Linux) fold and unfold at the cursor. A source file folds from the gutter beside its line numbers.
-- The Inline | Source switch in the status bar shows the raw Markdown instead. Settings, Editor, Markdown opens in sets which one a Markdown file opens in.
+- The Inline | Source switch in the status bar shows the raw Markdown instead. Settings, Editor, “Markdown opens in” sets which one a Markdown file opens in.
 - `[[Name]]` links another file by name, completes from the files in the folder, and opens on `Cmd+click` or `Enter`. `[[Name#Heading]]` opens at the heading. A name two files share asks which one is meant.
 - `Cmd+B`, `Cmd+I`, `Cmd+Shift+X`, `Cmd+Shift+E` and `Cmd+K` format a selection. Settings, Editor, Markdown shortcuts turns them off.
 - A `.txt` file gets the plain editor, with no link completion.
@@ -38,7 +39,7 @@ What Jotra does, at the level of detail that answers "does it do X".
 ## Editing
 
 - CodeMirror 6. A file's name decides its language, and a `.txt` or `.text` file stays plain text whatever it holds. Change Language in the palette picks another language for one file, and the file keeps it.
-- Word wrap, tab size and reading width, under Settings, Editor, apply to open files at once. Reading width keeps lines of prose to a set width; code files keep the full width.
+- Word wrap, tab size and reading width, under Settings, Editor, apply to open files at once. Reading width keeps lines of prose to the narrow, medium or wide width Line length picks; code files keep the full width.
 - The command palette opens on a double tap of `Shift` (Help > Command Palette). Typing a file's name there lists the file under the commands.
 - File > Open Folder (`Cmd+Option+O`) shows a folder's files in the sidebar. The tree draws only the rows on screen; it is one `Tab` stop, with the arrow keys, `Home`, `End` and typing a name to move inside it. A folder Jotra cannot read says so with Try again, and folders stay open across launches. Right-click on any row shows it in the file manager or copies its path; in Jotra's folder it also renames, moves to the Trash, or makes a new file in a folder.
 - Help holds Jotra Help (the guide on the site), Keyboard Shortcuts, What's New (the changelog at this version), Show Setup Again and Report an Issue (the bug form, with the version filled in).
@@ -64,7 +65,7 @@ What Jotra does, at the level of detail that answers "does it do X".
 ## Window
 
 - `Cmd+Shift+Space` (`Ctrl+Shift+Space` on Windows and Linux) shows and hides the window from any app. Settings, General records a new one, and Settings, Shortcuts lists it first with every other shortcut.
-- `Cmd+Shift+Option+Space` (`Ctrl+Shift+Alt+Space` on Windows and Linux) opens a small window over any app. Escape adds what you typed to the end of Today's File; on macOS and Windows the app you were in gets the keyboard back.
+- Quick capture, `Cmd+Shift+Option+Space` (`Ctrl+Shift+Alt+Space` on Windows and Linux), opens a small window over any app. Escape adds what you typed to the end of Today's File; on macOS and Windows the app you were in gets the keyboard back.
 - Tabs switch with `Cmd+[` and `Cmd+]`, and `Cmd+Shift+T` reopens the last closed one.
 - Light and dark follow the system, with six accent colours, preset themes and custom colours.
 - The editor font size (`Cmd+=`, `Cmd+-`, `Cmd+0`) and the interface text size (Settings, Appearance) change separately.
@@ -87,7 +88,7 @@ Chat and Rewrite share one AI connection: Ollama, LM Studio, llama.cpp or Jan on
 - Spell check runs on this machine and is off until you turn it on. Code, URLs and identifiers stay unflagged.
 - A watched folder (Settings, Integrations) opens new files as they arrive. See [adr/018-watch-inbox.md](adr/018-watch-inbox.md).
 - The `jotra` command opens files, folders and piped text from a terminal, and answers questions about the folder. See [cli-verbs.md](cli-verbs.md).
-- On macOS and Windows, `jotra://open?path=Plan.md&line=12` opens a file in Jotra's folder at a line, from a browser or another program, and `jotra://new?name=Plan` opens a new tab. `writ://` links work the same way. A link opens only a file inside the folder and writes nothing. See [adr/052-writ-links.md](adr/052-writ-links.md).
+- `jotra://open?path=Plan.md&line=12` opens a file in Jotra's folder at a line, from a browser or another program, and `jotra://new?name=Plan` opens a new tab. `writ://` links work the same way. A link opens only a file inside the folder and writes nothing. See [adr/052-writ-links.md](adr/052-writ-links.md).
 - A folder written in Obsidian opens as it is: [what carries over](./importing-from-obsidian.md).
 - No account and no telemetry.
 - Each update is verified against Jotra's signing key before it installs, and the automatic check can be turned off under Settings, About. See [adr/007-in-app-updater.md](adr/007-in-app-updater.md).

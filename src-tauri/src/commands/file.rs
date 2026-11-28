@@ -520,6 +520,25 @@ pub async fn open_file<R: Runtime>(
     .await
 }
 
+/// IPC: the window was handed `paths` by the OS or a `jotra` command and
+/// opened no tab for them, so a `jotra --wait` on them is answered
+/// ([`crate::instance::tabs_not_opened`]).
+#[tauri::command]
+pub async fn files_not_opened<R: Runtime>(
+    app: AppHandle<R>,
+    paths: Vec<String>,
+) -> Result<(), String> {
+    run_blocking(
+        app,
+        crate::commands::offload::ERR_COMMAND_STOPPED,
+        move |state| {
+            crate::instance::tabs_not_opened(state, &paths);
+            Ok(())
+        },
+    )
+    .await
+}
+
 /// Opens a file in the 50-500 MiB tier once the person said Open.
 ///
 /// Classifies again, since the file can change while the question is up: a

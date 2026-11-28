@@ -159,7 +159,9 @@ import Prose from '../layouts/Prose.astro';
   <p>
     Jotra ships an MCP server, <code>jotra mcp</code>, so a program you choose can work with the files in your folder.
     Connected programs is an app you switch on in <code>Settings &rarr; Apps</code>, which also shows the command to
-    give the program. The program starts the server itself and talks to it over that process's input and output.
+    give the program. Connect on a program's card runs that program's own <code>mcp add</code>, opens the install link
+    the program handles, or hands it an extension bundle it installs itself; Jotra never edits another program's
+    configuration. The program starts the server itself and talks to it over that process's input and output.
     Jotra opens no port for it, and the server makes no network request. Where that program sends what it reads is up to
     that program.
   </p>
@@ -182,7 +184,8 @@ import Prose from '../layouts/Prose.astro';
   </p>
   <p>
     With Open file turned on for it, a program can ask which file is in front in Jotra and read the text you selected
-    there, including text not saved yet. A file outside your folder is named to it by its file name alone. Jotra asks
+    there, including text not saved yet. A selection longer than about 2 million characters is cut there, and the
+    answer says it was cut. A file outside your folder is named to it by its file name alone. Jotra asks
     the window only when the program calls, hands the answer over in a file in its data folder that the server
     deletes once read, and lists each call in the activity list with the file's name and not the text.
   </p>
@@ -191,7 +194,8 @@ import Prose from '../layouts/Prose.astro';
   <p>
     Every call from a program, whether it was allowed, refused or left waiting, and every chat edit you applied or
     discarded, is appended to <code>activity.jsonl</code>. A record names the program, the chat or Jotra, the tool, the file,
-    the decision and, for a write, a byte count, never the text. Reads of one file that one program repeats within a minute
+    the decision and, for a write, a byte count, never the text. A chat edit to a file outside your folder, applied
+    or discarded, is recorded under that file's full path. Reads of one file that one program repeats within a minute
     are counted on a single record. The file stays on your disk and is capped at 5&nbsp;MB with one
     older generation kept. While Connected programs is on, open it from
     <code>Settings &rarr; Apps &rarr; Connected programs &rarr; Program activity</code>.

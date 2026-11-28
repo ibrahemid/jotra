@@ -75,6 +75,30 @@ fn an_answer_is_readable_by_its_owner_only() {
     assert_eq!(mode, 0o600);
 }
 
+#[cfg(windows)]
+#[test]
+fn an_answer_is_readable_by_its_owner_only() {
+    let dir = TempDir::new().expect("temp dir");
+    write_answer(dir.path(), "abc-3", &context()).expect("write");
+    let path = answer_path(dir.path(), "abc-3").expect("path");
+    let system = std::env::var_os("SystemRoot").unwrap_or_else(|| "C:\\Windows".into());
+    let icacls = std::path::Path::new(&system)
+        .join("System32")
+        .join("icacls.exe");
+    let output = std::process::Command::new(icacls)
+        .arg(&path)
+        .output()
+        .expect("icacls");
+    let listed = String::from_utf8_lossy(&output.stdout);
+    let entries: Vec<&str> = listed.lines().filter(|line| line.contains(":(")).collect();
+    assert_eq!(
+        entries.len(),
+        1,
+        "one entry, for the current user: {listed}"
+    );
+    assert!(!entries[0].contains("(I)"), "nothing inherited: {listed}");
+}
+
 #[test]
 fn answers_left_from_an_earlier_run_and_withdrawn_ones_are_removed() {
     let dir = TempDir::new().expect("temp dir");

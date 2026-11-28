@@ -142,11 +142,29 @@ export function showToast(
   const id = nextId++;
   if (request.onClose) closers.set(id, request.onClose);
   const next = [...current, makeToast(id, request.text, kind, request.action ?? null)];
-  const overflow = next.slice(0, Math.max(0, next.length - MAX_TOASTS));
-  setToasts(next.slice(-MAX_TOASTS));
+  const overflow = pushedOut(next);
+  setToasts(next.filter((toast) => !overflow.includes(toast)));
   armClock(id, lifetime(request, kind));
-  for (const pushedOut of overflow) leave(pushedOut.id, false);
+  for (const toast of overflow) leave(toast.id, false);
   return id;
+}
+
+/** The toasts a full column lets go, oldest first. An error waits to be
+ * dismissed, so it goes only once the column holds nothing else to drop. */
+function pushedOut(column: ToastMessage[]): ToastMessage[] {
+  let excess = column.length - MAX_TOASTS;
+  if (excess <= 0) return [];
+  const older = column.slice(0, -1);
+  const out: ToastMessage[] = [];
+  for (const toast of [
+    ...older.filter((t) => t.type !== "error"),
+    ...older.filter((t) => t.type === "error"),
+  ]) {
+    if (excess === 0) break;
+    out.push(toast);
+    excess -= 1;
+  }
+  return out;
 }
 
 /** Takes the toast away; its action, if it had one, is not run. */

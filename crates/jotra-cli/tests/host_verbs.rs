@@ -8,7 +8,9 @@
 
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output, Stdio};
+use std::process::{Child, Command, Output, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use jotra_core::instance::OpenRequest;
@@ -122,27 +124,56 @@ fn json(output: &Output) -> Value {
         .unwrap_or_else(|_| panic!("one JSON document: {}", stdout(output)))
 }
 
-/// Plays the running app: takes the first request that arrives, answers its
-/// wait after `answer_after`, and hands it back.
-fn running_app(
-    data: &Path,
-    answer_after: Option<Duration>,
-) -> std::thread::JoinHandle<OpenRequest> {
-    let data = data.to_path_buf();
-    std::thread::spawn(move || {
-        let deadline = Instant::now() + Duration::from_secs(10);
-        loop {
-            if let Some(request) = take_requests(&data).into_iter().next() {
-                if let (Some(after), Some(token)) = (answer_after, request.wait_token()) {
-                    std::thread::sleep(after);
-                    release_wait(&data, token);
-                }
-                return request;
-            }
-            assert!(Instant::now() < deadline, "no request arrived");
+/// The test playing the running app, on a thread of its own.
+struct RunningApp {
+    command_ended: Arc<AtomicBool>,
+    thread: std::thread::JoinHandle<Option<OpenRequest>>,
+}
+
+impl RunningApp {
+    /// The request the command sent, asked for once the command has ended.
+    fn request(self) -> OpenRequest {
+        self.command_ended.store(true, Ordering::SeqCst);
+        self.thread
+            .join()
+            .expect("app")
+            .expect("the command ended without sending a request")
+    }
+
+    /// The request `child` sends, taken while it still runs.
+    fn request_from(self, child: &mut Child) -> OpenRequest {
+        while !self.thread.is_finished() && child.try_wait().expect("poll jotra").is_none() {
             std::thread::sleep(Duration::from_millis(5));
         }
-    })
+        self.request()
+    }
+}
+
+/// Plays the running app: takes the first request that arrives, answers its
+/// wait after `answer_after`, and hands it back. It looks until a request
+/// arrives or the command has ended, however long the command takes to start.
+fn running_app(data: &Path, answer_after: Option<Duration>) -> RunningApp {
+    let data = data.to_path_buf();
+    let command_ended = Arc::new(AtomicBool::new(false));
+    let ended = Arc::clone(&command_ended);
+    let thread = std::thread::spawn(move || loop {
+        let last_look = ended.load(Ordering::SeqCst);
+        if let Some(request) = take_requests(&data).into_iter().next() {
+            if let (Some(after), Some(token)) = (answer_after, request.wait_token()) {
+                std::thread::sleep(after);
+                release_wait(&data, token);
+            }
+            return Some(request);
+        }
+        if last_look {
+            return None;
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    });
+    RunningApp {
+        command_ended,
+        thread,
+    }
 }
 
 // ------------------------------------------------------------------ search
@@ -359,7 +390,7 @@ fn open_by_name_at_a_line_hands_the_running_app_the_line() {
     let _app = acquire(&fixture.data).expect("the test plays the running app");
     let app = running_app(&fixture.data, None);
     let output = fixture.run(&["open", "Plan:2", "--json"]);
-    let request = app.join().expect("app");
+    let request = app.request();
     assert_eq!(code(&output), 0, "{}", stderr(&output));
     let document = json(&output);
     assert_eq!(document["line"], 2);
@@ -385,7 +416,7 @@ fn a_path_ending_in_a_line_opens_there() {
     let _app = acquire(&fixture.data).expect("the test plays the running app");
     let app = running_app(&fixture.data, None);
     let output = fixture.run(&["Plan.txt:2"]);
-    let request = app.join().expect("app");
+    let request = app.request();
     assert_eq!(code(&output), 0, "{}", stderr(&output));
     let [sent] = request.paths.as_slice() else {
         panic!("one path: {:?}", request.paths);
@@ -405,7 +436,7 @@ fn wait_returns_when_the_tab_closes() {
     let app = running_app(&fixture.data, Some(Duration::from_millis(300)));
     let started = Instant::now();
     let output = fixture.run(&["--wait", "COMMIT_EDITMSG"]);
-    let request = app.join().expect("app");
+    let request = app.request();
     assert_eq!(code(&output), 0, "{}", stderr(&output));
     assert!(request.wait_token().is_some());
     let [sent] = request.paths.as_slice() else {
@@ -428,13 +459,13 @@ fn wait_returns_when_the_app_ends() {
     std::fs::write(fixture.notes.join("COMMIT_EDITMSG"), "\n").expect("message");
     let held = acquire(&fixture.data).expect("the test plays the running app");
     let app = running_app(&fixture.data, None);
-    let child = fixture
+    let mut child = fixture
         .command(&["--wait", "COMMIT_EDITMSG"])
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
         .expect("run jotra");
-    app.join().expect("app");
+    app.request_from(&mut child);
     std::thread::sleep(Duration::from_millis(200));
     drop(held);
     let output = child.wait_with_output().expect("wait");

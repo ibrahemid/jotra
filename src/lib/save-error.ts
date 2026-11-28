@@ -14,6 +14,7 @@ const ERR_PERMISSION_DENIED = "ERR_PERMISSION_DENIED";
 const ERR_FILE_IN_USE = "ERR_FILE_IN_USE";
 const ERR_FILE_MISSING = "ERR_FILE_MISSING";
 const ERR_WRITE_TIMED_OUT = "ERR_WRITE_TIMED_OUT";
+const ERR_DISK_FULL = "ERR_DISK_FULL";
 const ERR_WRITE_FAILED = "ERR_WRITE_FAILED";
 // The one code whose message is read too: the encoding's name and the
 // characters it has no bytes for (ADR-049).
@@ -40,6 +41,7 @@ const CODE_MESSAGES: Record<string, string> = {
   [ERR_FILE_IN_USE]: "another program has the file open.",
   [ERR_FILE_MISSING]: "the folder this file was in is no longer there.",
   [ERR_WRITE_TIMED_OUT]: "the disk stopped responding. Check that the drive is still connected.",
+  [ERR_DISK_FULL]: "the disk is full.",
   [ERR_WRITE_FAILED]: "the disk would not take the write.",
   [ERR_ENCODING_LOSSY]: "this file's encoding cannot hold some of the characters in it.",
 };
@@ -68,6 +70,7 @@ const SKIPPED_CODE_MESSAGES: Record<string, string> = {
   [ERR_FILE_MISSING]: "is no longer there.",
   [ERR_FILE_REMOVED_ON_DISK]: "was deleted.",
   [ERR_WRITE_TIMED_OUT]: "is on a disk that stopped responding.",
+  [ERR_DISK_FULL]: "is on a disk that is full.",
   [ERR_WRITE_FAILED]: "is on a disk that would not take the write.",
 };
 

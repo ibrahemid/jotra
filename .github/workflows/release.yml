@@ -419,6 +419,8 @@ jobs:
               mkdir -p dist/build-linux
               cp "target/x86_64-unknown-linux-gnu/release/bundle/deb/Jotra_${VERSION}_amd64.deb" dist/build-linux/
               cp "target/x86_64-unknown-linux-gnu/release/bundle/appimage/Jotra_${VERSION}_amd64.AppImage" dist/build-linux/
+              python3 scripts/gen-linux-library-notices.py offer --appimage "dist/build-linux/Jotra_${VERSION}_amd64.AppImage" \
+                --out "dist/build-linux/Jotra_${VERSION}_amd64.AppImage.source-offer.md"
               ;;
           esac
           ls -la dist/*

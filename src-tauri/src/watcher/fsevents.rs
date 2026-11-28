@@ -212,6 +212,8 @@ struct StreamKeeper<S: StartStream> {
     polled: HashMap<PathBuf, Snapshot>,
     poll_due: Option<Instant>,
     retry_due: Option<Instant>,
+    /// How a replaced stream is let go: [`retire`], or at once in a test.
+    retire: fn(S::Stream),
 }
 
 impl<S: StartStream> StreamKeeper<S> {
@@ -225,6 +227,7 @@ impl<S: StartStream> StreamKeeper<S> {
             polled: HashMap::new(),
             poll_due: None,
             retry_due: None,
+            retire: retire::<S::Stream>,
         }
     }
 
@@ -310,7 +313,7 @@ impl<S: StartStream> StreamKeeper<S> {
         let roots = stream_roots(&streamable);
         if roots.is_empty() {
             if let Some((old, _)) = self.running.take() {
-                retire(old);
+                (self.retire)(old);
             }
         } else {
             match self
@@ -328,7 +331,7 @@ impl<S: StartStream> StreamKeeper<S> {
                     });
                     deliver(&self.handler, caught_up);
                     if let Some((old, _)) = self.running.replace((stream, streamable)) {
-                        retire(old);
+                        (self.retire)(old);
                     }
                 }
                 Err(error) => {
@@ -579,8 +582,11 @@ mod tests {
         assert!(!is_reported(Path::new("/elsewhere/x.md"), &folders));
     }
 
-    fn wait_for(rx: &mpsc::Receiver<notify::Result<Event>>, path: &Path) -> bool {
-        let deadline = Instant::now() + Duration::from_secs(10);
+    /// Long enough for a loaded machine; only a failing run waits it out.
+    const BOUND: Duration = Duration::from_secs(30);
+
+    fn wait_for(rx: &mpsc::Receiver<notify::Result<Event>>, path: &Path, bound: Duration) -> bool {
+        let deadline = Instant::now() + bound;
         while let Some(left) = deadline.checked_duration_since(Instant::now()) {
             match rx.recv_timeout(left) {
                 Ok(Ok(event)) if event.paths.iter().any(|p| p == path) => return true,
@@ -591,8 +597,16 @@ mod tests {
         false
     }
 
+    /// Whether anything the handler has been told so far names `path`.
+    fn heard(rx: &mpsc::Receiver<notify::Result<Event>>, path: &Path) -> bool {
+        rx.try_iter()
+            .any(|event| matches!(event, Ok(event) if event.paths.iter().any(|p| p == path)))
+    }
+
+    /// The one test here that runs FSEvents itself. Delivery lags on a loaded
+    /// machine, so a write the daemon has not reported is made again.
     #[test]
-    fn a_write_right_after_watch_returns_is_reported() {
+    fn the_real_stream_reports_a_write_in_a_watched_folder() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().canonicalize().unwrap();
         let (tx, rx) = mpsc::channel::<notify::Result<Event>>();
@@ -600,53 +614,253 @@ mod tests {
 
         watcher.watch(&root, RecursiveMode::NonRecursive).unwrap();
         let file = root.join("a.md");
-        std::fs::write(&file, "x").unwrap();
-        assert!(wait_for(&rx, &file), "the write was never reported");
+        let reported = (0..4).any(|attempt| {
+            std::fs::write(&file, format!("attempt {attempt}")).unwrap();
+            wait_for(&rx, &file, Duration::from_secs(15))
+        });
+        assert!(
+            reported,
+            "FSEvents never reported a write in a watched folder"
+        );
+    }
+
+    /// What one scripted start does.
+    enum Outcome {
+        Start,
+        Fail,
+        /// Starts once the sender side says so.
+        StartWhen(mpsc::Receiver<()>),
+        /// Writes the file while the stream is being started, before it runs.
+        WriteDuringStart(PathBuf),
+    }
+
+    /// A running scripted stream: its id, the folders it reports, its handler.
+    type Running = (usize, BTreeSet<PathBuf>, SharedHandler);
+
+    /// Stands in for the daemon: a change reaches every stream running when it
+    /// is made, and no other.
+    #[derive(Clone, Default)]
+    struct Daemon {
+        running: Arc<Mutex<Vec<Running>>>,
+    }
+
+    impl Daemon {
+        fn write(&self, file: &Path, text: &str) {
+            std::fs::write(file, text).unwrap();
+            let running = self.running.lock().unwrap().clone();
+            for (_, folders, handler) in running {
+                if is_reported(file, &folders) {
+                    deliver(&handler, vec![file.to_path_buf()]);
+                }
+            }
+        }
+    }
+
+    /// Starts whose streams report only what the test writes through the
+    /// [`Daemon`], so anything else the handler hears came from a listing.
+    struct ScriptedStarts {
+        outcomes: VecDeque<Outcome>,
+        asked: mpsc::Sender<BTreeSet<PathBuf>>,
+        stopped: Arc<Mutex<Vec<usize>>>,
+        daemon: Daemon,
+        started: usize,
+    }
+
+    struct ScriptedStream {
+        id: usize,
+        stopped: Arc<Mutex<Vec<usize>>>,
+        daemon: Daemon,
+    }
+
+    impl StopStream for ScriptedStream {
+        fn stop(self) {
+            self.stopped.lock().unwrap().push(self.id);
+            self.daemon
+                .running
+                .lock()
+                .unwrap()
+                .retain(|(id, _, _)| *id != self.id);
+        }
+    }
+
+    impl StartStream for ScriptedStarts {
+        type Stream = ScriptedStream;
+
+        fn start(
+            &mut self,
+            _roots: &[PathBuf],
+            folders: BTreeSet<PathBuf>,
+            handler: SharedHandler,
+        ) -> Result<ScriptedStream, StreamError> {
+            let _ = self.asked.send(folders.clone());
+            match self.outcomes.pop_front().unwrap_or(Outcome::Start) {
+                Outcome::Fail => return Err(StreamError::Start),
+                Outcome::StartWhen(gate) => {
+                    let _ = gate.recv();
+                }
+                Outcome::WriteDuringStart(file) => self.daemon.write(&file, "during"),
+                Outcome::Start => {}
+            }
+            let id = self.started;
+            self.started += 1;
+            self.daemon
+                .running
+                .lock()
+                .unwrap()
+                .push((id, folders, handler));
+            Ok(ScriptedStream {
+                id,
+                stopped: self.stopped.clone(),
+                daemon: self.daemon.clone(),
+            })
+        }
+    }
+
+    const TEST_POLL: Duration = Duration::from_millis(50);
+
+    struct Script {
+        starter: ScriptedStarts,
+        events: mpsc::Receiver<notify::Result<Event>>,
+        handler: SharedHandler,
+        asked: mpsc::Receiver<BTreeSet<PathBuf>>,
+        stopped: Arc<Mutex<Vec<usize>>>,
+        daemon: Daemon,
+    }
+
+    fn script(outcomes: Vec<Outcome>) -> Script {
+        let (tx, events) = mpsc::channel::<notify::Result<Event>>();
+        let (asked_tx, asked) = mpsc::channel();
+        let stopped = Arc::new(Mutex::new(Vec::new()));
+        let daemon = Daemon::default();
+        Script {
+            starter: ScriptedStarts {
+                outcomes: outcomes.into(),
+                asked: asked_tx,
+                stopped: stopped.clone(),
+                daemon: daemon.clone(),
+                started: 0,
+            },
+            events,
+            handler: Arc::new(Mutex::new(tx)),
+            asked,
+            stopped,
+            daemon,
+        }
+    }
+
+    /// The stream thread's state, driven by the test: each request is applied
+    /// when the test makes it, a listing is due when the test says, and a
+    /// replaced stream stops at once.
+    struct Keeper {
+        keeper: StreamKeeper<ScriptedStarts>,
+        events: mpsc::Receiver<notify::Result<Event>>,
+        asked: mpsc::Receiver<BTreeSet<PathBuf>>,
+        stopped: Arc<Mutex<Vec<usize>>>,
+        daemon: Daemon,
+    }
+
+    impl Keeper {
+        fn new(outcomes: Vec<Outcome>) -> Self {
+            let s = script(outcomes);
+            let mut keeper = StreamKeeper::new(s.starter, s.handler, TEST_POLL);
+            keeper.retire = |stream| stream.stop();
+            Self {
+                keeper,
+                events: s.events,
+                asked: s.asked,
+                stopped: s.stopped,
+                daemon: s.daemon,
+            }
+        }
+
+        /// What `watch` hands the stream thread: every folder wanted, and the
+        /// new one with what it held when `watch` listed it.
+        fn watch(&mut self, wanted: &[&Path], added: &Path) {
+            self.keeper.apply(
+                wanted.iter().map(|folder| folder.to_path_buf()).collect(),
+                HashMap::from([(added.to_path_buf(), snapshot(added))]),
+            );
+        }
+
+        fn asked(&self) -> BTreeSet<PathBuf> {
+            self.asked.try_recv().expect("a start was asked for")
+        }
+
+        fn list_now(&mut self) {
+            let due = self.keeper.poll_due.expect("a folder is listed");
+            self.keeper.on_deadline(due);
+        }
+
+        fn stopped(&self) -> Vec<usize> {
+            self.stopped.lock().unwrap().clone()
+        }
+    }
+
+    fn folder() -> (tempfile::TempDir, PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        (dir, root)
+    }
+
+    fn folders(paths: &[&Path]) -> BTreeSet<PathBuf> {
+        paths.iter().map(|path| path.to_path_buf()).collect()
     }
 
     #[test]
     fn a_write_landing_while_the_stream_is_rebuilt_is_still_reported() {
-        let first = tempfile::tempdir().unwrap();
-        let second = tempfile::tempdir().unwrap();
-        let first_root = first.path().canonicalize().unwrap();
-        let second_root = second.path().canonicalize().unwrap();
-        let (tx, rx) = mpsc::channel::<notify::Result<Event>>();
-        let watcher = Arc::new(Mutex::new(
-            FsEventsWatcher::new(tx, Config::default()).unwrap(),
-        ));
-        watcher
-            .lock()
-            .unwrap()
-            .watch(&first_root, RecursiveMode::NonRecursive)
+        let (_a, a) = folder();
+        let (_b, b) = folder();
+        let during = a.join("during.md");
+        let mut k = Keeper::new(vec![
+            Outcome::Start,
+            Outcome::WriteDuringStart(during.clone()),
+        ]);
+
+        k.watch(&[&a], &a);
+        // Adding a folder replaces the stream; the write lands while the new
+        // one is starting and before it reports anything.
+        k.watch(&[&a, &b], &b);
+        assert!(
+            heard(&k.events, &during),
+            "a write during the rebuild was lost"
+        );
+        assert_eq!(k.stopped(), vec![0], "the replaced stream was kept");
+
+        let later = b.join("after.md");
+        k.daemon.write(&later, "y");
+        assert!(heard(&k.events, &later), "the added folder is not watched");
+    }
+
+    #[test]
+    fn a_replaced_stream_is_stopped_only_after_the_overlap() {
+        let s = script(vec![]);
+        let mut starter = s.starter;
+        let (_a, a) = folder();
+        let stream = starter
+            .start(std::slice::from_ref(&a), folders(&[&a]), s.handler)
             .unwrap();
 
-        // Adding a folder replaces the stream; the write races the swap.
-        let adder = {
-            let watcher = watcher.clone();
-            let second_root = second_root.clone();
-            std::thread::spawn(move || {
-                watcher
-                    .lock()
-                    .unwrap()
-                    .watch(&second_root, RecursiveMode::NonRecursive)
-                    .unwrap();
-            })
-        };
-        let file = first_root.join("during.md");
-        std::fs::write(&file, "x").unwrap();
-        adder.join().unwrap();
-        assert!(wait_for(&rx, &file), "a write during the rebuild was lost");
-
-        let later = second_root.join("after.md");
-        std::fs::write(&later, "y").unwrap();
-        assert!(wait_for(&rx, &later), "the added folder is not watched");
+        let retired = Instant::now();
+        retire(stream);
+        assert!(
+            s.stopped.lock().unwrap().is_empty(),
+            "the replaced stream stopped before its successor had overlapped it"
+        );
+        while s.stopped.lock().unwrap().is_empty() {
+            assert!(
+                retired.elapsed() < OVERLAP + BOUND,
+                "a replaced stream was never stopped"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(retired.elapsed() >= OVERLAP);
     }
 
     #[test]
     fn an_unwatched_folder_is_refused_a_second_time() {
+        let s = script(vec![]);
+        let mut watcher = FsEventsWatcher::spawn(s.handler, s.starter, TEST_POLL).unwrap();
         let dir = tempfile::tempdir().unwrap();
-        let (tx, _rx) = mpsc::channel::<notify::Result<Event>>();
-        let mut watcher = FsEventsWatcher::new(tx, Config::default()).unwrap();
         watcher
             .watch(dir.path(), RecursiveMode::NonRecursive)
             .unwrap();
@@ -657,189 +871,105 @@ mod tests {
             .is_err());
     }
 
-    /// What one scripted start does.
-    enum Outcome {
-        Start,
-        Fail,
-        /// Starts once the sender side says so.
-        StartWhen(mpsc::Receiver<()>),
-    }
-
-    /// Starts that report nothing of their own, so whatever the handler hears
-    /// came from a listing.
-    struct ScriptedStarts {
-        outcomes: VecDeque<Outcome>,
-        asked: mpsc::Sender<BTreeSet<PathBuf>>,
-        stopped: Arc<Mutex<Vec<usize>>>,
-        started: usize,
-    }
-
-    struct SilentStream {
-        id: usize,
-        stopped: Arc<Mutex<Vec<usize>>>,
-    }
-
-    impl StopStream for SilentStream {
-        fn stop(self) {
-            self.stopped.lock().unwrap().push(self.id);
-        }
-    }
-
-    impl StartStream for ScriptedStarts {
-        type Stream = SilentStream;
-
-        fn start(
-            &mut self,
-            _roots: &[PathBuf],
-            folders: BTreeSet<PathBuf>,
-            _handler: SharedHandler,
-        ) -> Result<SilentStream, StreamError> {
-            let _ = self.asked.send(folders);
-            match self.outcomes.pop_front().unwrap_or(Outcome::Start) {
-                Outcome::Fail => return Err(StreamError::Start),
-                Outcome::StartWhen(gate) => {
-                    let _ = gate.recv();
-                }
-                Outcome::Start => {}
-            }
-            let id = self.started;
-            self.started += 1;
-            Ok(SilentStream {
-                id,
-                stopped: self.stopped.clone(),
-            })
-        }
-    }
-
-    struct Scripted {
-        watcher: FsEventsWatcher,
-        events: mpsc::Receiver<notify::Result<Event>>,
-        asked: mpsc::Receiver<BTreeSet<PathBuf>>,
-        stopped: Arc<Mutex<Vec<usize>>>,
-    }
-
-    const TEST_POLL: Duration = Duration::from_millis(50);
-
-    fn scripted(outcomes: Vec<Outcome>) -> Scripted {
-        let (tx, events) = mpsc::channel::<notify::Result<Event>>();
-        let (asked_tx, asked) = mpsc::channel();
-        let stopped = Arc::new(Mutex::new(Vec::new()));
-        let starter = ScriptedStarts {
-            outcomes: outcomes.into(),
-            asked: asked_tx,
-            stopped: stopped.clone(),
-            started: 0,
-        };
-        let watcher = FsEventsWatcher::spawn(Arc::new(Mutex::new(tx)), starter, TEST_POLL).unwrap();
-        Scripted {
-            watcher,
-            events,
-            asked,
-            stopped,
-        }
-    }
-
-    fn asked_for(scripted: &Scripted) -> BTreeSet<PathBuf> {
-        scripted
-            .asked
-            .recv_timeout(Duration::from_secs(10))
-            .expect("a start was asked for")
-    }
-
-    fn folder() -> (tempfile::TempDir, PathBuf) {
-        let dir = tempfile::tempdir().unwrap();
-        let root = dir.path().canonicalize().unwrap();
-        (dir, root)
-    }
-
     #[test]
     fn a_failed_start_keeps_the_running_stream_and_lists_the_new_folder() {
-        let mut s = scripted(vec![Outcome::Start, Outcome::Fail]);
+        let mut k = Keeper::new(vec![Outcome::Start, Outcome::Fail]);
         let (_a, a) = folder();
         let (_b, b) = folder();
 
-        s.watcher.watch(&a, RecursiveMode::NonRecursive).unwrap();
-        asked_for(&s);
-        s.watcher.watch(&b, RecursiveMode::NonRecursive).unwrap();
-        assert_eq!(asked_for(&s), [a.clone(), b.clone()].into_iter().collect());
+        k.watch(&[&a], &a);
+        k.asked();
+        k.watch(&[&a, &b], &b);
+        assert_eq!(k.asked(), folders(&[&a, &b]));
+        assert!(
+            k.stopped().is_empty(),
+            "a failed start retired the stream that was running"
+        );
+        assert!(
+            k.keeper.retry_due.is_some(),
+            "a failed start is never retried"
+        );
 
         let file = b.join("listed.md");
         std::fs::write(&file, "x").unwrap();
+        k.list_now();
         assert!(
-            wait_for(&s.events, &file),
+            heard(&k.events, &file),
             "a folder whose stream failed to start is not listed"
-        );
-        std::thread::sleep(OVERLAP + Duration::from_millis(300));
-        assert!(
-            s.stopped.lock().unwrap().is_empty(),
-            "a failed start retired the stream that was running"
         );
     }
 
     #[test]
     fn watch_returns_while_the_stream_is_still_starting() {
         let (release, gate) = mpsc::channel();
-        let mut s = scripted(vec![Outcome::StartWhen(gate)]);
+        let s = script(vec![Outcome::StartWhen(gate)]);
+        let mut watcher = FsEventsWatcher::spawn(s.handler, s.starter, TEST_POLL).unwrap();
         let (_a, a) = folder();
 
-        let asked = Instant::now();
-        s.watcher.watch(&a, RecursiveMode::NonRecursive).unwrap();
+        let (returned_tx, returned) = mpsc::channel();
+        let watching = {
+            let a = a.clone();
+            std::thread::spawn(move || {
+                watcher.watch(&a, RecursiveMode::NonRecursive).unwrap();
+                let _ = returned_tx.send(());
+                watcher
+            })
+        };
+        s.asked.recv_timeout(BOUND).expect("a start was asked for");
+        // The start is held at the gate until the test releases it.
         assert!(
-            asked.elapsed() < Duration::from_secs(1),
+            returned.recv_timeout(BOUND).is_ok(),
             "watch waited for the stream"
         );
-        asked_for(&s);
+        let _watcher = watching.join().unwrap();
 
         let file = a.join("before-the-stream.md");
         std::fs::write(&file, "x").unwrap();
         release.send(()).unwrap();
         assert!(
-            wait_for(&s.events, &file),
+            wait_for(&s.events, &file, BOUND),
             "a write before the stream ran was never reported"
         );
     }
 
     #[test]
     fn a_start_after_a_failure_takes_over_the_listed_folder() {
-        let mut s = scripted(vec![Outcome::Fail, Outcome::Start]);
+        let mut k = Keeper::new(vec![Outcome::Fail, Outcome::Start]);
         let (_a, a) = folder();
         let (_b, b) = folder();
 
-        s.watcher.watch(&a, RecursiveMode::NonRecursive).unwrap();
-        asked_for(&s);
+        k.watch(&[&a], &a);
+        k.asked();
         let listed = a.join("listed.md");
         std::fs::write(&listed, "x").unwrap();
-        assert!(wait_for(&s.events, &listed), "the folder is not listed");
+        k.list_now();
+        assert!(heard(&k.events, &listed), "the folder is not listed");
 
-        s.watcher.watch(&b, RecursiveMode::NonRecursive).unwrap();
+        let caught_up = a.join("before-the-takeover.md");
+        std::fs::write(&caught_up, "y").unwrap();
+        k.watch(&[&a, &b], &b);
         assert_eq!(
-            asked_for(&s),
-            [a.clone(), b.clone()].into_iter().collect(),
+            k.asked(),
+            folders(&[&a, &b]),
             "the retry left out the folder whose start failed"
         );
-        // The stream reports nothing here; the listing it took over is gone.
-        std::thread::sleep(TEST_POLL * 4);
-        while s.events.try_recv().is_ok() {}
-        std::fs::write(a.join("after.md"), "y").unwrap();
-        std::thread::sleep(TEST_POLL * 6);
         assert!(
-            s.events.try_recv().is_err(),
+            heard(&k.events, &caught_up),
+            "a change the listing had not reached was lost in the takeover"
+        );
+        assert!(
+            k.keeper.polled.is_empty() && k.keeper.poll_due.is_none(),
             "a folder a stream reports is still listed"
         );
     }
 
     #[test]
     fn an_empty_set_retires_the_running_stream() {
-        let mut s = scripted(vec![Outcome::Start]);
+        let mut k = Keeper::new(vec![Outcome::Start]);
         let (_a, a) = folder();
 
-        s.watcher.watch(&a, RecursiveMode::NonRecursive).unwrap();
-        asked_for(&s);
-        s.watcher.unwatch(&a).unwrap();
-        let deadline = Instant::now() + OVERLAP + Duration::from_secs(5);
-        while s.stopped.lock().unwrap().is_empty() && Instant::now() < deadline {
-            std::thread::sleep(Duration::from_millis(20));
-        }
-        assert_eq!(*s.stopped.lock().unwrap(), vec![0]);
+        k.watch(&[&a], &a);
+        k.keeper.apply(BTreeSet::new(), HashMap::new());
+        assert_eq!(k.stopped(), vec![0]);
     }
 }

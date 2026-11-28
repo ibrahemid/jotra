@@ -362,10 +362,19 @@ impl BufferStore {
     /// neither a hex view nor a document Jotra generated is that. Neither file
     /// is read ([`Self::reindex_target`]).
     pub fn reindex_buffer(&self, id: &str) -> StorageResult<()> {
+        self.reindex_buffer_reading(id, read_indexable_text)
+    }
+
+    /// [`Self::reindex_buffer`], reading the file with `read`.
+    fn reindex_buffer_reading(
+        &self,
+        id: &str,
+        read: impl FnOnce(&BufferDocument) -> String,
+    ) -> StorageResult<()> {
         let Some(doc) = self.reindex_target(id)? else {
             return Ok(());
         };
-        let content = read_indexable_text(&doc);
+        let content = read(&doc);
         self.reindex_with(&doc, &content)
     }
 
@@ -1740,5 +1749,92 @@ impl ReadText {
             ReadBytes::Text => Some(self.text.as_bytes()),
             ReadBytes::Raw(bytes) => Some(bytes),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use jotra_core::buffer::document::BufferDocument;
+    use jotra_core::buffer::manager::BufferManager;
+    use jotra_core::file_ops::THRESHOLD_NORMAL_BYTES;
+    use tempfile::TempDir;
+
+    use super::BufferStore;
+    use crate::database::connection::open_database;
+    use crate::database::migrations::run_migrations;
+    use crate::notes_index::NotesIndexStore;
+
+    /// A store over a notes folder in `dir`, with a row for a file named
+    /// `name` in that folder, recorded as `size_bytes` long and `read_only`.
+    fn store_with_note(
+        dir: &TempDir,
+        name: &str,
+        size_bytes: u64,
+        read_only: bool,
+    ) -> (BufferStore, String) {
+        let db_path = dir.path().join("jotra.db");
+        let conn = open_database(&db_path).expect("open_database");
+        run_migrations(&conn).expect("migrations");
+        let notes = dir.path().join("Jotra");
+        std::fs::create_dir_all(&notes).expect("notes dir");
+        let notes = notes.canonicalize().expect("canonical notes");
+        let path = notes.join(name);
+        std::fs::write(&path, "# Note\n").expect("write the note");
+        let mut store = BufferStore::new(conn, dir.path().join("buffers"));
+        store.set_notes_root(notes);
+        store.set_notes_index(Arc::new(NotesIndexStore::open(&db_path).expect("index")));
+        let doc = BufferManager::new()
+            .open_external(path.to_string_lossy().into_owned())
+            .expect("open");
+        let doc = BufferDocument {
+            size_bytes,
+            read_only,
+            ..doc
+        };
+        store.open_from_path_unindexed(&doc).expect("row");
+        (store, doc.id)
+    }
+
+    /// Whether a reindex of `id` read its file.
+    fn reindex_reads_the_file(store: &BufferStore, id: &str) -> bool {
+        let mut read = false;
+        store
+            .reindex_buffer_reading(id, |_| {
+                read = true;
+                String::new()
+            })
+            .expect("reindex");
+        read
+    }
+
+    #[test]
+    fn a_reindex_of_a_note_reads_its_file() {
+        let dir = TempDir::new().expect("tempdir");
+        let (store, id) = store_with_note(&dir, "Plan.md", 7, false);
+        assert!(reindex_reads_the_file(&store, &id));
+    }
+
+    // Before the size check moved ahead of the read, the reindex read the whole
+    // file and only then found it too large to index.
+    #[test]
+    fn a_reindex_of_a_row_over_the_normal_tier_reads_nothing() {
+        let dir = TempDir::new().expect("tempdir");
+        let (store, id) = store_with_note(&dir, "big.log", THRESHOLD_NORMAL_BYTES + 1, false);
+        assert!(
+            !reindex_reads_the_file(&store, &id),
+            "the reindex read a file the index does not take"
+        );
+    }
+
+    #[test]
+    fn a_reindex_of_a_read_only_row_reads_nothing() {
+        let dir = TempDir::new().expect("tempdir");
+        let (store, id) = store_with_note(&dir, "generated.md", 10, true);
+        assert!(
+            !reindex_reads_the_file(&store, &id),
+            "the reindex read a read-only row's file"
+        );
     }
 }

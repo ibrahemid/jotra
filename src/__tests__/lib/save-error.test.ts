@@ -3,6 +3,7 @@ import { describe, it, expect } from "vitest";
 import {
   asSentence,
   describeSaveFailure,
+  describeSkippedNote,
   formatRenameError,
   formatSaveError,
   isRetryableSaveError,
@@ -74,6 +75,7 @@ describe("formatSaveError", () => {
       "ERR_FILE_IN_USE",
       "ERR_FILE_MISSING",
       "ERR_WRITE_TIMED_OUT",
+      "ERR_DISK_FULL",
       "ERR_WRITE_FAILED",
       "Consistency error: note has no file",
     ];
@@ -109,12 +111,26 @@ describe("formatSaveError", () => {
     expect(formatSaveError(new Error("ERR_WRITE_TIMED_OUT: io error (os error 60)"))).toBe(
       "the disk stopped responding. Check that the drive is still connected.",
     );
-    expect(formatSaveError(new Error("ERR_WRITE_FAILED: io error (os error 28)"))).toBe(
+    expect(formatSaveError(new Error("ERR_DISK_FULL: io error (os error 28)"))).toBe(
+      "the disk is full.",
+    );
+    expect(formatSaveError(new Error("ERR_WRITE_FAILED: io error (os error 5)"))).toBe(
       "the disk would not take the write.",
     );
     expect(formatSaveError(new Error("ERR_NOTE_READ_ONLY: note 9f1c0f6e is read-only"))).toBe(
       "this file opened read-only, so it cannot be written to.",
     );
+  });
+
+  it("says a full disk is full, for a save and for a note a rename left alone", () => {
+    const full = new Error("ERR_DISK_FULL: io error: No space left on device (os error 28)");
+    expect(describeSaveFailure(full)).toEqual({
+      code: "ERR_DISK_FULL",
+      message: "the disk is full.",
+      retryable: true,
+    });
+    expect(isRetryableSaveError(full)).toBe(true);
+    expect(describeSkippedNote("ERR_DISK_FULL")).toBe("is on a disk that is full.");
   });
 
   it("says the one thing that is true for a failure with no code, rather than the raw text", () => {

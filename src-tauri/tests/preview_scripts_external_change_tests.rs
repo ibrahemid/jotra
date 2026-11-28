@@ -3,31 +3,27 @@
 //!
 //! The app's open-file watcher runs over a real folder with the app's tracking
 //! and ignore set, and turns the opt-in off through that tracking before it
-//! reports the change; a receiver on the bus stands in for the frontend. A
-//! change no watcher sees, made while the tab is closed or while Jotra is not
-//! running, is caught when the editor reads the file back: the digest it
-//! records is not the one the opt-in covers. Those cases run through the app's
-//! own close, History reopen, read and render.
+//! reports the change; the events it returns are what the frontend would hear.
+//! The test hands it what the platform reports. A change no watcher sees, made
+//! while the tab is closed or while Jotra is not running, is caught when the
+//! editor reads the file back: the digest it records is not the one the opt-in
+//! covers. Those cases run through the app's own close, History reopen, read
+//! and render.
 
+#[path = "support/app_state.rs"]
+mod app_state;
+#[path = "support/fed_watchers.rs"]
+mod fed_watchers;
+
+use app_state::AppStateBuilder;
+use fed_watchers::FedWatchers;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::AtomicBool;
-use std::sync::{mpsc, Arc, Mutex, RwLock};
-use std::time::{Duration, Instant};
+use std::sync::{mpsc, Arc};
+use std::time::Duration;
 
-use jotra_core::config::JotraConfig;
-use jotra_core::events::bus::{EventBus, JotraEvent};
-use jotra_core::preview::{ContentRendererRegistry, RenderRequest};
-use jotra_core::update::UpdatePhase;
+use jotra_core::events::bus::JotraEvent;
+use jotra_core::preview::RenderRequest;
 use jotra_core::watcher::change_event::ExternalChange;
-use jotra_core::watcher::ignore::DEFAULT_IGNORE_TTL;
-use jotra_core::watcher::reconcile::ReconcileGate;
-use jotra_plugin::transform::TransformRegistry;
-use jotra_storage::buffer_store::BufferStore;
-use jotra_storage::config_store::ConfigStore;
-use jotra_storage::database::connection::open_database;
-use jotra_storage::database::migrations::run_migrations;
-use jotra_storage::layout_state::LayoutStateStore;
-use jotra_storage::notes_index::NotesIndexStore;
 use jotra_tauri_lib::commands::buffer::{
     close_buffer_inner, read_buffer_content_inner, save_buffer_content_inner,
 };
@@ -38,123 +34,25 @@ use jotra_tauri_lib::commands::preview::{
     lapse_scripts_opt_in_now, preview_get_scripts_inner, preview_set_scripts_inner,
     render_into_cache,
 };
-use jotra_tauri_lib::preview::handler::{RenderCache, RenderedDoc};
+use jotra_tauri_lib::preview::handler::RenderedDoc;
 use jotra_tauri_lib::preview::renderers::HtmlRenderer;
-use jotra_tauri_lib::quit::QuitState;
-use jotra_tauri_lib::security::{canonicalize_for_authorization, AuthorizedPaths};
+use jotra_tauri_lib::security::canonicalize_for_authorization;
 use jotra_tauri_lib::state::AppState;
-use jotra_tauri_lib::watcher::handler::create_ignore_set;
-use jotra_tauri_lib::watcher::moves::FileTracking;
-use jotra_tauri_lib::watcher::open_files::start_open_file_watcher;
 use tempfile::TempDir;
 
-/// Long enough for the 500 ms debounce plus the platform's own notification
-/// latency, and for the ignore stamp to be nowhere near expiry.
-const SETTLE: Duration = Duration::from_secs(3);
+/// Long enough for a loaded machine; only a failing run waits it out.
+const DELIVERY_BOUND: Duration = Duration::from_secs(15);
 
 fn make_state(dir: &TempDir) -> AppState {
-    let jotra_dir = dir.path().to_path_buf();
-    let buffers_dir = jotra_dir.join("buffers");
-    std::fs::create_dir_all(&buffers_dir).expect("buffers dir");
-
-    let notes_root = jotra_dir.join("Jotra");
-    std::fs::create_dir_all(&notes_root).expect("notes folder");
-    let notes_root = jotra_tauri_lib::security::canonicalize_root(&notes_root).expect("canonical");
-
-    let db_path = jotra_dir.join("jotra.db");
-    let conn = open_database(&db_path).expect("open db");
-    run_migrations(&conn).expect("migrations");
-
-    let note_history = Arc::new(
-        jotra_storage::note_history::NoteHistoryStore::open(&jotra_dir).expect("version store"),
-    );
-
-    AppState {
-        store: Mutex::new(BufferStore::new(conn, buffers_dir.clone())),
-        config_store: ConfigStore::new(jotra_dir.join("config.toml")),
-        config: Mutex::new(JotraConfig::default()),
-        jotra_dir,
-        buffers_dir,
-        notes_root: RwLock::new(notes_root),
-        first_run: false,
-        first_run_finished: AtomicBool::new(false),
-        menu_apps: Mutex::new(None),
-        retitle_watch: Arc::new(jotra_tauri_lib::first_run::RetitleWatch::new()),
-        notes_root_fallback: RwLock::new(None),
-        watcher_ignore: create_ignore_set(),
-        watcher: Mutex::new(None),
-        notes_watcher: Mutex::new(None),
-        open_file_watcher: Mutex::new(None),
-        file_tracking: Mutex::new(None),
-        notes_index: Arc::new(NotesIndexStore::open(&db_path).expect("notes index db")),
-        note_history,
-        notes_index_cancel: Arc::new(AtomicBool::new(false)),
-        notes_reconcile: Arc::new(ReconcileGate::new()),
-        quit: Arc::new(QuitState::new()),
-        removal_holds: Default::default(),
-        pending_opens: Mutex::new(Vec::new()),
-        pending_lines: Mutex::new(Default::default()),
-        cli_waits: Mutex::new(Default::default()),
-        frontend_ready: AtomicBool::new(false),
-        window_revealed: AtomicBool::new(false),
-        window_dismissed: AtomicBool::new(false),
-        transforms: RwLock::new(TransformRegistry::new()),
-        event_bus: Arc::new(EventBus::new()),
-        update_phase: Mutex::new(UpdatePhase::default()),
-        authorized_paths: AuthorizedPaths::new(),
-        preview_registry: Arc::new(RwLock::new(ContentRendererRegistry::new())),
-        preview_render_cache: Arc::new(RenderCache::new()),
-        layout_state: LayoutStateStore::new(open_database(&db_path).expect("layout db")),
-        tab_rows: jotra_storage::tab_rows::TabRowStore::new(
-            open_database(&db_path).expect("tab rows db"),
-        ),
-        command_usage: jotra_storage::command_usage::CommandUsageStore::new(
-            open_database(&db_path).expect("usage db"),
-        ),
-        config_diagnostics: std::sync::Mutex::new(Vec::new()),
-        recovered_buffers: Mutex::new(Vec::new()),
-        was_dirty_shutdown: false,
-        workspace_root: Mutex::new(None),
-        workspace_watcher: Mutex::new(None),
-        inbox_root: Mutex::new(None),
-        inbox_watcher: Mutex::new(None),
-        fts_scheduler: jotra_tauri_lib::fts_scheduler::FtsScheduler::new(),
-        workspace_index: Arc::new(RwLock::new(
-            jotra_tauri_lib::workspace_index::WorkspaceIndex::new(None),
-        )),
-        search_generation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
-        last_disk_hash: Mutex::new(std::collections::HashMap::new()),
-        source_records: Mutex::new(std::collections::HashMap::new()),
-        buffer_writes: Default::default(),
-    }
-}
-
-/// Every change the bus carries for a tab.
-fn frontend_view(state: &AppState) -> mpsc::Receiver<JotraEvent> {
-    let (tx, rx) = mpsc::channel();
-    state.event_bus.subscribe(move |event| {
-        if let JotraEvent::BufferExternal { .. } = event {
-            let _ = tx.send(event.clone());
-        }
-    });
-    rx
+    AppStateBuilder::new(dir.path()).build()
 }
 
 /// A state with the open-file watcher following its tabs through the app's
-/// tracking, and a receiver for the changes the frontend would hear.
-fn watching_state(dir: &TempDir) -> (Arc<AppState>, mpsc::Receiver<JotraEvent>) {
+/// tracking, and the watcher the test hands deliveries to.
+fn watching_state(dir: &TempDir) -> (Arc<AppState>, FedWatchers) {
     let state = Arc::new(make_state(dir));
-    let rx = frontend_view(&state);
-    *state.file_tracking.lock().expect("tracking slot") = Some(FileTracking::of_state(&state));
-    let open_files = start_open_file_watcher(
-        state.event_bus.clone(),
-        state.watcher_ignore.clone(),
-        &state.notes_root(),
-        state.file_tracking(),
-    )
-    .expect("start the open file watcher");
-    *state.open_file_watcher.lock().expect("watcher slot") = Some(open_files);
-    (state, rx)
+    let fed = FedWatchers::install(&state);
+    (state, fed)
 }
 
 /// `name` in `dir` opened as a tab, its scripts turned on and a render of it
@@ -234,20 +132,28 @@ fn rendered_with_scripts(state: &AppState, id: &str, text: &str) -> bool {
     cached_scripts_on(state, id)
 }
 
-/// The changes the bus carried for `id` within `SETTLE`.
-fn changes_to(rx: &mpsc::Receiver<JotraEvent>, id: &str) -> Vec<ExternalChange> {
-    let deadline = Instant::now() + SETTLE;
-    let mut seen = Vec::new();
-    while let Some(left) = deadline.checked_duration_since(Instant::now()) {
-        match rx.recv_timeout(left) {
-            Ok(JotraEvent::BufferExternal {
+/// The changes `told` carries for `id`.
+fn changes_to(told: &[JotraEvent], id: &str) -> Vec<ExternalChange> {
+    told.iter()
+        .filter_map(|event| match event {
+            JotraEvent::BufferExternal {
                 buffer_id, change, ..
-            }) if buffer_id == id => seen.push(change),
-            Ok(_) => {}
-            Err(_) => break,
-        }
-    }
-    seen
+            } if buffer_id == id => Some(change.clone()),
+            _ => None,
+        })
+        .collect()
+}
+
+/// Delivers the platform's report of the file as it was opened in a batch of
+/// its own, as time between the open and the next change gives it, so that
+/// change is judged on what it did alone.
+fn the_open_is_delivered_apart(fed: &mut FedWatchers, folder: &Path, id: &str) {
+    let told = fed.platform_reports(&[folder], &[]);
+    assert_eq!(
+        changes_to(&told, id),
+        Vec::<ExternalChange>::new(),
+        "opening the file was reported as a change to it"
+    );
 }
 
 fn write_by_temp_and_rename(path: &Path, bytes: &[u8]) {
@@ -260,17 +166,19 @@ fn write_by_temp_and_rename(path: &Path, bytes: &[u8]) {
 fn a_file_another_program_rewrites_loses_its_scripts_opt_in() {
     let dir = TempDir::new().expect("temp dir");
     let downloads = TempDir::new().expect("a folder outside the notes folder");
-    let (state, rx) = watching_state(&dir);
+    let (state, mut fed) = watching_state(&dir);
     let (id, file) = opted_in(
         &state,
         downloads.path(),
         "report.html",
         "<p>read</p><script>one()</script>",
     );
+    the_open_is_delivered_apart(&mut fed, downloads.path(), &id);
 
     write_by_temp_and_rename(&file, b"<p>downloaded again</p><script>two()</script>");
+    let told = fed.platform_reports(&[downloads.path()], &[]);
 
-    assert_eq!(changes_to(&rx, &id), vec![ExternalChange::Modified]);
+    assert_eq!(changes_to(&told, &id), vec![ExternalChange::Modified]);
     assert!(
         !scripts_on(&state, &id),
         "the replaced file kept the opt-in given to the one it replaced"
@@ -285,47 +193,49 @@ fn a_file_another_program_rewrites_loses_its_scripts_opt_in() {
 fn a_rewrite_is_reported_and_lapses_the_opt_in_while_a_command_holds_the_store() {
     let dir = TempDir::new().expect("temp dir");
     let downloads = TempDir::new().expect("a folder outside the notes folder");
-    let (state, rx) = watching_state(&dir);
+    let (state, mut fed) = watching_state(&dir);
     let (id, file) = opted_in(
         &state,
         downloads.path(),
         "report.html",
         "<p>read</p><script>one()</script>",
     );
+    the_open_is_delivered_apart(&mut fed, downloads.path(), &id);
 
     let held = state.store.lock().expect("store");
     write_by_temp_and_rename(&file, b"<p>downloaded again</p><script>two()</script>");
-    let seen = changes_to(&rx, &id);
+    let (reported, told) = mpsc::channel();
+    let folder = downloads.path().to_path_buf();
+    let watcher = std::thread::spawn(move || {
+        let _ = reported.send(fed.platform_reports(&[&folder], &[]));
+    });
+    let told = told.recv_timeout(DELIVERY_BOUND);
     drop(held);
+    watcher.join().expect("the watcher's thread");
 
-    assert_eq!(
-        seen,
-        vec![ExternalChange::Modified],
-        "the watcher waited on the store's lock to report the change"
-    );
+    let told = told.expect("the watcher waited on the store's lock to report the change");
+    assert_eq!(changes_to(&told, &id), vec![ExternalChange::Modified]);
     assert!(!row_opted_in(&state, &id));
     assert!(!cached_scripts_on(&state, &id));
 }
 
 #[test]
 fn a_save_jotra_makes_keeps_the_scripts_opt_in() {
-    assert!(
-        DEFAULT_IGNORE_TTL > SETTLE,
-        "the stamp has to outlive the wait, or this passes for the wrong reason"
-    );
     let dir = TempDir::new().expect("temp dir");
     let downloads = TempDir::new().expect("a folder outside the notes folder");
-    let (state, rx) = watching_state(&dir);
+    let (state, mut fed) = watching_state(&dir);
     let (id, file) = opted_in(&state, downloads.path(), "report.html", "<p>read</p>");
+    the_open_is_delivered_apart(&mut fed, downloads.path(), &id);
 
     save_buffer_content_inner(&state, &id, "<p>edited in Jotra</p>").expect("save");
+    let told = fed.platform_reports(&[downloads.path()], &[]);
 
     assert_eq!(
         std::fs::read_to_string(&file).expect("read the file"),
         "<p>edited in Jotra</p>"
     );
     assert_eq!(
-        changes_to(&rx, &id),
+        changes_to(&told, &id),
         Vec::<ExternalChange>::new(),
         "Jotra's own save came back as somebody else's change"
     );
@@ -340,12 +250,14 @@ fn a_save_jotra_makes_keeps_the_scripts_opt_in() {
 fn a_file_another_program_moves_keeps_its_scripts_opt_in() {
     let dir = TempDir::new().expect("temp dir");
     let downloads = TempDir::new().expect("a folder outside the notes folder");
-    let (state, rx) = watching_state(&dir);
+    let (state, mut fed) = watching_state(&dir);
     let (id, file) = opted_in(&state, downloads.path(), "report.html", "<p>read</p>");
+    the_open_is_delivered_apart(&mut fed, downloads.path(), &id);
 
     std::fs::rename(&file, file.with_file_name("renamed.html")).expect("move the file");
+    let told = fed.platform_reports(&[downloads.path()], &[&file]);
 
-    assert_eq!(changes_to(&rx, &id), vec![ExternalChange::Moved]);
+    assert_eq!(changes_to(&told, &id), vec![ExternalChange::Moved]);
     assert!(
         scripts_on(&state, &id),
         "a move changes no bytes, and it turned the scripts off"

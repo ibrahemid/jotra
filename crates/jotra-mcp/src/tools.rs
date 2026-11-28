@@ -32,7 +32,8 @@
 //! one facade a note's file is ever written by (ADR-032 section 4), under
 //! `WriteOrigin::Mcp` and a policy that refuses with a copy, so a note that
 //! changed since the client read it keeps what it holds and the client's text
-//! lands beside it. What the client read is the `expected_hash` it passes or,
+//! lands beside it. A client the person set to Ask first is refused with
+//! nothing beside the note (ADR-053). What the client read is the `expected_hash` it passes or,
 //! without one, the text this session last saw the note hold. A note the
 //! session has not seen is refused unless the client passes `overwrite`, and
 //! an overwrite is logged under its own action, [`OVERWRITE_ACTION`].
@@ -111,7 +112,7 @@ pub struct HitPage {
 /// registers them, the gate reads the split, and the settings row shows the
 /// user the same names, so none of the three can drift
 /// ([`jotra_core::tools`]).
-pub use jotra_core::tools::{CONTEXT_TOOLS, READ_TOOLS, WRITE_TOOLS};
+pub use jotra_core::tools::{CONTEXT_TOOLS, READ_TOOLS, SHOW_TOOLS, WRITE_TOOLS};
 
 /// The tool that sees the file open in Jotra (ADR-053), and the action its
 /// activity line carries.
@@ -229,6 +230,13 @@ pub enum ToolError {
         /// The path as the client wrote it.
         path: String,
     },
+    /// The write names a file the notes folder skips, such as one inside
+    /// `.obsidian`. Nothing was written.
+    #[error("{path} is in a folder or under a name Jotra skips, such as .obsidian. Nothing was written.")]
+    SkippedName {
+        /// The path as the client wrote it.
+        path: String,
+    },
     /// The index is absent, unreadable, or at another version.
     #[error("Jotra's file index is not readable. Open Jotra once and it builds one.")]
     IndexUnavailable,
@@ -265,7 +273,8 @@ pub enum ToolError {
         bytes: u64,
     },
     /// The note holds something other than what the client read, so the write
-    /// was not made. The client's text is beside the note.
+    /// was not made. The client's text is beside the note when `conflict_copy`
+    /// names it, and never for a write held for the person's answer.
     #[error("{path} changed on disk after it was read, and was left as it is.{}",
         .conflict_copy.as_ref().map(|copy| format!(" What you sent is at {copy}.")).unwrap_or_default())]
     Conflict {
@@ -427,6 +436,16 @@ pub struct TodayReceipt {
     pub open_url: Option<String>,
 }
 
+/// The bytes a `today` call wrote, for its activity line: the text it added,
+/// zero for a day's file made with nothing in it, none when it only found it.
+fn today_bytes_written(receipt: &TodayReceipt, text: Option<&str>) -> Option<u64> {
+    match text {
+        Some(text) if receipt.changed && !text.is_empty() => Some(text.len() as u64),
+        _ if receipt.created => Some(0),
+        _ => None,
+    }
+}
+
 /// What `open_in_jotra` answers.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ShownReceipt {
@@ -437,6 +456,9 @@ pub struct ShownReceipt {
     pub line: Option<u32>,
     /// The `jotra://` link Jotra was handed.
     pub open_url: String,
+    /// Jotra was started for this and shows the file as it opens.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub starting: bool,
 }
 
 /// What `get_context` answers (ADR-053).
@@ -570,7 +592,16 @@ pub trait JotraOpener: Send + Sync {
     /// # Errors
     ///
     /// [`JotraNotReached`]: Jotra did not take the link.
-    fn open_link(&self, link: &str) -> Result<(), JotraNotReached>;
+    fn open_link(&self, link: &str) -> Result<LinkHanded, JotraNotReached>;
+}
+
+/// How far a link handed to Jotra got.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LinkHanded {
+    /// Jotra took the link.
+    Taken,
+    /// Jotra was started and takes the link as it opens.
+    Starting,
 }
 
 /// Jotra did not take a link.
@@ -583,7 +614,7 @@ pub struct JotraNotReached;
 pub struct NoOpener;
 
 impl JotraOpener for NoOpener {
-    fn open_link(&self, _link: &str) -> Result<(), JotraNotReached> {
+    fn open_link(&self, _link: &str) -> Result<LinkHanded, JotraNotReached> {
         Err(JotraNotReached)
     }
 }
@@ -1069,7 +1100,8 @@ impl ToolHost {
     /// write handed back. Given it, the write is made only while the note still
     /// holds that text: a note somebody edited in between keeps what it holds,
     /// the text handed in is put beside it as a dated copy, and
-    /// [`ToolError::Conflict`] names the copy (ADR-028 section 5). Omitted, the
+    /// [`ToolError::Conflict`] names the copy (ADR-028 section 5). A write held
+    /// for the person's answer puts nothing beside it. Omitted, the
     /// same comparison is made against the text this session last saw the note
     /// hold, through a read or its own write, and a note this session has not
     /// seen is answered with [`ToolError::HashRequired`] and left alone.
@@ -1282,7 +1314,10 @@ impl ToolHost {
                 .as_ref()
                 .ok()
                 .map(|receipt| logged_path(&root, &receipt.path)),
-            text.map(|text| text.len() as u64),
+            result
+                .as_ref()
+                .ok()
+                .and_then(|receipt| today_bytes_written(receipt, text)),
             decision_of(&result),
         );
         result
@@ -1423,7 +1458,8 @@ impl ToolHost {
                 .ok_or_else(|| ToolError::NotInAppFolder {
                     path: path.to_string(),
                 })?;
-        self.opener
+        let handed = self
+            .opener
             .open_link(&open_url)
             .map_err(|_| ToolError::JotraUnreachable {
                 path: path.to_string(),
@@ -1432,6 +1468,7 @@ impl ToolHost {
             path: spelled_in(&root, &summary.path),
             line,
             open_url,
+            starting: handed == LinkHanded::Starting,
         })
     }
 
@@ -1992,6 +2029,7 @@ fn tool_error(root: &Path, client: &ClientId, tool: &str, error: HostError) -> T
             tool: tool.to_string(),
         },
         HostError::OutsideNotesFolder { path } => ToolError::OutsideNotesFolder { path },
+        HostError::SkippedName { path } => ToolError::SkippedName { path },
         HostError::IndexUnavailable => ToolError::IndexUnavailable,
         HostError::NotFound { path } => ToolError::NotFound { path },
         HostError::TooLarge { path, bytes } => ToolError::TooLarge { path, bytes },
@@ -4680,9 +4718,18 @@ mod tests {
     struct RecordingOpener(Arc<Mutex<Vec<String>>>);
 
     impl JotraOpener for RecordingOpener {
-        fn open_link(&self, link: &str) -> Result<(), JotraNotReached> {
+        fn open_link(&self, link: &str) -> Result<LinkHanded, JotraNotReached> {
             self.0.lock().expect("links").push(link.to_string());
-            Ok(())
+            Ok(LinkHanded::Taken)
+        }
+    }
+
+    /// Starts Jotra for every link and leaves the link waiting for it.
+    struct StartingOpener;
+
+    impl JotraOpener for StartingOpener {
+        fn open_link(&self, _link: &str) -> Result<LinkHanded, JotraNotReached> {
+            Ok(LinkHanded::Starting)
         }
     }
 
@@ -4819,6 +4866,32 @@ mod tests {
     }
 
     #[test]
+    fn todays_activity_line_counts_only_the_text_it_added() {
+        let fixture = fixture();
+        let host = approved_host(&fixture, true, true);
+        host.today(&client(), None).expect("today's file");
+        let made = records(&fixture);
+        assert_eq!(made.first().map(|record| record.bytes), Some(Some(0)));
+
+        let receipt = |created, changed| TodayReceipt {
+            path: "Today.md".into(),
+            created,
+            changed,
+            open_url: None,
+        };
+        assert_eq!(today_bytes_written(&receipt(false, false), None), None);
+        assert_eq!(today_bytes_written(&receipt(false, false), Some("")), None);
+        assert_eq!(
+            today_bytes_written(&receipt(false, true), Some("Called")),
+            Some(6)
+        );
+        assert_eq!(
+            today_bytes_written(&receipt(true, true), Some("Called")),
+            Some(6)
+        );
+    }
+
+    #[test]
     fn today_is_a_write_and_a_reader_cannot_make_the_file() {
         let fixture = fixture();
         let host = approved_host(&fixture, true, false);
@@ -4850,6 +4923,31 @@ mod tests {
                 path: "Projects/Launch Plan.md".to_string(),
                 line: Some(12)
             })
+        );
+    }
+
+    #[test]
+    fn open_in_jotra_answers_while_jotra_is_still_starting() {
+        let fixture = fixture();
+        write_note(&fixture, "Plan.md", "one\n");
+        let taken = approved_host(&fixture, true, false)
+            .with_opener(Box::new(RecordingOpener::default()))
+            .open_in_jotra(&client(), "Plan.md", None)
+            .expect("shown");
+        assert!(!taken.starting);
+        assert!(serde_json::to_value(&taken)
+            .expect("json")
+            .get("starting")
+            .is_none());
+
+        let starting = approved_host(&fixture, true, false)
+            .with_opener(Box::new(StartingOpener))
+            .open_in_jotra(&client(), "Plan.md", None)
+            .expect("handed over");
+        assert!(starting.starting);
+        assert_eq!(
+            serde_json::to_value(&starting).expect("json")["starting"],
+            true
         );
     }
 

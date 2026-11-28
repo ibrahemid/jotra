@@ -23,6 +23,7 @@ const EXPECTED_ROWS: ReadonlyArray<[string, string, string, string[]]> = [
   ["editor.tab_size", "editor", "Tab size", ["tab", "indent", "spaces", "width"]],
   ["editor.word_wrap", "editor", "Word wrap", ["wrap", "word", "line", "soft wrap"]],
   ["editor.reading_width", "editor", "Reading width", ["reading", "width", "measure", "line length", "column", "narrow", "center"]],
+  ["editor.reading_measure", "editor", "Line length", ["line length", "reading", "width", "measure", "narrow", "medium", "wide", "column"]],
   ["editor.markdown_editing", "editor", "Markdown shortcuts", ["markdown", "editing", "bold", "italic", "strikethrough", "link", "shortcuts", "checkbox", "list"]],
   ["preview.layout_md", "editor", "Markdown opens in", ["layout", "markdown", "md", "text", "preview", "inline", "source"]],
   ["editor.load_remote_images", "editor", "Load web images", ["image", "images", "remote", "web", "url", "http", "https", "load", "privacy", "network", "markdown"]],

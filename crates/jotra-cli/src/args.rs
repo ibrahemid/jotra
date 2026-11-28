@@ -136,6 +136,10 @@ pub enum Command {
         /// yet is created
         #[arg(value_name = "FILE")]
         file: String,
+        /// With -, wait however long stdin takes to close; without it, an
+        /// open stdin with nothing on it for 5 seconds exits 1
+        #[arg(value_name = "-", value_parser = ["-"], hide_possible_values = true)]
+        stdin: Option<String>,
         /// Print a JSON document
         #[arg(long)]
         json: bool,
@@ -145,6 +149,15 @@ pub enum Command {
         /// Add piped stdin to the end of today's file first
         #[arg(long)]
         append: bool,
+        /// With - and --append, wait however long stdin takes to close;
+        /// without it, an open stdin with nothing on it for 5 seconds exits 1
+        #[arg(
+            value_name = "-",
+            value_parser = ["-"],
+            hide_possible_values = true,
+            requires = "append"
+        )]
+        stdin: Option<String>,
         /// Print the path without opening Jotra
         #[arg(long)]
         no_open: bool,
@@ -169,6 +182,10 @@ pub enum Command {
         /// The file's name; with none, Jotra names it
         #[arg(value_name = "NAME")]
         name: Option<String>,
+        /// With -, wait however long stdin takes to close; without it, an
+        /// open stdin with nothing on it for 5 seconds exits 1
+        #[arg(value_name = "-", value_parser = ["-"], hide_possible_values = true)]
+        stdin: Option<String>,
         /// Print a JSON document
         #[arg(long)]
         json: bool,
@@ -252,22 +269,38 @@ where
         Some(Command::Search { query, limit, json }) => Verb::Search { query, limit, json },
         Some(Command::Cat { file, json }) => Verb::Cat { note: file, json },
         Some(Command::Ls { folder, json }) => Verb::Ls { folder, json },
-        Some(Command::Append { file, json }) => Verb::Append { note: file, json },
+        Some(Command::Append { file, stdin, json }) => Verb::Append {
+            note: file,
+            json,
+            wait_for_stdin: stdin.is_some(),
+        },
         Some(Command::Today {
             append,
+            stdin,
             no_open,
             json,
         }) => Verb::Today {
             append,
             open: !no_open,
             json,
+            wait_for_stdin: stdin.is_some(),
         },
         Some(Command::Open { name, wait, json }) => Verb::Open {
             note: name,
             wait,
             json,
         },
-        Some(Command::New { name, json }) => Verb::New { name, json },
+        Some(Command::New { name, stdin, json }) => {
+            let (name, wait_for_stdin) = match (name, stdin) {
+                (Some(name), None) if name == "-" => (None, true),
+                (name, stdin) => (name, stdin.is_some()),
+            };
+            Verb::New {
+                name,
+                json,
+                wait_for_stdin,
+            }
+        }
 
         Some(Command::Rename {
             file,
@@ -389,9 +422,63 @@ mod tests {
             parse(&["new", "Ideas", "--json"]).unwrap(),
             Invocation::Verb(Verb::New {
                 name: Some("Ideas".to_string()),
-                json: true
+                json: true,
+                wait_for_stdin: false
             })
         );
+    }
+
+    #[test]
+    fn a_lone_dash_asks_the_stdin_verbs_to_wait_for_the_pipe_to_close() {
+        assert_eq!(
+            parse(&["new", "-"]).unwrap(),
+            Invocation::Verb(Verb::New {
+                name: None,
+                json: false,
+                wait_for_stdin: true
+            })
+        );
+        assert_eq!(
+            parse(&["new", "Ideas", "-", "--json"]).unwrap(),
+            Invocation::Verb(Verb::New {
+                name: Some("Ideas".to_string()),
+                json: true,
+                wait_for_stdin: true
+            })
+        );
+        assert_eq!(
+            parse(&["append", "Log", "-"]).unwrap(),
+            Invocation::Verb(Verb::Append {
+                note: "Log".to_string(),
+                json: false,
+                wait_for_stdin: true
+            })
+        );
+        assert_eq!(
+            parse(&["append", "Log"]).unwrap(),
+            Invocation::Verb(Verb::Append {
+                note: "Log".to_string(),
+                json: false,
+                wait_for_stdin: false
+            })
+        );
+        assert_eq!(
+            parse(&["today", "--append", "-"]).unwrap(),
+            Invocation::Verb(Verb::Today {
+                append: true,
+                open: true,
+                json: false,
+                wait_for_stdin: true
+            })
+        );
+        for args in [
+            &["today", "-"][..],
+            &["append", "Log", "more"],
+            &["new", "Ideas", "more"],
+        ] {
+            let error = parse(args).unwrap_err();
+            assert_eq!(error.exit_code(), crate::verbs::EXIT_USAGE, "{args:?}");
+        }
     }
 
     #[test]
@@ -448,7 +535,8 @@ mod tests {
             Invocation::Verb(Verb::Today {
                 append: true,
                 open: false,
-                json: false
+                json: false,
+                wait_for_stdin: false
             })
         );
         assert_eq!(
@@ -550,6 +638,19 @@ mod tests {
         for name in VERBS {
             let help = subcommand_help(name).expect("a subcommand");
             assert!(help.contains("--json"), "{name} takes --json:\n{help}");
+        }
+    }
+
+    #[test]
+    fn the_stdin_verbs_help_says_what_a_dash_waits_for() {
+        for name in ["append", "new", "today"] {
+            let help = subcommand_help(name).expect("a subcommand");
+            assert!(help.contains("[-]"), "{name}:\n{help}");
+            assert!(
+                help.contains("wait however long stdin takes to close"),
+                "{name}:\n{help}"
+            );
+            assert!(help.contains("5 seconds exits 1"), "{name}:\n{help}");
         }
     }
 

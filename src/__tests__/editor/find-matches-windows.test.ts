@@ -3,6 +3,7 @@ import { EditorState, type ChangeSpec, type Transaction } from "@codemirror/stat
 import { SearchQuery } from "@codemirror/search";
 import { MatchIndex, MATCH_COUNT_CAP } from "../../editor/search/match-index";
 import { createQueryScanner, type ScanLimits } from "../../editor/search/scanner";
+import { expectSameRanges, type Range } from "./fixtures/ranges";
 
 // The same comparison as find-matches-parity.test.ts, with windows a few dozen
 // characters wide so that small documents cross every window edge: lines
@@ -10,11 +11,6 @@ import { createQueryScanner, type ScanLimits } from "../../editor/search/scanner
 // slices, and edits joined back onto what was read before them. Regular
 // expressions here keep their matches and lookarounds within `reach`.
 const SMALL: ScanLimits = { window: 48, reach: 12, longLine: 40, clusterMargin: 8, editRead: 20 };
-
-interface Range {
-  from: number;
-  to: number;
-}
 
 function reference(state: EditorState, query: SearchQuery): Range[] {
   const out: Range[] = [];
@@ -117,16 +113,27 @@ function readAll(query: SearchQuery, state: EditorState, limits: ScanLimits): Ma
   return index;
 }
 
-function expectReference(index: MatchIndex, state: EditorState, query: SearchQuery, label: string): void {
-  const expected = reference(state, query);
+function expectReference(
+  index: MatchIndex,
+  state: EditorState,
+  query: SearchQuery,
+  label: string,
+  expected: Range[] = reference(state, query),
+): void {
   expect(index.settled, label).toBe(true);
-  expect(index.ranges(), label).toEqual(expected.slice(0, MATCH_COUNT_CAP));
+  expectSameRanges(index.ranges(), expected.slice(0, MATCH_COUNT_CAP), label);
 }
 
 /** What has been read so far is the start of what a full read finds. */
-function expectPrefix(index: MatchIndex, state: EditorState, query: SearchQuery, label: string): void {
+function expectPrefix(
+  index: MatchIndex,
+  state: EditorState,
+  query: SearchQuery,
+  label: string,
+  expected: Range[] = reference(state, query),
+): void {
   const got = index.ranges();
-  expect(got, label).toEqual(reference(state, query).slice(0, got.length));
+  expectSameRanges(got, expected.slice(0, got.length), label);
 }
 
 function randomChange(rand: () => number, docLength: number): ChangeSpec {
@@ -157,13 +164,14 @@ describe("find reads in windows what CodeMirror's cursor finds", () => {
       const state = EditorState.create({ doc });
       for (const query of queriesFor(rand, doc)) {
         const label = `round ${round} ${describeQuery(query)}`;
+        const expected = reference(state, query);
         const index = new MatchIndex(createQueryScanner(query, SMALL)!);
         for (let reads = 0; !index.settled; reads++) {
           expect(reads, label).toBeLessThan(10_000);
           index.advance(state, -Infinity);
-          expectPrefix(index, state, query, label);
+          expectPrefix(index, state, query, label, expected);
         }
-        expectReference(index, state, query, label);
+        expectReference(index, state, query, label, expected);
       }
     }
   });
@@ -194,6 +202,7 @@ describe("an edit joins what was read past it", () => {
         }
       }
       for (const query of everyQuery(rand, first.doc.toString())) {
+        const described = describeQuery(query);
         const references = new Map<EditorState, Range[]>();
         const referenceOf = (at: EditorState) => {
           let found = references.get(at);
@@ -212,12 +221,12 @@ describe("an edit joins what was read past it", () => {
           }
           const got = index.ranges();
           const expected = referenceOf(current);
-          const label = `run ${run} step ${step} ${describeQuery(query)}`;
-          expect(got, label).toEqual(expected.slice(0, got.length));
-          if (op.kind === "full") expect(got, label).toEqual(expected.slice(0, MATCH_COUNT_CAP));
+          const label = `run ${run} step ${step} ${described}`;
+          expectSameRanges(got, expected.slice(0, got.length), label);
+          if (op.kind === "full") expectSameRanges(got, expected.slice(0, MATCH_COUNT_CAP), label);
         });
         index.advance(current, Infinity);
-        expect(index.ranges(), `run ${run} end ${describeQuery(query)}`).toEqual(referenceOf(current).slice(0, MATCH_COUNT_CAP));
+        expectSameRanges(index.ranges(), referenceOf(current).slice(0, MATCH_COUNT_CAP), `run ${run} end ${described}`);
       }
     }
   });
@@ -283,11 +292,11 @@ describe("an edit joins what was read past it", () => {
         const tr = state.update({ changes: { from: at, to: Math.min(state.doc.length, at + Math.floor(rand() * 40)), insert: rand() < 0.5 ? "" : "a b\nc" } });
         index.applyChanges(tr.changes, tr.startState.doc, tr.state);
         state = tr.state;
-        expectPrefix(index, state, query, label);
-        index.advance(state, Infinity);
         const expected = reference(state, query);
+        expectPrefix(index, state, query, label, expected);
+        index.advance(state, Infinity);
         expect(index.capped, label).toBe(expected.length >= MATCH_COUNT_CAP);
-        expectReference(index, state, query, label);
+        expectReference(index, state, query, label, expected);
       }
     }
   });

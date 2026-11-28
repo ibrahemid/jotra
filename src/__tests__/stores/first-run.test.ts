@@ -113,6 +113,27 @@ describe("what the first launch asks", () => {
     expect(first.failure()).toBe("Could not finish the setup. Press Continue to try again.");
   });
 
+  it("names why the settings could not be written", async () => {
+    const said = async (error: unknown) => {
+      const first = store();
+      await first.load();
+      first.continueFormat();
+      mocks.finishFirstRun.mockRejectedValueOnce(error);
+      await first.continueApps();
+      return first.failure();
+    };
+
+    expect(await said("ERR_PERMISSION_DENIED: io error: Permission denied (os error 13)")).toBe(
+      "Could not finish the setup. Jotra cannot write to its settings folder. Press Continue to try again.",
+    );
+    expect(await said("ERR_DISK_FULL: io error: No space left on device (os error 28)")).toBe(
+      "Could not finish the setup. The disk is full. Press Continue to try again.",
+    );
+    expect(await said("ERR_WRITE_FAILED: io error: Is a directory (os error 21)")).toBe(
+      "Could not finish the setup. Press Continue to try again.",
+    );
+  });
+
   it("clears the failure line once a later Continue lands", async () => {
     const first = store();
     await first.load();

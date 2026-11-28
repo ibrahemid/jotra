@@ -5,12 +5,47 @@ use tauri::{AppHandle, Manager};
 use crate::commands::buffer::ERR_READ_FAILED;
 use crate::commands::file::{open_generated_document, FileOpenResult};
 use crate::commands::offload::run_blocking;
+use crate::state::AppState;
 
 const NOTICES_FILE: &str = "THIRD-PARTY-NOTICES.md";
 
 /// Title of the generated document the licence listing opens as. Also the
 /// buffer title, so it is what the tab and the sidebar show.
 pub const THIRD_PARTY_NOTICES_TITLE: &str = "Third-party licenses";
+
+/// The title earlier builds gave the listing, and so the name of the file
+/// they left under `generated/`.
+pub const RETIRED_NOTICES_TITLE: &str = "Third-party licences";
+
+/// Removes the listing an earlier build wrote under [`RETIRED_NOTICES_TITLE`],
+/// with the closed tabs that name it, and answers whether it did. A listing a
+/// tab still has open is left until that tab closes.
+pub fn retire_old_notices(state: &AppState) -> Result<bool, String> {
+    let path = crate::generated::generated_document_path(&state.jotra_dir, RETIRED_NOTICES_TITLE);
+    if !path.is_file() {
+        return Ok(false);
+    }
+    let canonical =
+        crate::security::canonicalize_for_authorization(&path).map_err(|e| e.to_string())?;
+    {
+        let store = state.store.lock().map_err(|e| e.to_string())?;
+        if store
+            .find_active_by_source_path(&canonical)
+            .map_err(|e| e.to_string())?
+            .is_some()
+        {
+            return Ok(false);
+        }
+        while let Some(closed) = store
+            .find_history_by_source_path(&canonical)
+            .map_err(|e| e.to_string())?
+        {
+            store.delete(&closed.id).map_err(|e| e.to_string())?;
+        }
+    }
+    std::fs::remove_file(&path).map_err(|e| e.to_string())?;
+    Ok(true)
+}
 
 /// First readable candidate, in the order given.
 ///

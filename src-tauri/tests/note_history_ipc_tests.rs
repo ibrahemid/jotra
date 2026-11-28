@@ -10,31 +10,22 @@
 //! keeps of its file rather than on the write: that one runs against an app
 //! with the note open.
 
-use std::collections::HashMap;
+#[path = "support/app_state.rs"]
+mod app_state;
+
+use app_state::AppStateBuilder;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU64};
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime};
 
 use jotra_core::activity::{Actor, Decision};
-use jotra_core::config::JotraConfig;
 use jotra_core::diff::LineKind;
-use jotra_core::events::bus::{EventBus, JotraEvent};
+use jotra_core::events::bus::JotraEvent;
 use jotra_core::note_history::NoVersionsReason;
 use jotra_core::notes::guard::DiskState;
 use jotra_core::notes::{WriteOrigin, Writer};
-use jotra_core::preview::ContentRendererRegistry;
-use jotra_core::update::UpdatePhase;
 use jotra_core::watcher::change_event::{modification_is_news, ExternalChange};
-use jotra_core::watcher::reconcile::ReconcileGate;
-use jotra_plugin::transform::TransformRegistry;
-use jotra_storage::buffer_store::BufferStore;
-use jotra_storage::config_store::ConfigStore;
-use jotra_storage::database::connection::open_database;
-use jotra_storage::database::migrations::run_migrations;
-use jotra_storage::layout_state::LayoutStateStore;
 use jotra_storage::note_history::NoteHistoryStore;
-use jotra_storage::notes_index::NotesIndexStore;
 use jotra_tauri_lib::commands::buffer::{read_buffer_content_inner, save_buffer_content_inner};
 use jotra_tauri_lib::commands::file::open_file_from_path;
 use jotra_tauri_lib::commands::note_history::{
@@ -42,11 +33,9 @@ use jotra_tauri_lib::commands::note_history::{
     note_versions_inner, restore_note_version_for_tab, restore_note_version_inner, NoteVersion,
 };
 use jotra_tauri_lib::commands::preview::{preview_get_scripts_inner, preview_set_scripts_inner};
-use jotra_tauri_lib::preview::handler::{RenderCache, RenderedDoc};
-use jotra_tauri_lib::quit::QuitState;
-use jotra_tauri_lib::security::{canonicalize_for_authorization, AuthorizedPaths};
+use jotra_tauri_lib::preview::handler::RenderedDoc;
+use jotra_tauri_lib::security::canonicalize_for_authorization;
 use jotra_tauri_lib::state::AppState;
-use jotra_tauri_lib::watcher::handler::create_ignore_set;
 use jotra_tauri_lib::watcher::identity::PlatformIdentity;
 use tempfile::TempDir;
 
@@ -158,87 +147,10 @@ struct Running {
 impl Running {
     fn new() -> Self {
         let dir = TempDir::new().expect("temp dir");
-        let jotra_dir = dir.path().join("data");
-        let buffers_dir = jotra_dir.join("buffers");
-        std::fs::create_dir_all(&buffers_dir).expect("buffers dir");
-
-        let notes_root = jotra_dir.join("Jotra");
-        std::fs::create_dir_all(&notes_root).expect("notes folder");
-        let notes_root =
-            jotra_tauri_lib::security::canonicalize_root(&notes_root).expect("canonical");
-
-        let db_path = jotra_dir.join("jotra.db");
-        let conn = open_database(&db_path).expect("open db");
-        run_migrations(&conn).expect("migrations");
-
-        let note_history = Arc::new(NoteHistoryStore::open(&jotra_dir).expect("version store"));
-        note_history.set_notes_root(notes_root.clone());
-        note_history.set_probe(Arc::new(
-            jotra_tauri_lib::watcher::identity::PlatformIdentity,
-        ));
-
-        let mut store = BufferStore::new(conn, buffers_dir.clone());
-        store.set_notes_root(notes_root.clone());
-        store.set_history(Arc::clone(&note_history));
-
-        let state = AppState {
-            store: Mutex::new(store),
-            config_store: ConfigStore::new(jotra_dir.join("config.toml")),
-            config: Mutex::new(JotraConfig::default()),
-            jotra_dir: jotra_dir.clone(),
-            buffers_dir,
-            notes_root: RwLock::new(notes_root.clone()),
-            first_run: false,
-            first_run_finished: std::sync::atomic::AtomicBool::new(false),
-            menu_apps: std::sync::Mutex::new(None),
-            retitle_watch: Arc::new(jotra_tauri_lib::first_run::RetitleWatch::new()),
-            notes_root_fallback: RwLock::new(None),
-            watcher_ignore: create_ignore_set(),
-            watcher: Mutex::new(None),
-            notes_watcher: Mutex::new(None),
-            open_file_watcher: Mutex::new(None),
-            file_tracking: Mutex::new(None),
-            notes_index: Arc::new(NotesIndexStore::open(&db_path).expect("notes index db")),
-            note_history,
-            notes_index_cancel: Arc::new(AtomicBool::new(false)),
-            notes_reconcile: Arc::new(ReconcileGate::new()),
-            quit: Arc::new(QuitState::new()),
-            removal_holds: Default::default(),
-            pending_opens: Mutex::new(Vec::new()),
-            pending_lines: Mutex::new(Default::default()),
-            cli_waits: Mutex::new(Default::default()),
-            frontend_ready: AtomicBool::new(false),
-            window_revealed: AtomicBool::new(false),
-            window_dismissed: AtomicBool::new(false),
-            transforms: RwLock::new(TransformRegistry::new()),
-            event_bus: Arc::new(EventBus::new()),
-            update_phase: Mutex::new(UpdatePhase::default()),
-            authorized_paths: AuthorizedPaths::new(),
-            preview_registry: Arc::new(RwLock::new(ContentRendererRegistry::new())),
-            preview_render_cache: Arc::new(RenderCache::new()),
-            layout_state: LayoutStateStore::new(open_database(&db_path).expect("layout db")),
-            tab_rows: jotra_storage::tab_rows::TabRowStore::new(
-                open_database(&db_path).expect("tab rows db"),
-            ),
-            command_usage: jotra_storage::command_usage::CommandUsageStore::new(
-                open_database(&db_path).expect("usage db"),
-            ),
-            config_diagnostics: std::sync::Mutex::new(Vec::new()),
-            recovered_buffers: Mutex::new(Vec::new()),
-            was_dirty_shutdown: false,
-            workspace_root: Mutex::new(None),
-            workspace_watcher: Mutex::new(None),
-            inbox_root: Mutex::new(None),
-            inbox_watcher: Mutex::new(None),
-            fts_scheduler: jotra_tauri_lib::fts_scheduler::FtsScheduler::new(),
-            workspace_index: Arc::new(RwLock::new(
-                jotra_tauri_lib::workspace_index::WorkspaceIndex::new(None),
-            )),
-            search_generation: Arc::new(AtomicU64::new(0)),
-            last_disk_hash: Mutex::new(HashMap::new()),
-            source_records: Mutex::new(HashMap::new()),
-            buffer_writes: Default::default(),
-        };
+        let state = AppStateBuilder::new(&dir.path().join("data"))
+            .recorded_history()
+            .build();
+        let notes_root = state.notes_root();
         Self {
             _dir: dir,
             notes: notes_root,

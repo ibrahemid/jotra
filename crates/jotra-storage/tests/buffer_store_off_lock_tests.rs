@@ -72,70 +72,27 @@ fn indexed_paths(index: &NotesIndexStore) -> Vec<String> {
         .collect()
 }
 
-/// A named pipe: reading it blocks until something writes to it, so a reindex
-/// that reads its file never returns on its own.
-#[cfg(unix)]
-fn pipe(path: &Path) {
-    let status = std::process::Command::new("mkfifo")
-        .arg(path)
-        .status()
-        .expect("mkfifo");
-    assert!(status.success(), "mkfifo failed");
-}
-
-/// Runs a reindex of `id` on a thread and reports whether it returned without
-/// reading `fifo`. A reindex that did read it is let go by opening the pipe
-/// for writing, which ends its read.
-#[cfg(unix)]
-fn reindex_reads_nothing(store: BufferStore, id: String, fifo: &Path) -> bool {
-    let (done, finished) = mpsc::channel();
-    std::thread::spawn(move || {
-        let outcome = store.reindex_buffer(&id);
-        done.send(outcome.is_ok()).ok();
-    });
-    match finished.recv_timeout(Duration::from_secs(5)) {
-        Ok(ok) => ok,
-        Err(_) => {
-            drop(std::fs::OpenOptions::new().write(true).open(fifo));
-            let _ = finished.recv_timeout(Duration::from_secs(5));
-            false
-        }
-    }
-}
-
-// Before the size check moved ahead of the read, the reindex read the whole
-// file and only then found it too large to index.
-#[cfg(unix)]
 #[test]
-fn a_reindex_of_a_row_over_the_normal_tier_reads_nothing() {
+fn a_row_over_the_normal_tier_is_no_reindex_target() {
     let f = fixture();
-    let fifo = f.notes.join("big.log");
-    pipe(&fifo);
+    let path = f.notes.join("big.log");
+    std::fs::write(&path, "line\n").expect("write");
     let doc = row(
         &f.store,
-        &fifo,
+        &path,
         jotra_core::file_ops::THRESHOLD_NORMAL_BYTES + 1,
         false,
     );
     assert!(f.store.reindex_target(&doc.id).expect("target").is_none());
-    assert!(
-        reindex_reads_nothing(f.store, doc.id, &fifo),
-        "the reindex read a file the index does not take"
-    );
 }
 
-#[cfg(unix)]
 #[test]
-fn a_reindex_of_a_read_only_row_reads_nothing() {
+fn a_read_only_row_is_no_reindex_target() {
     let f = fixture();
-    let fifo = f.notes.join("generated.md");
-    pipe(&fifo);
-    let doc = row(&f.store, &fifo, 10, true);
+    let path = f.notes.join("generated.md");
+    std::fs::write(&path, "# Generated\n").expect("write");
+    let doc = row(&f.store, &path, 10, true);
     assert!(f.store.reindex_target(&doc.id).expect("target").is_none());
-    assert!(
-        reindex_reads_nothing(f.store, doc.id, &fifo),
-        "the reindex read a read-only row's file"
-    );
 }
 
 #[test]

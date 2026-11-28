@@ -98,6 +98,7 @@ import {
   uninstallKeyboardHandler,
 } from "../../commands/keybindings";
 import { windowRegistry } from "../../stores/global/window-registry";
+import { formatKeybinding } from "../../lib/keybinding-format";
 
 describe("TabBar close button (#47)", () => {
   afterEach(() => {
@@ -132,6 +133,29 @@ describe("TabBar close button (#47)", () => {
     expect(mocks.closeTab).toHaveBeenCalledTimes(2);
     expect(mocks.closeTab).toHaveBeenNthCalledWith(1, "buf-1", "left");
     expect(mocks.closeTab).toHaveBeenNthCalledWith(2, "buf-1", "left");
+  });
+
+  it("names the close chord in the tip's key style", async () => {
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+    registerCommand({
+      id: "buffer.close",
+      label: "Close tab",
+      keybinding: "CmdOrCtrl+W",
+      scope: "app",
+      execute: () => {},
+    });
+    try {
+      const { container } = render(() => <TabBar />);
+      const close = container.querySelector<HTMLElement>(".tab-close")!;
+      fireEvent.pointerEnter(close.closest(".jotra-tooltip-anchor")!);
+      await vi.advanceTimersByTimeAsync(600);
+      const tip = document.querySelector('[role="tooltip"]')!;
+      expect(tip.firstChild?.textContent).toBe("Close");
+      expect(tip.querySelector(".jotra-tooltip-kbd")?.textContent).toBe(formatKeybinding("CmdOrCtrl+W"));
+    } finally {
+      unregisterCommand("buffer.close");
+      vi.useRealTimers();
+    }
   });
 
   it("lets Cmd+W through to the close-tab command while the close control holds focus", () => {

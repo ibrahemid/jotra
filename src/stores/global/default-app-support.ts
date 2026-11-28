@@ -1,11 +1,11 @@
 import { createSignal } from "solid-js";
-import { fetchDefaultAppTypes, fetchDefaultAppStatus } from "./default-app";
+import { fetchDefaultAppTypes, fetchDefaultAppSupport } from "./default-app";
 import type { ClaimableType } from "./default-app";
 
 // Singleton state — Jotra is single-window. Claimable default-app type ids the
-// current platform actually supports (status other than "unsupported"). Probed
-// once at startup so the command palette and settings search can offer these
-// rows without the Settings modal having mounted.
+// current platform supports. Probed once at startup from what is installed, so
+// the command palette and settings search can offer these rows without the
+// Settings modal having mounted and without reading any type's default.
 const [supportedDefaultAppIds, setSupportedDefaultAppIds] = createSignal<ReadonlySet<string>>(
   new Set(),
 );
@@ -36,19 +36,11 @@ export function clearDefaultAppSupport(): void {
  */
 export async function probeDefaultAppSupport(): Promise<void> {
   let types: ClaimableType[];
+  let supported: boolean;
   try {
-    types = await fetchDefaultAppTypes();
+    [types, supported] = await Promise.all([fetchDefaultAppTypes(), fetchDefaultAppSupport()]);
   } catch {
     return;
   }
-  await Promise.all(
-    types.map(async (t) => {
-      try {
-        const status = await fetchDefaultAppStatus(t.id);
-        markDefaultAppTypeSupported(t.id, status.status !== "unsupported");
-      } catch {
-        markDefaultAppTypeSupported(t.id, false);
-      }
-    }),
-  );
+  for (const t of types) markDefaultAppTypeSupported(t.id, supported);
 }

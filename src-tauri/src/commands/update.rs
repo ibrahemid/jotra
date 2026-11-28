@@ -328,17 +328,17 @@ fn surfaces_to_user(user_initiated: bool, outcome: CheckOutcome) -> bool {
 /// `user_initiated` visibility policy. Shared by the IPC command and
 /// [`run_silent_checks`].
 ///
-/// A silent check does not start while a download, an install or a restart
-/// is pending (the phase refuses a new check); it returns `false` then, and
-/// `true` once it has run.
+/// A silent check starts only while no update phase is showing or in flight
+/// ([`UpdatePhase::start_silent_check`]); it returns `false` then, and `true`
+/// once it has run.
 pub async fn run_update_check(app: AppHandle, user_initiated: bool) -> bool {
     let checking = if user_initiated {
         advance(&app, UpdateEvent::CheckStarted)
     } else {
-        match try_advance(&app, UpdateEvent::CheckStarted) {
+        match try_start_silent_check(&app) {
             Some(phase) => phase,
             None => {
-                tracing::debug!("silent update check skipped: an update is in progress");
+                tracing::debug!("silent update check skipped: an update phase is showing");
                 return false;
             }
         }
@@ -410,12 +410,15 @@ fn advance(app: &AppHandle, event: UpdateEvent) -> UpdatePhase {
     }
 }
 
-/// Applies `event` only when it is legal from the current phase, in one hold
-/// of the lock. Returns the new phase, or `None` when the phase refused it.
-fn try_advance(app: &AppHandle, event: UpdateEvent) -> Option<UpdatePhase> {
+/// Starts a silent check in one hold of the lock. Returns the new phase, or
+/// `None` when the phase refused it ([`UpdatePhase::start_silent_check`]).
+fn try_start_silent_check(app: &AppHandle) -> Option<UpdatePhase> {
     let state = app.state::<AppState>();
-    let mut guard = recover_poison(state.update_phase.lock(), "commands::update::try_advance");
-    let next = guard.apply(event).ok()?;
+    let mut guard = recover_poison(
+        state.update_phase.lock(),
+        "commands::update::try_start_silent_check",
+    );
+    let next = guard.start_silent_check()?;
     *guard = next.clone();
     Some(next)
 }
@@ -469,6 +472,7 @@ fn updater_builder(app: &AppHandle) -> tauri_plugin_updater::UpdaterBuilder {
         let state = handle.state::<AppState>();
         crate::relaunch::shut_down_for_relaunch(&state, || crate::finish_shutdown(&handle));
         handle.cleanup_before_exit();
+        crate::logging::flush_logs();
     })
 }
 
@@ -638,5 +642,19 @@ mod tests {
         assert!(!surfaces_to_user(false, CheckOutcome::NoUpdate));
         assert!(!surfaces_to_user(false, CheckOutcome::Errored));
         assert!(surfaces_to_user(false, CheckOutcome::UpdateFound));
+    }
+
+    #[test]
+    fn a_silent_check_leaves_a_showing_phase_alone() {
+        const UPDATE_RS: &str = include_str!("update.rs");
+        let check = UPDATE_RS
+            .split("pub async fn run_update_check(")
+            .nth(1)
+            .expect("run_update_check");
+        let silent = &check[check.find("} else {").expect("the silent branch")..];
+        let silent = &silent[..silent.find("};").expect("the branch's end")];
+
+        assert!(silent.contains("try_start_silent_check(&app)"));
+        assert!(!silent.contains("UpdateEvent::CheckStarted"));
     }
 }

@@ -1758,7 +1758,7 @@ mod tests {
     }
     use std::io::{Read, Write};
     use std::net::TcpListener;
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::Arc;
 
     fn base_cfg() -> AiConfig {
@@ -3793,50 +3793,79 @@ mod tests {
         assert_eq!(events, vec![format!("error:{LINE_TOO_LONG}")]);
     }
 
-    /// A Gemini list that answers each page after `pause`, and always has
-    /// another.
-    fn spawn_slow_pages(pause: Duration) -> String {
-        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
-        let port = listener.local_addr().expect("addr").port();
-        std::thread::spawn(move || {
-            for (page, stream) in listener.incoming().enumerate() {
-                let Ok(mut stream) = stream else { return };
-                std::thread::spawn(move || {
-                    let mut buf = [0u8; 4096];
-                    let _ = stream.read(&mut buf);
-                    std::thread::sleep(pause);
-                    let body = format!(
-                        r#"{{"models":[{{"name":"models/m-{page}","supportedGenerationMethods":["generateContent"]}}],"nextPageToken":"p{page}"}}"#
-                    );
-                    let _ = stream.write_all(
-                        format!(
-                            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-                            body.len()
-                        )
-                        .as_bytes(),
-                    );
-                });
+    /// A Gemini list that moves the paused clock on by `page_takes` before it
+    /// answers each page, and always has another. `asked` counts the pages.
+    async fn serve_slow_pages(
+        listener: tokio::net::TcpListener,
+        page_takes: Duration,
+        asked: Arc<AtomicUsize>,
+    ) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        'serve: loop {
+            let Ok((mut stream, _)) = listener.accept().await else {
+                return;
+            };
+            let mut head = Vec::new();
+            let mut buf = [0u8; 4096];
+            while !head.windows(4).any(|window| window == b"\r\n\r\n") {
+                match stream.read(&mut buf).await {
+                    Ok(0) | Err(_) => continue 'serve,
+                    Ok(read) => head.extend_from_slice(&buf[..read]),
+                }
             }
-        });
-        format!("http://127.0.0.1:{port}/v1beta/models")
+            let page = asked.fetch_add(1, Ordering::SeqCst);
+            tokio::time::advance(page_takes).await;
+            let body = format!(
+                r#"{{"models":[{{"name":"models/m-{page}","supportedGenerationMethods":["generateContent"]}}],"nextPageToken":"p{page}"}}"#
+            );
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            let _ = stream.write_all(response.as_bytes()).await;
+            let _ = stream.shutdown().await;
+        }
     }
 
     #[test]
     fn a_list_is_read_inside_one_budget_however_many_pages_it_has() {
-        // Each page answers well inside the client's own per-request timeout;
-        // twenty of them do not fit the budget.
-        let url = spawn_slow_pages(Duration::from_millis(300));
+        // Each page takes well under the budget; twenty of them do not fit it.
+        let page_takes = Duration::from_millis(250);
         let budget = Duration::from_secs(1);
-        let started = std::time::Instant::now();
-        let listed = block_on(async {
-            let client = build_http_client(MODEL_LIST_TIMEOUT, false).expect("client");
-            fetch_model_ids(&client, "gemini", &url, Some("k"), budget).await
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .start_paused(true)
+            .build()
+            .expect("a test runtime");
+        let asked = Arc::new(AtomicUsize::new(0));
+        let (listed, took) = runtime.block_on(async {
+            // A running blocking task keeps the paused clock from jumping to the
+            // budget while a page is on the wire, so only the host moves it.
+            let (release, held) = std::sync::mpsc::channel::<()>();
+            let hold = tokio::task::spawn_blocking(move || {
+                let _ = held.recv();
+            });
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("bind");
+            let port = listener.local_addr().expect("addr").port();
+            tokio::spawn(serve_slow_pages(listener, page_takes, asked.clone()));
+            // No timeouts of the client's own, so only the list's budget ends it.
+            let client = client_builder(true).build().expect("client");
+            let url = format!("http://127.0.0.1:{port}/v1beta/models");
+            let started = tokio::time::Instant::now();
+            let listed = fetch_model_ids(&client, "gemini", &url, Some("k"), budget).await;
+            let took = started.elapsed();
+            drop(release);
+            hold.await.expect("the hold ends");
+            (listed, took)
         });
         assert_eq!(listed, Err(ModelListError::Timeout));
-        assert!(
-            started.elapsed() < budget + Duration::from_millis(700),
-            "the list took {:?}",
-            started.elapsed()
+        assert_eq!(took, budget, "the list gave up after {took:?}");
+        assert_eq!(
+            asked.load(Ordering::SeqCst),
+            4,
+            "the list asked for pages past its budget"
         );
     }
 

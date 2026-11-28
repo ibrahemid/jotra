@@ -6,6 +6,9 @@ import { showToast } from "./notifications";
 // Singleton state — Jotra is single-window. Whether the OS starts Jotra at
 // login, as the OS has it.
 
+/** The code of a change the OS made that the config could not record. */
+const UNSAVED = "ERR_LOGIN_ITEM_UNSAVED";
+
 export function createLoginItemStore() {
   const [enabled, setEnabled] = createSignal(false);
   const [busy, setBusy] = createSignal(false);
@@ -25,9 +28,14 @@ export function createLoginItemStore() {
     setBusy(true);
     try {
       setEnabled((await api.setLaunchAtLogin(on)).enabled);
-    } catch {
+    } catch (error) {
       logFailure("open at login could not be changed");
-      showToast(on ? "Couldn't add Jotra to your login items" : "Couldn't remove Jotra from your login items", "error");
+      if (String(error instanceof Error ? error.message : error).startsWith(UNSAVED)) {
+        setEnabled(on);
+        showToast("Could not save your settings", "error");
+      } else {
+        showToast(on ? "Couldn't add Jotra to your login items" : "Couldn't remove Jotra from your login items", "error");
+      }
     } finally {
       setBusy(false);
     }

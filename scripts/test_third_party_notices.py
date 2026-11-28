@@ -155,5 +155,56 @@ class RenderTests(unittest.TestCase):
         self.assertIn("| Apache-2.0 |  | 1 |  |", text)
 
 
+BUNDLE_TAIL = """/*! Bundled license information:
+
+dompurify/dist/purify.es.mjs:
+  (*! @license DOMPurify 3.4.12 | (c) Cure53 and other contributors | Released under the Apache license 2.0 *)
+
+lodash-es/lodash.js:
+  (**
+   * @license
+   * Build: `lodash modularize exports="es" --repo lodash/lodash#4.18.1 -o ./`
+   * Released under MIT license <https://lodash.com/license>
+   *)
+
+@scope/pkg/dist/index.js:
+  (*! @license Pkg v2.0.1 *)
+
+cytoscape/dist/cytoscape.esm.mjs:
+  (*!
+  Embeddable Minimum Strictly-Compliant Promises/A+ 1.1.1 Thenable
+  Licensed under The MIT License (http://opensource.org/licenses/MIT)
+  *)
+*/
+"""
+
+
+class BundledVersionTests(unittest.TestCase):
+    def test_each_banner_gives_its_package_version(self) -> None:
+        self.assertEqual(
+            MODULE.bundled_versions("code();\n" + BUNDLE_TAIL),
+            {"dompurify": "3.4.12", "lodash-es": "4.18.1", "@scope/pkg": "2.0.1"},
+        )
+
+    def test_a_banner_without_its_version_leaves_the_package_out(self) -> None:
+        bare = "/*! Bundled license information:\n\nlodash-es/lodash.js:\n  (**\n   * @license\n   * Lodash (Custom Build)\n   *)\n*/\n"
+        self.assertEqual(MODULE.bundled_versions(bare + BUNDLE_TAIL)["lodash-es"], "4.18.1")
+        self.assertEqual(MODULE.bundled_versions(bare), {})
+
+    def test_two_versions_of_one_package_are_refused(self) -> None:
+        other = BUNDLE_TAIL.replace("3.4.12", "3.4.17")
+        with self.assertRaises(MODULE.GenerationError):
+            MODULE.bundled_versions(BUNDLE_TAIL + other)
+
+    def test_the_shipped_bundle_names_the_dompurify_it_carries(self) -> None:
+        bundle = (SCRIPT_PATH.parent.parent / MODULE.MERMAID_BUNDLE).read_text(encoding="utf-8", errors="replace")
+        versions = MODULE.bundled_versions(bundle)
+        notices = (SCRIPT_PATH.parent.parent / "THIRD-PARTY-NOTICES.md").read_text()
+        section = notices.split("## Packages inside the Mermaid bundle")[1]
+        self.assertIn("dompurify", versions)
+        listed = f"dompurify {versions['dompurify']}"
+        self.assertTrue(listed in section, f"{listed} is not in the Mermaid section")
+
+
 if __name__ == "__main__":
     unittest.main()

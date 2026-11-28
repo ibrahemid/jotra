@@ -13,7 +13,7 @@
 //! STUN at a UDP sink, and, when the run routes a test domain to it, host
 //! names at a DNS sink.
 //!
-//! Three phases, in one webview:
+//! Four phases, in one webview:
 //! 1. **Scripts off**, every document's default. A corpus of static vectors:
 //!    resource hints of every kind (including a hint in a second `rel` after a
 //!    stylesheet's or an alternate's, which Chromium's preload scanner reads),
@@ -35,8 +35,10 @@
 //!    without a target, `location.href`) gets a load of its own, so an engine
 //!    that moves the frame still sees every attempt. Each load is held for the
 //!    settle time before the next one replaces it. Asserted: every load
-//!    reports in, every attempt is made, none reaches a sink, every link click
-//!    reaches the app as a request to open, and the app page never navigates.
+//!    reports in and still answers a ping after its attempts unless an
+//!    accepted frame navigation reached its sink, every attempt is made, none
+//!    reaches a sink, every link click reaches the app as a request to open,
+//!    and the app page never navigates.
 //!    The channels ADR-043 accepts for an opted-in file are reported, not
 //!    asserted: STUN, the resource hints the script creates (a preconnect and,
 //!    with the DNS sink on, a DNS prefetch by name), and on WebView2 the
@@ -48,7 +50,18 @@
 //!    something other than the policy keeps this engine from the sinks and
 //!    their silence above proves nothing; the other two report whether the
 //!    engine acts on them. A page with no policy at `about:blank` fires the
-//!    same three, which tells a broken frame apart from unreachable sinks.
+//!    same three; its image has to land too, which tells a broken frame apart
+//!    from unreachable sinks. WebView2 loads that page as a `data:` URL, which
+//!    the probe lets through the guard for that one load.
+//! 4. **Diagrams.** The app page opens a frame with no address of its own, as
+//!    Inline's drawing window does (`src/editor/block-renderer.ts`), loads the
+//!    vendored Mermaid into it and draws hostile diagrams with Inline's setup:
+//!    a class and a node style with a background image, an image node, init
+//!    directives setting theme CSS and a font family, and labels holding an
+//!    image and a styled span, each aimed at its own sink. Each drawing stays
+//!    in the frame's document for the settle time. Asserted: the frame keeps
+//!    the app page's origin, the runtime loads under the app CSP, at least one
+//!    drawing carries its URL into that document, and none reaches a sink.
 //!
 //! The probe prints one block per phase, every vector in it with its verdict,
 //! on a pass as on a failure; a failure lists the verdicts that failed first.
@@ -79,6 +92,7 @@ mod app_csp;
 use std::borrow::Cow;
 use std::collections::BTreeMap;
 use std::net::{SocketAddr, TcpListener, ToSocketAddrs, UdpSocket};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -218,6 +232,17 @@ const CONTROL_VECTORS: &[&str] = &[
     "control-preconnect",
 ];
 
+/// The hostile diagrams of the diagram phase, one sink each.
+const DIAGRAM_VECTORS: &[&str] = &[
+    "diagram-class-def",
+    "diagram-style",
+    "diagram-image",
+    "diagram-theme-css",
+    "diagram-font-family",
+    "diagram-label-img",
+    "diagram-label-style",
+];
+
 /// The buffer id the probe serves its in-frame control under, without the
 /// policy, outside `resolve_cached`.
 const CONTROL_DOCUMENT: &str = "control";
@@ -286,6 +311,7 @@ fn open_sinks() -> Result<Sinks, String> {
         .chain(ON_VECTORS)
         .chain(ON_RESIDUAL)
         .chain(CONTROL_VECTORS)
+        .chain(DIAGRAM_VECTORS)
     {
         let listener = TcpListener::bind("127.0.0.1:0").map_err(|e| format!("bind tcp: {e}"))?;
         listener
@@ -745,7 +771,70 @@ fn parent_page(sandbox: &str, off_src: &str) -> String {
     )
 }
 
-fn parent_script(on_src: &str, control_src: &str) -> String {
+/// Mermaid's setup as Inline gives it in `src/editor/block-renderer.ts`, read
+/// from that file, so the probe draws under the `secure` list the app ships.
+fn diagram_config() -> Result<String, String> {
+    const BLOCK_RENDERER: &str = include_str!("../../src/editor/block-renderer.ts");
+    if !BLOCK_RENDERER.contains("securityLevel: \"strict\"") {
+        return Err("block-renderer.ts no longer sets securityLevel \"strict\"".to_string());
+    }
+    let start = BLOCK_RENDERER
+        .find("secure: [")
+        .ok_or("block-renderer.ts sets no `secure` list")?
+        + "secure: ".len();
+    let end = start
+        + BLOCK_RENDERER[start..]
+            .find(']')
+            .ok_or("block-renderer.ts leaves its `secure` list open")?
+        + 1;
+    let secure: serde_json::Value = serde_json::from_str(&BLOCK_RENDERER[start..end])
+        .map_err(|e| format!("block-renderer.ts `secure` list: {e}"))?;
+    Ok(serde_json::json!({
+        "startOnLoad": false,
+        "securityLevel": "strict",
+        "secure": secure,
+        "theme": "default",
+    })
+    .to_string())
+}
+
+/// Each hostile diagram with the sink URL it aims at.
+fn diagram_sources(sinks: &Sinks) -> String {
+    let diagrams: Vec<serde_json::Value> = DIAGRAM_VECTORS
+        .iter()
+        .map(|vector| {
+            let url = sinks.url(vector);
+            let source = match *vector {
+                "diagram-class-def" => format!(
+                    "flowchart TD\n  A[one] --> B[two]\n  classDef hostile fill:red;background-image:url({url})\n  class A hostile"
+                ),
+                "diagram-style" => format!(
+                    "flowchart TD\n  A[one] --> B[two]\n  style B fill:red;background-image:url({url})"
+                ),
+                "diagram-image" => format!(
+                    "flowchart TD\n  A[one] --> C@{{ img: \"{url}\", label: \"three\", pos: \"t\", w: 60, h: 60, constraint: \"on\" }}"
+                ),
+                "diagram-theme-css" => format!(
+                    "%%{{init: {{\"themeCSS\": \"* {{ background-image: url({url}) }}\"}}}}%%\nflowchart TD\n  A[one] --> B[two]"
+                ),
+                "diagram-font-family" => format!(
+                    "%%{{init: {{\"fontFamily\": \"x; background-image: url({url})\"}}}}%%\nflowchart TD\n  A[one] --> B[two]"
+                ),
+                "diagram-label-img" => {
+                    format!("flowchart TD\n  A[\"<img src='{url}'>\"] --> B[two]")
+                }
+                "diagram-label-style" => format!(
+                    "flowchart TD\n  A[\"<span style='background-image:url({url})'>one</span>\"] --> B[two]"
+                ),
+                other => unreachable!("no diagram for {other}"),
+            };
+            serde_json::json!({ "vector": vector, "url": url, "source": source })
+        })
+        .collect();
+    serde_json::Value::from(diagrams).to_string()
+}
+
+fn parent_script(on_src: &str, control_src: &str, diagram_config: &str, diagrams: &str) -> String {
     format!(
         r#"(function () {{
   var phase = "off";
@@ -777,6 +866,44 @@ fn parent_script(on_src: &str, control_src: &str) -> String {
     control: function () {{
       phase = "control";
       frame().src = "{control_src}";
+    }},
+    diagrams: function () {{
+      function note(probe, type, vector, detail) {{
+        send({{ kind: "frame", phase: "diagrams", probe: probe, type: type || null, vector: vector || null, href: detail || null }});
+      }}
+      var drawing = document.createElement("iframe");
+      drawing.setAttribute("aria-hidden", "true");
+      drawing.style.cssText = "position:fixed;left:-10000px;top:0;width:1200px;height:900px;border:0;visibility:hidden";
+      document.body.appendChild(drawing);
+      var scope = drawing.contentWindow;
+      var doc = null;
+      try {{ doc = scope.document; if (!doc.head) doc = null; }} catch (e) {{ doc = null; }}
+      if (!doc) {{ note("diagram-frame", "unreachable"); note("diagrams-done"); return; }}
+      note("diagram-frame", "reachable");
+      var script = doc.createElement("script");
+      script.src = new URL("/mermaid.min.js", document.baseURI).href;
+      script.onerror = function () {{ note("diagram-runtime", "failed"); note("diagrams-done"); }};
+      script.onload = function () {{
+        var mermaid = scope.mermaid;
+        if (!mermaid) {{ note("diagram-runtime", "no-api"); note("diagrams-done"); return; }}
+        note("diagram-runtime", "loaded");
+        mermaid.initialize({diagram_config});
+        var queue = Promise.resolve();
+        {diagrams}.forEach(function (diagram, index) {{
+          queue = queue.then(function () {{
+            return mermaid.parse(diagram.source)
+              .then(function () {{ return mermaid.render("probe-diagram-" + index, diagram.source); }})
+              .then(function (result) {{
+                doc.body.insertAdjacentHTML("beforeend", result.svg);
+                note("diagram", result.svg.indexOf(diagram.url) >= 0 ? "carried" : "dropped", diagram.vector);
+              }}, function (error) {{
+                note("diagram", "failed", diagram.vector, String((error && error.message) || error).slice(0, 160));
+              }});
+          }});
+        }});
+        queue.then(function () {{ note("diagrams-done"); }});
+      }};
+      doc.head.appendChild(script);
     }},
     report: function () {{ send({{ kind: "final", href: location.href }}); }}
   }};
@@ -833,6 +960,16 @@ impl Reports {
             .filter(|m| m.probe.as_deref() == Some("unknown-step"))
             .filter_map(|m| m.vector.as_deref())
             .collect()
+    }
+
+    /// What the diagram phase reported for `probe`, for one diagram when
+    /// `vector` names it.
+    fn diagram(&self, probe: &str, vector: Option<&str>) -> Option<&FrameMessage> {
+        self.frame.iter().find(|m| {
+            m.phase == "diagrams"
+                && m.probe.as_deref() == Some(probe)
+                && (vector.is_none() || m.vector.as_deref() == vector)
+        })
     }
 
     fn opened(&self, href: &str) -> bool {
@@ -893,6 +1030,12 @@ enum Stage {
         deadline: Instant,
     },
     ControlSettle {
+        until: Instant,
+    },
+    AwaitDiagrams {
+        deadline: Instant,
+    },
+    DiagramSettle {
         until: Instant,
     },
     Report {
@@ -984,7 +1127,7 @@ fn run() -> Result<String, String> {
     let refused = Arc::new(Mutex::new(Vec::<(String, String)>::new()));
     let moment = Arc::new(Mutex::new("scripts off".to_string()));
 
-    let mut event_loop = EventLoopBuilder::new().build();
+    let mut event_loop = EventLoopBuilder::<()>::with_user_event().build();
     #[cfg(target_os = "macos")]
     {
         // A probe window must never take focus from whoever is at the machine.
@@ -1000,12 +1143,21 @@ fn run() -> Result<String, String> {
         .map_err(|e| e.to_string())?;
 
     let parent_html = parent_page(&sandbox, &off_src);
-    let parent_js = parent_script(&on_src, &control_src);
+    let parent_js = parent_script(
+        &on_src,
+        &control_src,
+        &diagram_config()?,
+        &diagram_sources(&sinks),
+    );
+    let (mermaid_js, _) = jotra_tauri_lib::preview::handler::chrome_asset("mermaid/mermaid.min.js")
+        .ok_or("the preview ships no Mermaid runtime")?;
     let control_body = control_document(&sinks);
     let preview_cache = cache.clone();
     let ipc_reports = reports.clone();
     let nav_refused = refused.clone();
     let nav_moment = moment.clone();
+    let control_loading = Arc::new(AtomicBool::new(false));
+    let nav_control_loading = control_loading.clone();
     let builder = WebViewBuilder::new()
         .with_custom_protocol("tauri".to_string(), move |_id, request| {
             let (status, content_type, body): (u16, &str, Vec<u8>) = match request.uri().path() {
@@ -1018,6 +1170,11 @@ fn run() -> Result<String, String> {
                     200,
                     "application/javascript; charset=utf-8",
                     parent_js.clone().into_bytes(),
+                ),
+                "/mermaid.min.js" => (
+                    200,
+                    "application/javascript; charset=utf-8",
+                    mermaid_js.to_vec(),
                 ),
                 _ => (404, "text/plain; charset=utf-8", b"not found".to_vec()),
             };
@@ -1050,6 +1207,12 @@ fn run() -> Result<String, String> {
         })
         .with_ipc_handler(move |request| record_report(&ipc_reports, request.body()))
         .with_navigation_handler(move |url| {
+            // WebView2 shows `load_html` as a data: URL; the control's own load goes through.
+            if url.starts_with("data:text/html")
+                && nav_control_loading.swap(false, Ordering::SeqCst)
+            {
+                return true;
+            }
             let allowed = jotra_tauri_lib::navigation::is_allowed_navigation(&url, None);
             if !allowed {
                 let moment = nav_moment.lock().expect("moment").clone();
@@ -1086,19 +1249,31 @@ fn run() -> Result<String, String> {
         deadline: Instant::now() + LOAD_TIMEOUT,
     };
     let mut run_failures: Vec<String> = Vec::new();
+    // tao's GTK loop arms no timer for `WaitUntil`, so a thread wakes it every POLL.
+    let ticking = Arc::new(AtomicBool::new(true));
+    let ticker = {
+        let proxy = event_loop.create_proxy();
+        let ticking = Arc::clone(&ticking);
+        std::thread::spawn(move || {
+            while ticking.load(Ordering::Relaxed) && proxy.send_event(()).is_ok() {
+                std::thread::sleep(POLL);
+            }
+        })
+    };
     event_loop.run_return(|_event, _, control_flow| {
         let now = Instant::now();
         let current_load = match stage {
             Stage::AwaitLoad { load, .. } | Stage::AwaitPong { load, .. } => Some(load),
             _ => None,
         };
-        let (off_ready, load_ready, load_answered, control_ran) = {
+        let (off_ready, load_ready, load_answered, control_ran, diagrams_done) = {
             let reports = reports.lock().expect("reports");
             (
                 reports.has("off", None, Some("ready")),
                 current_load.is_some_and(|load| reports.load_has(load, "load-ready")),
                 current_load.is_some_and(|load| reports.load_has(load, "pong")),
                 reports.has("control", Some("control-ran"), None),
+                reports.diagram("diagrams-done", None).is_some(),
             )
         };
         let set_moment = |what: String| *moment.lock().expect("moment") = what;
@@ -1190,6 +1365,18 @@ fn run() -> Result<String, String> {
                 })
             }
             Stage::ControlSettle { until } if now >= until => {
+                set_moment("the diagram drawing".to_string());
+                script("window.__jotraProbe.diagrams()", "draw the diagrams");
+                Some(Stage::AwaitDiagrams {
+                    deadline: now + LOAD_TIMEOUT,
+                })
+            }
+            Stage::AwaitDiagrams { deadline } if diagrams_done || now >= deadline => {
+                Some(Stage::DiagramSettle {
+                    until: now + SETTLE,
+                })
+            }
+            Stage::DiagramSettle { until } if now >= until => {
                 script(
                     "window.__jotraProbe.report()",
                     "ask the app page where it is",
@@ -1200,6 +1387,7 @@ fn run() -> Result<String, String> {
             }
             Stage::Report { until } if now >= until => {
                 set_moment("the about:blank control".to_string());
+                control_loading.store(true, Ordering::SeqCst);
                 if let Err(e) = webview.load_html(&control_html) {
                     run_failures.push(format!("the control page did not load: {e}"));
                 }
@@ -1218,6 +1406,10 @@ fn run() -> Result<String, String> {
         }
         *control_flow = ControlFlow::WaitUntil(now + POLL);
     });
+    ticking.store(false, Ordering::Relaxed);
+    ticker
+        .join()
+        .map_err(|_| "the event loop ticker panicked")?;
 
     let reports = reports.lock().expect("reports");
     let refused = refused.lock().expect("refused");
@@ -1344,10 +1536,19 @@ fn evaluate(
             "did not run"
         },
     );
+    if sinks.hits("control-img") > 0 {
+        controls.row(Mark::Ok, "about:blank image", reached("control-img"));
+    } else {
+        controls.row(
+            Mark::Fail,
+            "about:blank image",
+            "did not reach its sink, so the about:blank control cannot tell a broken frame from \
+             unreachable sinks",
+        );
+    }
     for (vector, what) in [
         ("control-frame-preconnect", "in-frame preconnect"),
         ("control-frame-stun", "in-frame STUN"),
-        ("control-img", "about:blank image"),
         ("control-preconnect", "about:blank preconnect"),
         ("control-stun", "about:blank STUN"),
     ] {
@@ -1465,13 +1666,36 @@ fn evaluate(
     );
     for (load, vectors) in ON_LOADS.iter().enumerate() {
         let what = format!("load {load}");
+        // The frame may leave its document only by a frame navigation this
+        // engine is accepted for that reached its sink; leaving any other way
+        // is a move the sinks did not see.
+        let moved_by = vectors.iter().copied().find(|vector| {
+            webview2 && ON_FRAME_NAVIGATIONS.contains(vector) && sinks.hits(vector) > 0
+        });
         if reports.load_has(load, "load-ready") {
-            let after = if reports.load_has(load, "pong") {
-                "the document answered the ping after its attempts"
+            if reports.load_has(load, "pong") {
+                on.row(
+                    Mark::Ok,
+                    what,
+                    "reported in; the document answered the ping after its attempts",
+                );
+            } else if let Some(vector) = moved_by {
+                on.row(
+                    Mark::Ok,
+                    what,
+                    format!(
+                        "reported in; the frame had left the document by the ping after its \
+                         attempts, moved by {vector}"
+                    ),
+                );
             } else {
-                "the frame had left the document by the ping after its attempts"
-            };
-            on.row(Mark::Ok, what, format!("reported in; {after}"));
+                on.row(
+                    Mark::Fail,
+                    what,
+                    "reported in, but the frame had left the document by the ping after its \
+                     attempts without an accepted frame navigation reaching its sink",
+                );
+            }
         } else if reports.load_has(load, "inline-ran") {
             on.row(
                 Mark::Fail,
@@ -1555,6 +1779,79 @@ fn evaluate(
         );
     }
     blocks.push(on);
+
+    let mut diagrams = Block::new(
+        "diagrams",
+        "hostile diagrams drawn by the vendored Mermaid in a frame of the app page with no \
+         address of its own, as Inline draws them",
+    );
+    match reports
+        .diagram("diagram-frame", None)
+        .and_then(|m| m.kind.as_deref())
+    {
+        Some("reachable") => diagrams.row(Mark::Ok, "frame", "keeps the app page's origin"),
+        Some(_) => diagrams.row(
+            Mark::Fail,
+            "frame",
+            "the app page cannot reach its document",
+        ),
+        None => diagrams.row(Mark::Fail, "frame", "never reported"),
+    }
+    let runtime = reports
+        .diagram("diagram-runtime", None)
+        .and_then(|m| m.kind.as_deref());
+    match runtime {
+        Some("loaded") => diagrams.row(Mark::Ok, "runtime", "loaded under the app policy"),
+        Some("no-api") => diagrams.row(Mark::Fail, "runtime", "loaded without its API"),
+        Some(_) => diagrams.row(Mark::Fail, "runtime", "did not load under the app policy"),
+        None => diagrams.row(Mark::Fail, "runtime", "never reported"),
+    }
+    let mut carried = 0;
+    for vector in DIAGRAM_VECTORS {
+        let drawn = reports.diagram("diagram", Some(vector));
+        let (mut mark, outcome) = match drawn.and_then(|m| m.kind.as_deref()) {
+            Some("carried") => {
+                carried += 1;
+                (
+                    Mark::Ok,
+                    "drawn with its URL in the frame's document".to_string(),
+                )
+            }
+            Some("dropped") => (Mark::Ok, "drawn; Mermaid left its URL out".to_string()),
+            Some(_) => (
+                Mark::Info,
+                format!(
+                    "not drawn: {}",
+                    drawn
+                        .and_then(|m| m.href.as_deref())
+                        .unwrap_or("no reason given")
+                ),
+            ),
+            None if runtime == Some("loaded") => (Mark::Fail, "never drawn".to_string()),
+            None => (Mark::Info, "never drawn".to_string()),
+        };
+        if sinks.hits(vector) > 0 {
+            mark = Mark::Fail;
+        }
+        diagrams.row(mark, *vector, format!("{outcome}; {}", reached(vector)));
+    }
+    if carried > 0 {
+        diagrams.row(
+            Mark::Ok,
+            "carried",
+            format!(
+                "{carried} of {} drawings put their URL in a document under the app policy",
+                DIAGRAM_VECTORS.len()
+            ),
+        );
+    } else {
+        diagrams.row(
+            Mark::Fail,
+            "carried",
+            "no drawing put its URL in the frame's document, so the silence above proves nothing",
+        );
+    }
+    blocks.push(diagrams);
 
     // The app page stayed where it was through every phase.
     let mut app = Block::new("app page", "the top-level page and the navigation guard");

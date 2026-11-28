@@ -39,6 +39,7 @@ const mocks = vi.hoisted(() => ({
   checkForUpdate: vi.fn().mockResolvedValue(undefined),
   rebindHotkey: vi.fn(),
   fetchDefaultAppStatus: vi.fn().mockResolvedValue({ status: "unsupported" }),
+  fetchDefaultAppSupport: vi.fn().mockResolvedValue(false),
   claimDefaultApp: vi.fn().mockResolvedValue(undefined),
   fetchDefaultAppTypes: vi.fn(),
   fetchCliStatus: vi.fn().mockResolvedValue({ installed: false }),
@@ -266,6 +267,7 @@ vi.mock("../../services/events", () => ({
 
 vi.mock("../../stores/global/default-app", () => ({
   fetchDefaultAppStatus: mocks.fetchDefaultAppStatus,
+  fetchDefaultAppSupport: mocks.fetchDefaultAppSupport,
   claimDefaultApp: mocks.claimDefaultApp,
   fetchDefaultAppTypes: mocks.fetchDefaultAppTypes,
 }));
@@ -393,6 +395,8 @@ function hexToRgb(hex: string): string {
 import { APPS } from "../../lib/apps";
 import { pendingConfirm, settleConfirm } from "../../stores/global/dialogs";
 import { updateStore } from "../../stores/global/update";
+import { hotkeyStore } from "../../stores/global/hotkey";
+import { toasts } from "../../stores/global/notifications";
 import { APP_VERSION } from "../../lib/app-info";
 import { clearDefaultAppSupport, probeDefaultAppSupport } from "../../stores/global/default-app-support";
 
@@ -444,6 +448,7 @@ describe("SettingsModal", () => {
     mocks.checkForUpdate.mockReset().mockResolvedValue(undefined);
     mocks.rebindHotkey.mockReset();
     mocks.fetchDefaultAppStatus.mockReset().mockResolvedValue({ status: "unsupported" });
+    mocks.fetchDefaultAppSupport.mockReset().mockResolvedValue(false);
     mocks.claimDefaultApp.mockReset().mockResolvedValue(undefined);
     mocks.fetchDefaultAppTypes.mockReset().mockResolvedValue([TEST_CLAIMABLE_TYPE]);
     mocks.fetchCliStatus.mockReset().mockResolvedValue({ installed: false });
@@ -611,6 +616,35 @@ describe("SettingsModal", () => {
     await waitFor(() => expect(mocks.save).toHaveBeenCalledTimes(1));
     const saved = mocks.save.mock.calls[0][0] as JotraConfig;
     expect(saved.preview.default_layout_markdown).toBe("source");
+  });
+
+  it("offers three line lengths while reading width is on and writes the choice", async () => {
+    mocks.config.mockReturnValue({ ...baseConfig(), editor: { ...baseConfig().editor, reading_width: true } });
+    const { container } = render(() => <SettingsModal />);
+    openSettings("editor");
+    await waitFor(() => expect(container.querySelector("[data-section='editor']")).not.toBeNull());
+    const select = container.querySelector<HTMLSelectElement>("[data-setting='reading_measure']")!;
+    expect(Array.from(select.options).map((o) => [o.value, o.text])).toEqual([
+      ["narrow", "Narrow"],
+      ["medium", "Medium"],
+      ["wide", "Wide"],
+    ]);
+    expect(select.disabled).toBe(false);
+    expect(select.value).toBe("medium");
+    fireEvent.change(select, { target: { value: "wide" } });
+    await waitFor(() => expect(mocks.save).toHaveBeenCalledTimes(1));
+    const saved = mocks.save.mock.calls[0][0] as JotraConfig;
+    expect(saved.editor).toMatchObject({ reading_width: true, reading_measure: "wide" });
+  });
+
+  it("holds the line length row until reading width is on", async () => {
+    const { container } = render(() => <SettingsModal />);
+    openSettings("editor");
+    await waitFor(() => expect(container.querySelector("[data-section='editor']")).not.toBeNull());
+    const row = container.querySelector<HTMLElement>("[data-setting-id='editor.reading_measure']")!;
+    const select = row.querySelector<HTMLSelectElement>("[data-setting='reading_measure']")!;
+    expect(select.disabled).toBe(true);
+    expect(row.textContent).toContain("Turn on Reading width to pick a line length.");
   });
 
   it("offers no markdown typography row", async () => {
@@ -953,6 +987,33 @@ describe("SettingsModal", () => {
       expect((mocks.save.mock.calls[0][0] as JotraConfig).hotkey.toggle).toBe("Alt+Space");
     });
 
+    it("puts the OS back on the chord it held when the new one cannot be saved", async () => {
+      const answer = (chord: string) => ({
+        status: { chord, registered: true, unsupported: false },
+        refused: false,
+      });
+      mocks.rebindHotkey.mockResolvedValueOnce(answer("CmdOrCtrl+Shift+Space"));
+      await hotkeyStore.rebind("CmdOrCtrl+Shift+Space");
+      mocks.rebindHotkey
+        .mockReset()
+        .mockResolvedValueOnce(answer("Alt+Space"))
+        .mockResolvedValueOnce(answer("CmdOrCtrl+Shift+Space"));
+      mocks.save.mockRejectedValueOnce(new Error("disk"));
+      const { container } = render(() => <SettingsModal />);
+      openSettings("general");
+      await waitFor(() =>
+        expect(container.querySelector("[data-action='record-global-chord']")).not.toBeNull(),
+      );
+      fireEvent.click(container.querySelector("[data-action='record-global-chord']")!);
+      fireEvent.keyDown(document.body, { key: " ", code: "Space", altKey: true });
+      await waitFor(() => expect(mocks.rebindHotkey).toHaveBeenCalledTimes(2));
+      expect(mocks.rebindHotkey.mock.calls.map((call) => call[0])).toEqual([
+        "Alt+Space",
+        "CmdOrCtrl+Shift+Space",
+      ]);
+      expect(hotkeyStore.chord()).toBe("CmdOrCtrl+Shift+Space");
+    });
+
     it("cancels a recording on Escape and keeps Settings open", async () => {
       const { container } = render(() => <SettingsModal />);
       openSettings("general");
@@ -1157,6 +1218,7 @@ describe("SettingsModal", () => {
     // heading and row are there to read the moment the nav switches.
     it("shows the Integrations heading on first render once support is known", async () => {
       mocks.fetchDefaultAppStatus.mockResolvedValue({ status: "no_handler" });
+      mocks.fetchDefaultAppSupport.mockResolvedValue(true);
       await probeDefaultAppSupport();
       mocks.fetchDefaultAppTypes.mockReturnValue(new Promise(() => {}));
 
@@ -1172,6 +1234,7 @@ describe("SettingsModal", () => {
     // The heading stays, because the rows beside it are every platform's.
     it("drops the file-types row when a known type turns out unclaimable", async () => {
       mocks.fetchDefaultAppStatus.mockResolvedValue({ status: "no_handler" });
+      mocks.fetchDefaultAppSupport.mockResolvedValue(true);
       await probeDefaultAppSupport();
       mocks.fetchDefaultAppStatus.mockResolvedValue({ status: "unsupported" });
 
@@ -1629,6 +1692,7 @@ describe("SettingsModal", () => {
         { id: "config-data", label: "Config & data", exts: ["json"], utis: ["public.json"] },
       ]);
       mocks.fetchDefaultAppStatus.mockResolvedValue({ status: "no_handler" });
+      mocks.fetchDefaultAppSupport.mockResolvedValue(true);
       await probeDefaultAppSupport();
 
       const { container } = render(() => <SettingsModal />);
@@ -2491,6 +2555,23 @@ describe("Files section — the folder row", () => {
     });
   });
 
+  it("names why Jotra refused the folder picked", async () => {
+    mocks.notesMove.mockRejectedValue("Pick a folder outside your current one.");
+    const { container } = await openNotes();
+    fireEvent.click(container.querySelector("[data-action='notes-move']")!);
+    await waitFor(() =>
+      expect(toasts().map((toast) => toast.text)).toContain("Pick a folder outside your current one."),
+    );
+  });
+
+  it("keeps an OS error's own text out of the move failure", async () => {
+    mocks.notesMove.mockRejectedValue("Permission denied (os error 13)");
+    const { container } = await openNotes();
+    fireEvent.click(container.querySelector("[data-action='notes-move']")!);
+    await waitFor(() => expect(toasts().map((toast) => toast.text)).toContain("Could not move the folder"));
+    expect(toasts().map((toast) => toast.text)).not.toContain("Permission denied (os error 13)");
+  });
+
   // ADR-028 §2: a `jotra.db` path is never the answer to "where are my notes".
   it("shows the notes root and never a database path", async () => {
     const { container } = await openNotes();
@@ -2926,7 +3007,7 @@ describe("Connected programs section, waiting for you", () => {
     cleanup();
   });
 
-  it("lists a waiting program with its three choices", async () => {
+  it("lists a waiting program with its choices", async () => {
     const { container } = await openPrograms();
 
     const selector = "[data-setting-id='mcp.waiting'] [data-program='Claude Code']";
@@ -2936,6 +3017,7 @@ describe("Connected programs section, waiting for you", () => {
     expect(Array.from(row.querySelectorAll("button"), (button) => button.textContent?.trim())).toEqual([
       "Approve reading",
       "Approve reading and writing",
+      "Let it see the open file",
       "Don't allow",
     ]);
 

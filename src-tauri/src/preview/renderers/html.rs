@@ -207,16 +207,57 @@ fn collect_cheap_warnings(html: &str) -> Vec<String> {
         // no warning needed.
         return warnings;
     }
-    let lower = html.to_ascii_lowercase();
-    let open_script = lower.matches("<script").count();
-    let close_script = lower.matches("</script>").count();
-    if open_script > close_script {
-        warnings.push(format!(
-            "{} unclosed <script> tag(s)",
-            open_script - close_script
-        ));
+    if let Some(at) = find_unclosed_script(html) {
+        warnings.push(format!("Unclosed <script> on line {}", line_at(html, at)));
     }
     warnings
+}
+
+/// Byte offset of the `<script` whose text runs to the end of the document.
+/// A script's text is raw up to the next `</script`, so a `<script` inside it
+/// opens nothing.
+fn find_unclosed_script(html: &str) -> Option<usize> {
+    let bytes = html.as_bytes();
+    let mut from = 0;
+    while let Some(open) = find_tag_ci(bytes, from, b"<script") {
+        let body = open + b"<script".len();
+        match find_tag_ci(bytes, body, b"</script") {
+            Some(close) => from = close + b"</script".len(),
+            None => return Some(open),
+        }
+    }
+    None
+}
+
+/// First case-insensitive `needle` at or after `from` that ends a tag name:
+/// the next byte is whitespace, `/`, `>` or the end of the text.
+fn find_tag_ci(bytes: &[u8], from: usize, needle: &[u8]) -> Option<usize> {
+    let mut at = from;
+    while at + needle.len() <= bytes.len() {
+        let offset = bytes[at..]
+            .windows(needle.len())
+            .position(|w| w.eq_ignore_ascii_case(needle))?;
+        let start = at + offset;
+        let end = start + needle.len();
+        match bytes.get(end) {
+            None | Some(b'\t' | b'\n' | b'\x0c' | b'\r' | b' ' | b'/' | b'>') => {
+                return Some(start)
+            }
+            Some(_) => at = start + 1,
+        }
+    }
+    None
+}
+
+/// One-based line of a byte offset, counting `\r\n`, `\r` and `\n` as one
+/// break each, as the editor does.
+fn line_at(text: &str, at: usize) -> usize {
+    let bytes = text.as_bytes();
+    1 + bytes[..at]
+        .iter()
+        .enumerate()
+        .filter(|&(i, &b)| b == b'\n' || (b == b'\r' && bytes.get(i + 1) != Some(&b'\n')))
+        .count()
 }
 
 #[cfg(test)]
@@ -443,7 +484,29 @@ mod tests {
         let out = HtmlRenderer
             .render(req("<body><script>doStuff()</body>"))
             .unwrap();
-        assert_eq!(out.parser_warnings.len(), 1);
-        assert!(out.parser_warnings[0].contains("unclosed"));
+        assert_eq!(out.parser_warnings, vec!["Unclosed <script> on line 1"]);
+    }
+
+    #[test]
+    fn an_unclosed_script_names_its_line() {
+        let text = "<p>a</p>\r\n<script>ok()</script>\r\n<SCRIPT>doStuff()\r\n</body>";
+        let out = HtmlRenderer.render(req(text)).unwrap();
+        assert_eq!(out.parser_warnings, vec!["Unclosed <script> on line 3"]);
+    }
+
+    #[test]
+    fn a_lone_carriage_return_ends_a_line() {
+        let out = HtmlRenderer.render(req("a\rb\n\r<script>")).unwrap();
+        assert_eq!(out.parser_warnings, vec!["Unclosed <script> on line 4"]);
+    }
+
+    #[test]
+    fn a_script_tag_inside_script_text_opens_nothing() {
+        let out = HtmlRenderer
+            .render(req(
+                "<script>let s = '<script>';</script >\n<scripts-list></scripts-list>",
+            ))
+            .unwrap();
+        assert!(out.parser_warnings.is_empty());
     }
 }

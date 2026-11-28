@@ -16,7 +16,8 @@ use std::sync::atomic::Ordering;
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
-use jotra_core::instance::OpenRequest;
+use jotra_core::data_folder::DataFolderOrigin;
+use jotra_core::instance::{held_folder_refusal, on_held_folder, HeldFolder, OpenRequest};
 use jotra_storage::instance::{
     acquire, requests_dir, send_request, take_requests, InstanceLock, InstanceLockError,
 };
@@ -128,9 +129,69 @@ pub fn claim_or_hand_over(jotra_dir: &Path) -> Result<InstanceLock, InstanceLock
         Err(InstanceLockError::Held) => {}
         claimed => return claimed,
     }
+    let (paths, links) = launch_targets();
+    hand_over_or_exit(jotra_dir, paths, links)
+}
+
+/// What claiming the folder for the app's own launch came to.
+pub struct LaunchClaim {
+    /// [`claim_or_hand_over`]'s answer.
+    pub lock: Result<InstanceLock, InstanceLockError>,
+    /// The context the app is built from, handed back unused.
+    pub context: tauri::Context<tauri::Wry>,
+}
+
+/// [`claim_or_hand_over`] for the app's own launch.
+///
+/// A `tauri dev` build on the home folder ends with [`held_folder_refusal`]
+/// instead of handing its paths to the installed app ([`on_held_folder`]). On
+/// macOS a launch with no paths on its command line may have been handed files
+/// by an Apple Event, which arrives only once an event loop runs, so the
+/// launch runs one from `context` to hear it before handing over
+/// ([`hand_over_apple_event_opens`]).
+pub fn claim_for_launch(
+    jotra_dir: &Path,
+    origin: DataFolderOrigin,
+    context: tauri::Context<tauri::Wry>,
+) -> LaunchClaim {
+    match acquire(jotra_dir) {
+        Err(InstanceLockError::Held) => {}
+        claimed => {
+            return LaunchClaim {
+                lock: claimed,
+                context,
+            }
+        }
+    }
+    if on_held_folder(tauri::is_dev(), origin) == HeldFolder::Refuse {
+        eprintln!("{}", held_folder_refusal(jotra_dir));
+        std::process::exit(1)
+    }
+    let (paths, links) = launch_targets();
+    #[cfg(target_os = "macos")]
+    if paths.is_empty() && links.is_empty() {
+        hand_over_apple_event_opens(jotra_dir, context)
+    }
+    LaunchClaim {
+        lock: hand_over_or_exit(jotra_dir, paths, links),
+        context,
+    }
+}
+
+/// The files and `jotra://` links on this launch's command line.
+fn launch_targets() -> (Vec<String>, Vec<String>) {
     let args: Vec<OsString> = std::env::args_os().skip(1).collect();
     let links = jotra_core::jotra_link::link_args(args.iter().cloned());
-    let paths = launch_paths(args);
+    (launch_paths(args), links)
+}
+
+/// [`hand_over`] with the launch's own waits, ending the process unless the
+/// holder exited and this launch now holds the folder.
+fn hand_over_or_exit(
+    jotra_dir: &Path,
+    paths: Vec<String>,
+    links: Vec<String>,
+) -> Result<InstanceLock, InstanceLockError> {
     match hand_over(jotra_dir, paths, links, HANDOVER_WAIT, HANDOVER_POLL) {
         Handover::TookOver(lock) => Ok(lock),
         Handover::Delivered => std::process::exit(0),
@@ -140,6 +201,119 @@ pub fn claim_or_hand_over(jotra_dir: &Path) -> Result<InstanceLock, InstanceLock
         }
         Handover::NotSent => std::process::exit(1),
     }
+}
+
+/// How long a launch that found its folder held waits, once its event loop is
+/// up, for the files an Apple Event hands it.
+#[cfg(target_os = "macos")]
+const APPLE_EVENT_WAIT: Duration = Duration::from_millis(500);
+
+/// Runs a windowless event loop from `context` to hear the files and links an
+/// Apple Event hands this launch, hands them to the instance holding
+/// `jotra_dir`, and ends the process.
+///
+/// A holder that exits during the hand-over leaves this process holding the
+/// folder with its one event loop already spent, so the launch starts the
+/// bundle again with what it was handed ([`reopen_arguments`]).
+#[cfg(target_os = "macos")]
+fn hand_over_apple_event_opens(jotra_dir: &Path, mut context: tauri::Context<tauri::Wry>) -> ! {
+    use std::sync::{Arc, Once};
+
+    context.config_mut().app.windows.clear();
+    let mut app = match tauri::Builder::default().build(context) {
+        Ok(app) => app,
+        Err(error) => {
+            eprintln!("jotra: files handed to this launch could not be read: {error}");
+            reopen_or_exit(jotra_dir, Vec::new(), Vec::new())
+        }
+    };
+    app.set_activation_policy(tauri::ActivationPolicy::Accessory);
+    let answered = Arc::new(Once::new());
+    let jotra_dir = jotra_dir.to_path_buf();
+    app.run(move |_, event| match event {
+        tauri::RunEvent::Opened { urls } => {
+            let (paths, links) = opened_targets(&urls);
+            answered.call_once(|| reopen_or_exit(&jotra_dir, paths, links));
+        }
+        tauri::RunEvent::Ready => {
+            let (answered, jotra_dir) = (Arc::clone(&answered), jotra_dir.clone());
+            std::thread::spawn(move || {
+                std::thread::sleep(APPLE_EVENT_WAIT);
+                answered.call_once(|| reopen_or_exit(&jotra_dir, Vec::new(), Vec::new()));
+            });
+        }
+        _ => {}
+    });
+    std::process::exit(0)
+}
+
+/// [`hand_over_or_exit`] for a launch whose event loop is spent: one that ends
+/// up holding the folder opens the bundle again with `paths` and `links`.
+#[cfg(target_os = "macos")]
+fn reopen_or_exit(jotra_dir: &Path, paths: Vec<String>, links: Vec<String>) -> ! {
+    let Ok(lock) = hand_over_or_exit(jotra_dir, paths.clone(), links.clone()) else {
+        std::process::exit(1)
+    };
+    drop(lock);
+    let bundle = std::env::current_exe()
+        .ok()
+        .and_then(|exe| jotra_core::bundle_rename::bundle_of_executable(&exe));
+    let Some(bundle) = bundle else {
+        eprintln!("jotra: this copy is not in an app bundle, so it cannot start again");
+        std::process::exit(1)
+    };
+    let env = jotra_core::bundle_rename::relaunch_environment(std::env::vars_os());
+    let targets: Vec<String> = paths.into_iter().chain(links).collect();
+    match std::process::Command::new("/usr/bin/open")
+        .args(reopen_arguments(&bundle, &env, &targets))
+        .status()
+    {
+        Ok(status) if status.success() => std::process::exit(0),
+        Ok(status) => {
+            eprintln!("jotra: open could not start {}: {status}", bundle.display());
+            std::process::exit(1)
+        }
+        Err(error) => {
+            eprintln!("jotra: open could not start {}: {error}", bundle.display());
+            std::process::exit(1)
+        }
+    }
+}
+
+/// The files and the `jotra://` links among the URLs an Apple Event opened.
+pub fn opened_targets(urls: &[url::Url]) -> (Vec<String>, Vec<String>) {
+    let paths = urls
+        .iter()
+        .filter(|url| url.scheme() == "file")
+        .filter_map(|url| url.to_file_path().ok())
+        .filter_map(|path| path.to_str().map(String::from))
+        .collect();
+    let links = urls
+        .iter()
+        .map(url::Url::as_str)
+        .filter(|url| jotra_core::jotra_link::is_jotra_link(url))
+        .map(String::from)
+        .collect();
+    (paths, links)
+}
+
+/// The `open` arguments that start `bundle` as a new instance with `env` and
+/// hand it `targets` as an Apple Event, the way Finder hands a file.
+pub fn reopen_arguments(
+    bundle: &Path,
+    env: &[(OsString, OsString)],
+    targets: &[String],
+) -> Vec<OsString> {
+    let mut args = vec![OsString::from("-n")];
+    for (name, value) in env {
+        let mut entry = name.clone();
+        entry.push("=");
+        entry.push(value);
+        args.extend([OsString::from("--env"), entry]);
+    }
+    args.extend([OsString::from("-a"), bundle.as_os_str().to_owned()]);
+    args.extend(targets.iter().map(OsString::from));
+    args
 }
 
 /// What a forwarded request asks the frontend to open, as authorized and
@@ -191,9 +365,57 @@ pub fn register_wait(state: &AppState, request: &OpenRequest, opens: &ForwardedO
 /// A path as the waits compare it: resolved the way an open resolves it, so a
 /// tab's file and a request's path name one file the same way on every
 /// platform.
+///
+/// A file no longer at the path, one just renamed or deleted, is named by its
+/// resolved folder and its name.
 fn wait_key(path: &str) -> String {
-    crate::security::canonicalize_for_authorization(Path::new(path))
-        .unwrap_or_else(|_| path.to_string())
+    let path = Path::new(path);
+    if let Ok(resolved) = crate::security::canonicalize_for_authorization(path) {
+        return resolved;
+    }
+    path.parent()
+        .zip(path.file_name())
+        .and_then(|(parent, name)| {
+            let folder = crate::security::canonicalize_root(parent).ok()?;
+            folder.join(name).into_os_string().into_string().ok()
+        })
+        .unwrap_or_else(|| path.to_string_lossy().into_owned())
+}
+
+/// Moves every `jotra --wait` on the file at `from` to `to`, where its tab
+/// now shows it: closing that tab answers the command.
+pub fn tab_moved(state: &AppState, from: &Path, to: &Path) {
+    if recover_poison(state.cli_waits.lock(), "instance::tab_moved").is_empty() {
+        return;
+    }
+    // Resolved outside the lock: resolving asks the disk.
+    let (from, to) = (
+        wait_key(&from.to_string_lossy()),
+        wait_key(&to.to_string_lossy()),
+    );
+    recover_poison(state.cli_waits.lock(), "instance::tab_moved").moved(&from, &to);
+}
+
+/// Answers every `jotra --wait` whose last file is among `paths`, files the
+/// window was handed and opened no tab for: a file the person declined to
+/// open, or one Jotra refused.
+///
+/// A file an open tab still shows is left waiting for that tab.
+pub fn tabs_not_opened(state: &AppState, paths: &[String]) {
+    if paths.is_empty()
+        || recover_poison(state.cli_waits.lock(), "instance::tabs_not_opened").is_empty()
+    {
+        return;
+    }
+    let unopened: Vec<String> = {
+        let store = recover_poison(state.store.lock(), "instance::tabs_not_opened");
+        paths
+            .iter()
+            .filter(|path| matches!(store.find_active_by_source_path(path), Ok(None)))
+            .cloned()
+            .collect()
+    };
+    tabs_closed(state, &unopened);
 }
 
 /// Answers every `jotra --wait` whose last file is among `closed`, the files
@@ -358,6 +580,46 @@ pub fn start_open_request_watcher(
 mod tests {
     use super::*;
     use jotra_storage::instance::{acquire, send_request};
+
+    #[test]
+    fn the_files_and_links_an_apple_event_opens_are_told_apart() {
+        let file = std::env::temp_dir().join("Plan.md");
+        let urls = vec![
+            url::Url::from_file_path(&file).expect("a file url"),
+            url::Url::parse("jotra://open?path=Plan.md").expect("a link"),
+            url::Url::parse("https://example.com/").expect("another url"),
+        ];
+
+        let (paths, links) = opened_targets(&urls);
+
+        assert_eq!(paths, vec![file.to_string_lossy().into_owned()]);
+        assert_eq!(links, vec!["jotra://open?path=Plan.md".to_string()]);
+    }
+
+    #[test]
+    fn a_launch_left_holding_the_folder_reopens_the_bundle_with_what_it_was_handed() {
+        let bundle = Path::new("/Applications/Jotra.app");
+        let env = vec![(
+            OsString::from("JOTRA_DATA_DIR"),
+            OsString::from("/tmp/data"),
+        )];
+        let targets = vec!["/notes/Plan.md".to_string()];
+
+        let args = reopen_arguments(bundle, &env, &targets);
+
+        let expected: Vec<OsString> = [
+            "-n",
+            "--env",
+            "JOTRA_DATA_DIR=/tmp/data",
+            "-a",
+            "/Applications/Jotra.app",
+            "/notes/Plan.md",
+        ]
+        .into_iter()
+        .map(OsString::from)
+        .collect();
+        assert_eq!(args, expected);
+    }
 
     #[test]
     fn a_launch_finding_the_folder_held_is_answered_when_its_request_is_taken() {

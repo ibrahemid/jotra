@@ -18,8 +18,9 @@ pub struct InstallCliResult {
 pub struct CliStatus {
     pub installed: bool,
     pub path: String,
-    /// Whether the app installs the command itself. On Windows the installer
-    /// puts it on the PATH, so there is nothing to offer.
+    /// Whether the app installs the command itself. On Windows and from a
+    /// Linux package the installer puts it on the PATH, so there is nothing to
+    /// offer.
     pub can_install: bool,
     /// The app runs from a folder macOS made up for a quarantined download,
     /// and has to be moved before anything may point at it.
@@ -47,8 +48,20 @@ pub(crate) fn install_target() -> Option<InstallTarget> {
     cli_install::install_target(InstallFacts {
         windows: cfg!(windows),
         in_appimage: runs_from_appimage(),
+        linux_package: installed_from_linux_package(),
         home: home.as_deref(),
     })
+}
+
+/// Whether the running app came from a `.deb` or `.rpm`, which put the
+/// command in the folder beside it.
+fn installed_from_linux_package() -> bool {
+    use tauri::utils::config::BundleType;
+    cfg!(target_os = "linux")
+        && matches!(
+            tauri::utils::platform::bundle_type(),
+            Some(BundleType::Deb | BundleType::Rpm)
+        )
 }
 
 /// Whether the running app has to be moved before the command can point at it.
@@ -64,8 +77,9 @@ pub async fn cli_status() -> Result<CliStatus, String> {
 
 /// Whether the `jotra` command is installed, and where it is or goes.
 ///
-/// On Windows the installer puts the folder holding `jotra.exe` on the PATH, so
-/// the command bundled beside the app is the installed one.
+/// On Windows the installer puts the folder holding `jotra.exe` on the PATH,
+/// and a Linux package puts `jotra` beside the app in `/usr/bin`, so the
+/// command bundled beside the app is the installed one.
 pub fn cli_status_blocking() -> CliStatus {
     match install_target() {
         Some(InstallTarget::ByInstaller) => {
@@ -231,13 +245,34 @@ pub(crate) fn inspect_entry(path: &Path, app_binary_name: Option<&OsStr>) -> Ins
             _ => raw,
         };
         let beside_app = app_binary_name.is_some_and(|name| target.with_file_name(name).exists());
-        return InstalledEntry::Link { target, beside_app };
+        let bundle_identifier =
+            cli_install::app_bundle_of_command(&target).and_then(read_bundle_identifier);
+        return InstalledEntry::Link {
+            target,
+            beside_app,
+            bundle_identifier,
+        };
     }
     if metadata.is_file() {
         let is_jotra_command = std::fs::read(path).is_ok_and(|bytes| carries_cli_signature(&bytes));
         return InstalledEntry::File { is_jotra_command };
     }
     InstalledEntry::Other
+}
+
+/// The `CFBundleIdentifier` in `bundle`'s `Info.plist`, when it reads.
+#[cfg(target_os = "macos")]
+fn read_bundle_identifier(bundle: &Path) -> Option<String> {
+    let info = plist::Value::from_file(bundle.join("Contents").join("Info.plist")).ok()?;
+    info.as_dictionary()?
+        .get("CFBundleIdentifier")?
+        .as_string()
+        .map(str::to_owned)
+}
+
+#[cfg(not(target_os = "macos"))]
+fn read_bundle_identifier(_bundle: &Path) -> Option<String> {
+    None
 }
 
 /// Refuses, as [`std::io::ErrorKind::AlreadyExists`], to touch `target` when
@@ -481,6 +516,36 @@ fn install_link(
 mod tests {
     use super::*;
     use std::path::PathBuf;
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_link_into_another_apps_bundle_is_read_with_that_apps_identifier() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let macos = dir.path().join("Other.app").join("Contents").join("MacOS");
+        std::fs::create_dir_all(&macos).expect("bundle");
+        std::fs::write(
+            macos.parent().expect("contents").join("Info.plist"),
+            "<?xml version=\"1.0\" encoding=\"UTF-8\"?><plist version=\"1.0\"><dict>\
+             <key>CFBundleIdentifier</key><string>com.example.other</string></dict></plist>",
+        )
+        .expect("plist");
+        let command = macos.join("jotra");
+        std::fs::write(&command, b"").expect("command");
+        let link = dir.path().join("link");
+        std::os::unix::fs::symlink(&command, &link).expect("link");
+
+        let entry = inspect_entry(&link, None);
+
+        assert_eq!(
+            entry,
+            InstalledEntry::Link {
+                target: command,
+                beside_app: false,
+                bundle_identifier: Some("com.example.other".to_string()),
+            }
+        );
+        assert!(!may_replace(&entry));
+    }
 
     #[test]
     fn sidecar_candidate_sits_next_to_the_executable() {

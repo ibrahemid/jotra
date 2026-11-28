@@ -274,16 +274,20 @@ describe("PreviewLayoutToggle", () => {
     await vi.waitFor(() => expect(container.querySelectorAll('[role="radio"]').length).toBe(2));
     const chord = formatKeybinding("CmdOrCtrl+Shift+V");
     const tips: string[] = [];
+    const keys: string[] = [];
     for (const anchor of container.querySelectorAll<HTMLElement>(".jotra-tooltip-anchor")) {
       fireEvent.pointerEnter(anchor);
       await vi.advanceTimersByTimeAsync(600);
-      tips.push(document.querySelector('[role="tooltip"]')!.textContent ?? "");
+      const tip = document.querySelector('[role="tooltip"]')!;
+      tips.push(tip.textContent ?? "");
+      keys.push(tip.querySelector(".jotra-tooltip-kbd")?.textContent ?? "");
       fireEvent.pointerLeave(anchor);
     }
     expect(tips).toEqual([
       `Inline: Markdown formatted as you type ${chord}`,
       `Source: the raw Markdown ${chord}`,
     ]);
+    expect(keys).toEqual([chord, chord]);
     expect(container.querySelector('[role="radio"][title]')).toBeNull();
     unregisterCommand("preview.cycleLayout");
     vi.useRealTimers();

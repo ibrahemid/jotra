@@ -182,6 +182,31 @@ describe("a program's held write", () => {
     expect(h.answerHeldWrite).toHaveBeenCalledWith("t-7", false);
   });
 
+  it("comes back after a question the person opens while it is on screen", async () => {
+    const user = userEvent.setup({ document });
+    render(() => <ConfirmDialog />, { container: mountShell() });
+
+    receiveHeldWrite(held("t-8"));
+    await flush();
+    expect(title()).toBe("Claude Code wants to change Plan.md");
+
+    const theirs = requestConfirm({ title: "Delete Plan.md?", message: "" });
+    await flush();
+    expect(title()).toBe("Delete Plan.md?");
+    expect(h.answerHeldWrite).not.toHaveBeenCalled();
+
+    await user.click(document.querySelector<HTMLButtonElement>(".confirm-cancel")!);
+    await expect(theirs).resolves.toBe(false);
+    await flush();
+    expect(title()).toBe("Claude Code wants to change Plan.md");
+    expect(h.answerHeldWrite).not.toHaveBeenCalled();
+
+    await user.click(document.querySelector<HTMLButtonElement>(".confirm-accept")!);
+    await flush();
+    expect(h.answerHeldWrite).toHaveBeenCalledWith("t-8", true);
+    expect(h.answerHeldWrite).toHaveBeenCalledTimes(1);
+  });
+
   it("names a rename by the name it would give", () => {
     expect(
       heldWriteQuestion(held("t-6", { kind: "rename", rename_to: "Roadmap.md", hunks: [] })).title,

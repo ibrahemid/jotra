@@ -5,6 +5,7 @@ import FolderGraphView from "../../components/Graph/FolderGraphView";
 import Palette from "../../components/Palette/Palette";
 import type { ResultProvider } from "../../components/Palette/types";
 import { executeCommand, registerCommand, unregisterCommand } from "../../commands/registry";
+import type { OpenOutcome } from "../../stores/global/buffer-registry";
 import {
   createFolderGraphStore,
   MAX_ZOOM,
@@ -42,7 +43,7 @@ const h = vi.hoisted(() => ({
   buffer: null as null | (() => { source_path: string } | null),
   error: null as string | null,
   settled: true,
-  openFile: vi.fn<(path: string) => Promise<null>>(),
+  openPath: vi.fn<(path: string) => Promise<OpenOutcome>>(),
   releaseGraph: vi.fn(),
   focusEditor: vi.fn(),
 }));
@@ -91,7 +92,7 @@ let folderGraph: ReturnType<typeof createFolderGraphStore>;
 vi.mock("../../components/WindowProvider/WindowProvider", () => ({
   useWindow: () => ({
     folderGraph,
-    tabs: { openFile: h.openFile },
+    tabs: { openPath: h.openPath },
     editor: { focusEditor: h.focusEditor },
   }),
 }));
@@ -153,16 +154,16 @@ beforeEach(() => {
   folderGraph.open();
   h.error = null;
   h.settled = true;
-  h.openFile.mockReset();
+  h.openPath.mockReset();
   h.releaseGraph.mockClear();
   h.focusEditor.mockClear();
   setRows({ nodes: [], edges: [] });
   setBuffer(null);
   // What the tab store does when a note is opened, as far as the drawing can
   // see it: the note becomes the active buffer.
-  h.openFile.mockImplementation(async (path: string) => {
+  h.openPath.mockImplementation(async (path: string) => {
     setBuffer({ source_path: path });
-    return null;
+    return { kind: "opened", doc: { source_path: path }, existed: false, mode: { kind: "Full" } } as unknown as OpenOutcome;
   });
 
   vi.spyOn(HTMLCanvasElement.prototype, "getContext").mockReturnValue(
@@ -449,7 +450,7 @@ describe("choosing a note from the drawing", () => {
     const disc = recorder.spots[0];
     fireEvent.click(canvas, { clientX: disc.x, clientY: disc.y });
 
-    expect(h.openFile).not.toHaveBeenCalled();
+    expect(h.openPath).not.toHaveBeenCalled();
     expect(folderGraph.isOpen()).toBe(true);
     const chosen = folderGraph.selected();
     expect(chosen).toMatch(/\.md$/);
@@ -469,7 +470,7 @@ describe("choosing a note from the drawing", () => {
 
     fireEvent.keyDown(canvas, { key: "Enter" });
     await vi.waitFor(() => expect(folderGraph.isOpen()).toBe(false));
-    expect(h.openFile).toHaveBeenCalledWith(chosen);
+    expect(h.openPath).toHaveBeenCalledWith(chosen);
   });
 
   it("opens a note on a double-click and closes the layer", async () => {
@@ -480,8 +481,8 @@ describe("choosing a note from the drawing", () => {
     fireEvent.dblClick(canvas, { clientX: disc.x, clientY: disc.y });
 
     await vi.waitFor(() => expect(folderGraph.isOpen()).toBe(false));
-    expect(h.openFile).toHaveBeenCalledTimes(1);
-    expect(h.openFile.mock.calls[0][0]).toMatch(/\.md$/);
+    expect(h.openPath).toHaveBeenCalledTimes(1);
+    expect(h.openPath.mock.calls[0][0]).toMatch(/\.md$/);
   });
 
   it("leaves every note where it settled and the drawing where it was taken", () => {
@@ -509,7 +510,7 @@ describe("choosing a note from the drawing", () => {
     // moved: the settle belongs to the folder, not to which note is open. The
     // count says it as well as the places do, because a settle that keeps its
     // places would have repainted the same drawing had one been started.
-    expect(h.openFile).toHaveBeenCalledTimes(1);
+    expect(h.openPath).toHaveBeenCalledTimes(1);
     expect(settles.started).toBe(started);
     expect(recorder.spots).toEqual(before);
     expect(folderGraph.zoom()).toBe(zoom);
@@ -779,6 +780,46 @@ describe("the legend", () => {
     expect(folderGraph.isolated()).toBeNull();
     expect(recorder.discs.every((disc) => disc.alpha === 1)).toBe(true);
   });
+
+  it("lets go of a chosen file it dims, so Enter opens nothing drawn faint", () => {
+    twoFolders();
+    const view = render(() => <FolderGraphView />);
+    const canvas = view.container.querySelector("canvas") as HTMLCanvasElement;
+    folderGraph.select("Archive/gamma.md");
+
+    fireEvent.click(chips(view).find((chip) => labelOf(chip) === "Projects")!);
+    fireEvent.keyDown(canvas, { key: "Enter" });
+
+    expect(folderGraph.selected()).toBeNull();
+    expect(h.openPath).not.toHaveBeenCalled();
+    expect(folderGraph.isOpen()).toBe(true);
+  });
+
+  it("keeps a chosen file in the folder it lights", () => {
+    twoFolders();
+    const view = render(() => <FolderGraphView />);
+    folderGraph.select("Projects/beta.md");
+
+    fireEvent.click(chips(view).find((chip) => labelOf(chip) === "Projects")!);
+
+    expect(folderGraph.selected()).toBe("Projects/beta.md");
+  });
+});
+
+describe("a file that does not open", () => {
+  it("leaves the layer up", async () => {
+    twoFolders();
+    h.openPath.mockResolvedValue({ kind: "refused", path: "Projects/alpha.md", reason: "it is gone" });
+    const view = render(() => <FolderGraphView />);
+    const canvas = view.container.querySelector("canvas") as HTMLCanvasElement;
+    folderGraph.select("Projects/alpha.md");
+
+    fireEvent.keyDown(canvas, { key: "Enter" });
+
+    await vi.waitFor(() => expect(h.openPath).toHaveBeenCalledWith("Projects/alpha.md"));
+    await new Promise((settle) => setTimeout(settle, 0));
+    expect(folderGraph.isOpen()).toBe(true);
+  });
 });
 
 describe("opening a file from the keyboard", () => {
@@ -790,7 +831,7 @@ describe("opening a file from the keyboard", () => {
     fireEvent.keyDown(field, { key: "Enter" });
     await vi.waitFor(() => expect(folderGraph.isOpen()).toBe(false));
     // Alpha, Beta, Gamma all carry an "a"; by name, Alpha is first.
-    expect(h.openFile).toHaveBeenCalledWith("Projects/alpha.md");
+    expect(h.openPath).toHaveBeenCalledWith("Projects/alpha.md");
   });
 
   it("steps through what the search names with the arrows and says which", async () => {
@@ -812,14 +853,14 @@ describe("opening a file from the keyboard", () => {
 
     fireEvent.keyDown(field, { key: "Enter" });
     await vi.waitFor(() => expect(folderGraph.isOpen()).toBe(false));
-    expect(h.openFile).toHaveBeenCalledWith("Archive/gamma.md");
+    expect(h.openPath).toHaveBeenCalledWith("Archive/gamma.md");
   });
 
   it("does nothing on Enter with nothing typed and nothing chosen", () => {
     twoFolders();
     const view = render(() => <FolderGraphView />);
     fireEvent.keyDown(view.getByLabelText("Search files"), { key: "Enter" });
-    expect(h.openFile).not.toHaveBeenCalled();
+    expect(h.openPath).not.toHaveBeenCalled();
     expect(folderGraph.isOpen()).toBe(true);
   });
 

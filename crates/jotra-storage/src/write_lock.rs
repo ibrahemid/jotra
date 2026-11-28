@@ -10,16 +10,20 @@
 //! The lock is a file in the data folder that carries no data. Nothing is
 //! written to it, nothing reads it, and the app learns of a program's write the
 //! way it always has, through the folder watcher (ADR-033). What it is held
-//! around is a read of the note and a rename, so it is held for microseconds:
-//! the replacement is written and synced before it is taken.
+//! around is a read of the note, a rename and, for a writer keeping versions,
+//! the version of what landed: the replacement is written and synced before it
+//! is taken. A watcher that finds no version for the bytes it read waits for
+//! the lock and asks again, so a version kept slowly still names its writer.
 //!
 //! A writer that cannot have it writes without it rather than not at all: a
 //! lock file that will not open, a data folder that is not writable, or a
 //! holder that has not let go within [`WAIT`] is logged, and the save lands
 //! guarded as it did before the lock existed.
 
+use std::collections::BTreeMap;
 use std::fs::{File, OpenOptions, TryLockError};
 use std::path::{Path, PathBuf};
+use std::sync::{Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
 use tracing::warn;
@@ -28,12 +32,16 @@ use tracing::warn;
 pub const WRITE_LOCK_FILE: &str = "write.lock";
 
 /// How long a writer waits for another to let go before writing without the
-/// lock. A holder lets go after one read and one rename; one that has not
-/// within this is stopped or hung, and a save is not held behind it.
+/// lock. A holder lets go after one read, one rename and the version it keeps;
+/// one that has not within this is stopped or hung, and a save is not held
+/// behind it.
 pub const WAIT: Duration = Duration::from_secs(2);
 
 /// How long a waiting writer sleeps between tries.
 const RETRY: Duration = Duration::from_micros(200);
+
+/// How many of this process's holders are waiting on each lock file.
+static WAITING: Mutex<BTreeMap<PathBuf, usize>> = Mutex::new(BTreeMap::new());
 
 /// The lock every Jotra process writing into one data folder's notes shares.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -59,6 +67,16 @@ impl WriteLock {
     /// The lock file.
     pub fn path(&self) -> &Path {
         &self.path
+    }
+
+    /// How many holders in this process are waiting for another to let go.
+    pub fn waiting(&self) -> usize {
+        WAITING
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(&self.path)
+            .copied()
+            .unwrap_or(0)
     }
 
     /// Holds the lock until the answer is dropped, or `None` when it could not
@@ -87,10 +105,12 @@ impl WriteLock {
             }
         };
         let deadline = Instant::now() + wait;
+        let mut waiting = None;
         loop {
             match file.try_lock() {
                 Ok(()) => return Some(HeldWriteLock { file }),
                 Err(TryLockError::WouldBlock) if Instant::now() < deadline => {
+                    waiting.get_or_insert_with(|| Waiting::on(&self.path));
                     std::thread::sleep(RETRY)
                 }
                 Err(TryLockError::WouldBlock) => {
@@ -101,6 +121,34 @@ impl WriteLock {
                     warn!(path = %self.path.display(), error = %error, "the write lock could not be taken; writing without it");
                     return None;
                 }
+            }
+        }
+    }
+}
+
+/// One holder counted in [`WAITING`] until it stops waiting.
+struct Waiting<'a> {
+    path: &'a Path,
+}
+
+impl<'a> Waiting<'a> {
+    fn on(path: &'a Path) -> Self {
+        *WAITING
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .entry(path.to_path_buf())
+            .or_insert(0) += 1;
+        Self { path }
+    }
+}
+
+impl Drop for Waiting<'_> {
+    fn drop(&mut self) {
+        let mut waiting = WAITING.lock().unwrap_or_else(PoisonError::into_inner);
+        if let Some(count) = waiting.get_mut(self.path) {
+            *count -= 1;
+            if *count == 0 {
+                waiting.remove(self.path);
             }
         }
     }
