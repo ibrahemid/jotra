@@ -50,4 +50,4 @@ jotra-render = { path = "../jotra-render" }
 html5ever = "0.40"
 # Test-only. A tree builder for the resource-hint tests to compare documents
 # with.
-dom_query = "0.29"
+dom_query = "0.30"

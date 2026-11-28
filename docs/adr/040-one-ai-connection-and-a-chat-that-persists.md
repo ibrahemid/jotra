@@ -679,8 +679,8 @@ stream, context and apply move to `crates/writ-ai` (ADR-005 amendment); the comm
 `src-tauri` and the "no new crate" line under Packaging no longer holds. Rows 3 to 7 of section 1
 and the `chat:*` accounts of section 5 existed only in builds between bdb53216 and d5998b1e, never
 in a release, so those branches and the lazy move are deleted; a 0.4 `preset` file still converts
-by rows 1, 2 and 8. Linux keeps keys in the Secret Service through keyring's libdbus backend
-(keyring 3's zbus backend needs zbus 4 and the tree resolves 5); when no Secret Service answers the
+by rows 1, 2 and 8. Linux keeps keys in the Secret Service over libdbus
+(`dbus-secret-service-keyring-store` under keyring-core, which reads the items keyring 3 wrote); when no Secret Service answers the
 key stays in memory and the key row says it is not saved. A note whose text closes the attached
 notes' frame is sent verbatim under `<note-N>` tags it does not contain. The chat list reads
 `chats/index.json` and opens a conversation only when its file no longer matches its row.

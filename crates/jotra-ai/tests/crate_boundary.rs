@@ -98,7 +98,7 @@ fn the_connection_links_none_of_the_desktop_shell() {
     assert!(found.is_empty(), "jotra-ai reaches {found:?}");
     // A walk that started from the wrong node would pass the assertion above
     // for the wrong reason.
-    for needed in ["jotra-core", "jotra-storage", "reqwest", "keyring"] {
+    for needed in ["jotra-core", "jotra-storage", "reqwest", "keyring-core"] {
         assert!(
             reachable.contains(needed),
             "the walk did not reach {needed}"
