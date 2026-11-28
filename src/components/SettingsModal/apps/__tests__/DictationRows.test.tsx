@@ -95,6 +95,7 @@ function aiReady(overrides: Partial<AiEndpointState> = {}): AiEndpointState {
     is_consented: true,
     provider: "deepseek",
     key_state: { is_set: true, memory_only: false },
+    sends_key: true,
     is_on_device: false,
     ...overrides,
   };

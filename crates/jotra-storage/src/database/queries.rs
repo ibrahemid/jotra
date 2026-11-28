@@ -464,6 +464,18 @@ pub fn disable_preview_scripts(conn: &Connection, id: &str) -> StorageResult<()>
     Ok(())
 }
 
+/// Takes a buffer's preview-scripts opt-in away, with its digest, in one
+/// statement. Answers whether the buffer was opted in; an id with no row and a
+/// buffer already opted out answer `false`, and `updated_at` is left alone.
+pub fn lapse_preview_scripts(conn: &Connection, id: &str) -> StorageResult<bool> {
+    let changed = conn.execute(
+        "UPDATE buffers SET preview_scripts = 0, preview_scripts_hash = NULL
+         WHERE id = ?1 AND preview_scripts != 0",
+        params![id],
+    )?;
+    Ok(changed > 0)
+}
+
 /// Records `hash` as the bytes an opted-in buffer's opt-in covers, once Jotra
 /// has written them to its file. A buffer that is not opted in is left alone.
 pub fn record_preview_scripts_hash(conn: &Connection, id: &str, hash: &str) -> StorageResult<()> {

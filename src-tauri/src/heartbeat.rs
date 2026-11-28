@@ -17,12 +17,8 @@ pub const SNAPSHOT_HEARTBEAT: std::time::Duration = std::time::Duration::from_se
 /// written. The first beat of a session writes it, one insert into `jotra.db`;
 /// every beat after that reads the flag and does no I/O.
 pub fn beat(state: &AppState) {
-    let marked = state
-        .store
-        .lock()
-        .ok()
-        .map(|mut store| store.mark_session_running());
-    if let Some(Err(e)) = marked {
+    let marked = state.lock_store().mark_session_running();
+    if let Err(e) = marked {
         tracing::warn!(error = %e, "the running-session marker could not be written");
     }
 }

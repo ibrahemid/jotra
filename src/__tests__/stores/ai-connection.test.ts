@@ -11,9 +11,11 @@ interface AiFixture {
 
 const hoisted = vi.hoisted(() => ({
   aiCheckConnection: vi.fn(),
+  aiCheckConnectionUnprompted: vi.fn(),
   aiConsentHost: vi.fn(),
   aiProviders: vi.fn(),
   aiListModels: vi.fn(),
+  aiListModelsUnprompted: vi.fn(),
   aiSetProvider: vi.fn(),
   configLoad: vi.fn(),
   configSave: vi.fn(),
@@ -31,8 +33,10 @@ const hoisted = vi.hoisted(() => ({
 
 vi.mock("../../services/tauri", () => ({
   aiCheckConnection: (...a: unknown[]) => hoisted.aiCheckConnection(...a),
+  aiCheckConnectionUnprompted: (...a: unknown[]) => hoisted.aiCheckConnectionUnprompted(...a),
   aiProviders: (...a: unknown[]) => hoisted.aiProviders(...a),
   aiListModels: (...a: unknown[]) => hoisted.aiListModels(...a),
+  aiListModelsUnprompted: (...a: unknown[]) => hoisted.aiListModelsUnprompted(...a),
   aiSetProvider: (...a: unknown[]) => hoisted.aiSetProvider(...a),
   aiConsentHost: (...a: unknown[]) => hoisted.aiConsentHost(...a),
 }));
@@ -99,7 +103,9 @@ const OK = { reachable: true, model_listed: true, kind: "ok", detail: "", models
 describe("ai connection store", () => {
   beforeEach(async () => {
     hoisted.aiCheckConnection.mockReset();
+    hoisted.aiCheckConnectionUnprompted.mockReset();
     hoisted.aiListModels.mockReset();
+    hoisted.aiListModelsUnprompted.mockReset();
     hoisted.aiSetProvider.mockReset();
     hoisted.aiConsentHost.mockReset();
     hoisted.configLoad.mockReset();
@@ -124,6 +130,18 @@ describe("ai connection store", () => {
     hoisted.aiCheckConnection.mockResolvedValue(OK);
     await aiConnectionStore.check();
     expect(hoisted.aiCheckConnection).toHaveBeenCalledTimes(1);
+    expect(aiConnectionStore.status()?.kind).toBe("ok");
+  });
+
+  it("leaves the status unchecked when the check would read a key nobody asked for", async () => {
+    hoisted.aiCheckConnectionUnprompted.mockResolvedValue(null);
+    await aiConnectionStore.checkUnprompted();
+    expect(aiConnectionStore.status()).toBeNull();
+    expect(aiConnectionStore.checking()).toBe(false);
+    expect(hoisted.aiCheckConnection).not.toHaveBeenCalled();
+
+    hoisted.aiCheckConnectionUnprompted.mockResolvedValue(OK);
+    await aiConnectionStore.checkUnprompted();
     expect(aiConnectionStore.status()?.kind).toBe("ok");
   });
 
@@ -156,13 +174,15 @@ describe("ai connection store", () => {
     hoisted.aiListModels.mockImplementation(() =>
       Promise.resolve(catalog(hoisted.ai.provider, ["a-model"])),
     );
+    hoisted.aiListModelsUnprompted.mockResolvedValue(null);
     aiConnectionStore.watch();
     await new Promise((resolve) => setTimeout(resolve, 0));
-    const before = hoisted.aiListModels.mock.calls.length;
-    expect(before).toBeGreaterThan(0);
+    expect(hoisted.aiListModelsUnprompted).toHaveBeenCalledTimes(1);
+    expect(hoisted.aiListModels).not.toHaveBeenCalled();
+    expect(aiConnectionStore.catalog()).toBeNull();
 
     await setProvider("groq");
-    expect(hoisted.aiListModels.mock.calls.length).toBeGreaterThan(before);
+    expect(hoisted.aiListModels).toHaveBeenCalled();
     expect(aiConnectionStore.catalog()?.provider).toBe("groq");
   });
 
@@ -247,6 +267,7 @@ describe("connectionDisplay", () => {
     expect(missing.tone).toBe("warn");
     expect(missing.text).toContain("llama3");
 
+    hoisted.ai.provider = "groq";
     const auth = connectionDisplay(
       { reachable: true, model_listed: null, kind: "unauthorized", detail: "api.groq.com", models: [] },
       "",
@@ -275,6 +296,21 @@ describe("connectionDisplay", () => {
       "",
     );
     expect(refusedJan.text).toBe("Jan is not running at localhost:1337");
+  });
+
+  it("says a local runtime wants its own key instead of blaming a key it was never sent", () => {
+    hoisted.ai.provider = "jan";
+    const refused = {
+      text: "Jan asks for an API key. Jotra sends no key to a server on this computer.",
+      tone: "error",
+    };
+    expect(
+      connectionDisplay(
+        { reachable: true, model_listed: null, kind: "unauthorized", detail: "localhost:1337", models: [] },
+        "",
+      ),
+    ).toEqual(refused);
+    expect(modelListDisplay({ kind: "unauthorized" }, "localhost")).toEqual(refused);
   });
 
   // A hosted endpoint is not probed before consent, so this state means "no
@@ -309,7 +345,12 @@ describe("connectionDisplay", () => {
 });
 
 describe("modelListDisplay", () => {
+  afterEach(() => {
+    hoisted.ai.provider = "ollama";
+  });
+
   it("writes a line for every kind the list can fail with", () => {
+    hoisted.ai.provider = "groq";
     expect(modelListDisplay({ kind: "unreachable" }, "api.groq.com")).toEqual({
       text: "Could not reach api.groq.com",
       tone: "error",

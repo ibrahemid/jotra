@@ -621,9 +621,7 @@ describe("the chat column", () => {
       "abc",
     );
     await waitFor(() =>
-      expect(container.querySelector(".chat-proposal-verdict")?.textContent).toBe(
-        "Applied to Launch.md.",
-      ),
+      expect(container.querySelector(".chat-proposal-verdict")?.textContent).toBe("Applied."),
     );
   });
 

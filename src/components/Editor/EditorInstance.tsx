@@ -1194,7 +1194,13 @@ export default function EditorInstance(props: Props) {
   // record has to move now: a background note left holding the digest
   // of a file that has changed reads dirty against a file it matches, and the
   // next change to it asks a question that has no reason to be asked.
+  //
+  // A read of the note still on its way to a view lands first. Its text can
+  // be older than this reload's, and the open's digest, taken after both
+  // reads, would otherwise pair that older text with the newer file.
   async function reloadFromDisk(id: string, writer?: VersionWriter | null) {
+    const reading = ed.readInFlight(id);
+    if (reading !== null) await reading;
     const wasUnread = unreadTabs.stateOf(id) !== null;
     let content: string;
     try {

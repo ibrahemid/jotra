@@ -570,6 +570,17 @@ export async function saveBufferContent(id: string, content: string): Promise<st
 }
 
 /**
+ * Writes the note in UTF-8 whatever encoding its file is in, and the note's
+ * later saves and reads use UTF-8 (ADR-049). Sent and answered like
+ * [`saveBufferContent`]; the encoding moves only once the write has landed.
+ */
+export async function saveBufferAsUtf8(id: string, content: string): Promise<string | null> {
+  return invoke("save_buffer_as_utf8", new TextEncoder().encode(content), {
+    headers: { [NOTE_ID_HEADER]: id },
+  });
+}
+
+/**
  * Writes the note as `changes` (CodeMirror's `ChangeSet.toJSON()`) applied to
  * the text whose digest is `base`, the digest a write of it or the open's
  * [`noteDiskState`] answered with. `length` is the length in UTF-16 code units
@@ -1700,6 +1711,9 @@ export interface AiEndpointState {
   is_consented: boolean;
   provider: string;
   key_state: AiKeyState;
+  /** A request carries the stored key, which an https address on a private
+   * network takes when one is set. */
+  sends_key: boolean;
   /** Apple's on-device model: no address, key or consent, Rewrite only. */
   is_on_device: boolean;
 }
@@ -1800,6 +1814,17 @@ export async function aiListModels(provider: string): Promise<ModelCatalog> {
   }
 }
 
+/** The model list for a surface that opened rather than one a person asked
+ * to read: `null`, and nothing sent, when the list needs a key the keychain
+ * has not answered this session. */
+export async function aiListModelsUnprompted(provider: string): Promise<ModelCatalog | null> {
+  try {
+    return await invoke<ModelCatalog | null>("ai_list_models_unprompted");
+  } catch (err) {
+    return { provider, models: [], source: "none", error: narrowModelListError(err) };
+  }
+}
+
 /** Points the connection at another provider, seeding its model and dropping a
  * chat model that belonged to the old one. Answers the saved connection. */
 export async function aiSetProvider(provider: string): Promise<AiConfig> {
@@ -1864,6 +1889,9 @@ export interface ChatEndpointState {
   is_allowed: boolean;
   is_consented: boolean;
   key_state: AiKeyState;
+  /** A send carries the stored key, which an https address on a private
+   * network takes when one is set. */
+  sends_key: boolean;
   /** Apple's on-device model, which serves Rewrite only. */
   is_on_device: boolean;
 }
@@ -1958,6 +1986,19 @@ export interface ChatProposal {
   /** The note moved on since the proposal was made, so applying it would be
    * refused. */
   stale?: boolean;
+  /** The file is outside the notes folder and no tab has it open, so it can
+   * be neither read nor written until one does. */
+  needs_tab?: boolean;
+  /** The file an open offer names, through every symlink, which is how the
+   * watcher and the index name it. */
+  resolved_path?: string | null;
+  /** What an applied proposal left the file holding. */
+  applied_hash?: string | null;
+  /** Undo put back what the file held before the proposal was applied. */
+  undone?: boolean;
+  /** The file still holds what the apply left and the text before it is
+   * kept, so the card offers Undo. */
+  undoable?: boolean;
 }
 
 /** Why a block a reply wrote could not become a proposal. */
@@ -2027,8 +2068,8 @@ export interface ChatProposalOutcome {
   /** The write moved bytes. False when the note already held the proposed
    * text, which is what a model asked for a whole note often writes back. */
   changed: boolean;
-  /** The text the note held before is kept as a version, so the write can be
-   * undone. False for a file outside the notes folder, which keeps none. */
+  /** The text the file held before is kept, so the write can be undone: a
+   * note's as a version, a file outside the notes folder's for the session. */
   undoable: boolean;
 }
 
@@ -2110,15 +2151,17 @@ export async function chatApplyProposal(
   });
 }
 
-/** Puts back the text a note held before a proposal was applied to it, by
- * the version that write kept. `appliedHash` is what the apply left the note
- * holding: a note that moved on since is refused rather than overwritten. */
+/** Puts back the text a file held before a proposal was applied to it, and
+ * records that in the conversation. `appliedHash` is what the apply left the
+ * file holding: a file that moved on since is refused rather than overwritten. */
 export async function chatUndoProposal(
+  conversationId: string,
+  turn: number,
   path: string,
   beforeHash: string,
   appliedHash: string,
 ): Promise<ChatProposalOutcome> {
-  return invoke("chat_undo_proposal", { path, beforeHash, appliedHash });
+  return invoke("chat_undo_proposal", { conversationId, turn, path, beforeHash, appliedHash });
 }
 
 export async function chatDiscardProposal(
@@ -2150,6 +2193,12 @@ export async function aiWordDiff(before: string, after: string): Promise<WordSpa
 
 export async function aiCheckConnection(): Promise<AiConnectionStatus> {
   return invoke("ai_check_connection");
+}
+
+/** The connection check for a surface that opened: `null`, and nothing sent,
+ * when the check needs a key the keychain has not answered this session. */
+export async function aiCheckConnectionUnprompted(): Promise<AiConnectionStatus | null> {
+  return invoke("ai_check_connection_unprompted");
 }
 
 export async function aiSetApiKey(provider: string, key: string): Promise<AiKeyState> {

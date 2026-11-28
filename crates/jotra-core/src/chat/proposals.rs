@@ -110,7 +110,13 @@ pub(super) fn opening_path(line: &str) -> Option<String> {
     let info = open_proposal(line)
         .map(|(_, info)| info)
         .or_else(|| header_info(line))?;
-    attribute(info, "path")
+    named_path(info)
+}
+
+/// The name an info string's `path` attribute spells, read back the way the
+/// prompt wrote it ([`read_path_attribute`]).
+fn named_path(info: &str) -> Option<String> {
+    attribute(info, "path").map(|value| read_path_attribute(&value))
 }
 
 /// What opens a proposal: the fence, the attributes, and where the body starts.
@@ -400,7 +406,7 @@ pub fn parse_proposals(reply: &str, context: &[AttachedNote], truncated: bool) -
             index += 1;
             continue;
         };
-        let named = attribute(opening.info, "path").unwrap_or_default();
+        let named = named_path(opening.info).unwrap_or_default();
         let summary = attribute(opening.info, "summary").unwrap_or_default();
         let (block, next) = read_block(&lines, opening.body, opening.fence);
         index = next;

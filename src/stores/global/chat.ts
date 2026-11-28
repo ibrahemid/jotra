@@ -450,11 +450,11 @@ function createChatStore() {
    * reads one rather than starting one: a chat closed yesterday is on screen
    * where it was left. The connection is checked as the pane opens, so the
    * readiness line states what a send would meet rather than waiting for one
-   * to fail (CH-22). */
+   * to fail (CH-22), unless the check would raise a keychain prompt. */
   async function openPane() {
     aiConnectionStore.watch();
     if (aiConnectionStore.status() === null && !aiConnectionStore.checking()) {
-      void aiConnectionStore.check();
+      void aiConnectionStore.checkUnprompted();
     }
     chips.watchNotes();
     proposals.watchOfferedNotes();
@@ -462,6 +462,12 @@ function createChatStore() {
     if (current() || exchange.isBusy()) return;
     const recent = conversations()[0];
     if (recent) await open(recent.id);
+  }
+
+  /** What a pane that closed stops doing: reading the offers again on each
+   * change to a file one names. */
+  function closePane() {
+    proposals.unwatchOfferedNotes();
   }
 
   /** Puts a conversation on screen. Nothing else moves: a reply arriving into
@@ -577,6 +583,7 @@ function createChatStore() {
     refusalFor: proposals.refusalFor,
     isApplying: proposals.isApplying,
     verdictFor: proposals.verdictFor,
+    canUndo: proposals.canUndo,
     attach: chips.attach,
     attachAll: chips.attachAll,
     attachByPath: chips.attachByPath,
@@ -588,6 +595,7 @@ function createChatStore() {
     detach: chips.detach,
     isAttached: chips.isAttached,
     openPane,
+    closePane,
     refreshList,
     open,
     newChat,

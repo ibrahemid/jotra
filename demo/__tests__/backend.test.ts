@@ -311,6 +311,8 @@ describe("the demo backend", () => {
     });
     expect(await handle("ai_has_api_key", { provider: "anthropic" })).toEqual({ is_set: false, memory_only: false });
     expect(((await handle("ai_check_connection", {})) as { kind: string }).kind).toBe("refused");
+    expect(((await handle("ai_check_connection_unprompted", {})) as { kind: string }).kind).toBe("refused");
+    expect(await handle("ai_list_models_unprompted", {})).toEqual(await handle("ai_list_models", {}));
     await expect(handle("ai_rewrite", { requestId: "r1", action: "polish", text: "x" })).rejects.toBe("Rewriting is turned off.");
     await expect(handle("ai_consent_host", {})).rejects.toBe("This endpoint is on your machine; nothing is sent.");
   });

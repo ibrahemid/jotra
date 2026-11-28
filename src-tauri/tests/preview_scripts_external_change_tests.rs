@@ -105,6 +105,9 @@ fn make_state(dir: &TempDir) -> AppState {
         preview_registry: Arc::new(RwLock::new(ContentRendererRegistry::new())),
         preview_render_cache: Arc::new(RenderCache::new()),
         layout_state: LayoutStateStore::new(open_database(&db_path).expect("layout db")),
+        tab_rows: jotra_storage::tab_rows::TabRowStore::new(
+            open_database(&db_path).expect("tab rows db"),
+        ),
         command_usage: jotra_storage::command_usage::CommandUsageStore::new(
             open_database(&db_path).expect("usage db"),
         ),
@@ -276,6 +279,32 @@ fn a_file_another_program_rewrites_loses_its_scripts_opt_in() {
         !cached_scripts_on(&state, &id),
         "the cached render would still be served with the file's scripts on"
     );
+}
+
+#[test]
+fn a_rewrite_is_reported_and_lapses_the_opt_in_while_a_command_holds_the_store() {
+    let dir = TempDir::new().expect("temp dir");
+    let downloads = TempDir::new().expect("a folder outside the notes folder");
+    let (state, rx) = watching_state(&dir);
+    let (id, file) = opted_in(
+        &state,
+        downloads.path(),
+        "report.html",
+        "<p>read</p><script>one()</script>",
+    );
+
+    let held = state.store.lock().expect("store");
+    write_by_temp_and_rename(&file, b"<p>downloaded again</p><script>two()</script>");
+    let seen = changes_to(&rx, &id);
+    drop(held);
+
+    assert_eq!(
+        seen,
+        vec![ExternalChange::Modified],
+        "the watcher waited on the store's lock to report the change"
+    );
+    assert!(!row_opted_in(&state, &id));
+    assert!(!cached_scripts_on(&state, &id));
 }
 
 #[test]

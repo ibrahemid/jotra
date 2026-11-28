@@ -348,7 +348,8 @@ share a bucket with a newer one, then the other ordinary entries, then markers: 
 entry of each session (a pause of 15 minutes ends one), the first of each day, and a text something
 other than a run of saves set aside. The newest entry, the newest session's first, and the last
 entry before that session are never taken by the cap (`writ_core::note_history::prune_plan`). Age
-and the store-wide size cap are unchanged. A version whose text no longer matches its digest is
+is unchanged. The store-wide size cap takes those three only once no other entry it could take is
+left. A version whose text no longer matches its digest is
 reported as damaged rather than restored.
 
 ### 6. Consent is revocable in the app and by editing the config

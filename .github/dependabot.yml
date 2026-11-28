@@ -20,9 +20,6 @@ updates:
     groups:
       cargo-all:
         patterns: ["*"]
-    ignore:
-      - dependency-name: "fsevent-sys"
-        update-types: ["version-update:semver-major"]
 
   # Root frontend (Tauri / SolidJS / Vite)
   - package-ecosystem: "npm"

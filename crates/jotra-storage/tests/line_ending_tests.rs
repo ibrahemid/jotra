@@ -182,6 +182,7 @@ fn a_note_jotra_creates_is_saved_in_lf() {
         "one\r\ntwo\r\n",
         WriteOrigin::Editor,
         None,
+        None,
     )
     .expect("copy");
 

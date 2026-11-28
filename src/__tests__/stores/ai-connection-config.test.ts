@@ -8,7 +8,9 @@ const h = vi.hoisted(() => ({
 
 vi.mock("../../services/tauri", () => ({
   aiListModels: (...a: unknown[]) => h.aiListModels(...a),
+  aiListModelsUnprompted: vi.fn().mockResolvedValue(null),
   aiCheckConnection: vi.fn(),
+  aiCheckConnectionUnprompted: vi.fn().mockResolvedValue(null),
   aiConsentHost: vi.fn(),
   aiProbeLocal: vi.fn(),
   aiOpenrouterCancel: vi.fn(),

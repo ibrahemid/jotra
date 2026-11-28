@@ -16,6 +16,7 @@
 //! Policy only: no clock of its own, no filesystem, no events. The caller
 //! passes the time and acts on the verdict.
 
+use std::collections::BTreeSet;
 use std::time::{Duration, Instant};
 
 /// Everything one debounce window may emit about the folder, the sweep
@@ -186,6 +187,73 @@ impl EmissionBudget {
             }
             _ => false,
         }
+    }
+}
+
+/// Changes one workspace sweep may carry by path. Past it the sweep carries
+/// none and the file-name index walks the folder instead.
+pub const MAX_SWEPT_PATHS: usize = 4_096;
+
+/// The changes the next workspace sweep stands for, kept from one sweep to the
+/// next.
+///
+/// The budget spares the frontend, for which every named change is a message
+/// and a directory reload. The file-name index patches one path for the price
+/// of a stat, so a sweep carries the changes it replaced and the index patches
+/// those instead of walking the tree every cooldown while a build runs. Past
+/// the cap the sweep carries nothing, and the walk is the cheaper answer.
+#[derive(Debug)]
+pub struct SweptPaths {
+    paths: BTreeSet<String>,
+    cap: usize,
+    overflowed: bool,
+}
+
+impl Default for SweptPaths {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl SweptPaths {
+    /// An empty record holding up to [`MAX_SWEPT_PATHS`].
+    pub fn new() -> Self {
+        Self::with_cap(MAX_SWEPT_PATHS)
+    }
+
+    /// An empty record holding up to `cap` paths, for tests.
+    pub fn with_cap(cap: usize) -> Self {
+        Self {
+            paths: BTreeSet::new(),
+            cap,
+            overflowed: false,
+        }
+    }
+
+    /// Records one change the next sweep stands for. A path recorded twice
+    /// is carried once.
+    pub fn record(&mut self, path: String) {
+        if self.overflowed {
+            return;
+        }
+        self.paths.insert(path);
+        if self.paths.len() > self.cap {
+            self.overflowed = true;
+            self.paths.clear();
+        }
+    }
+
+    /// Whether no change waits for a sweep.
+    pub fn is_empty(&self) -> bool {
+        !self.overflowed && self.paths.is_empty()
+    }
+
+    /// Takes what the next sweep carries and starts over: the recorded paths,
+    /// or `None` when more were recorded than the cap holds.
+    pub fn take(&mut self) -> Option<Vec<String>> {
+        let overflowed = std::mem::take(&mut self.overflowed);
+        let paths = std::mem::take(&mut self.paths);
+        (!overflowed).then(|| paths.into_iter().collect())
     }
 }
 
@@ -403,5 +471,50 @@ mod tests {
             !budget.take_owed_sweep(due + DEFAULT_SWEEP_COOLDOWN),
             "the storm's own sweeps are not owed again"
         );
+    }
+
+    #[test]
+    fn a_sweep_carries_each_recorded_change_once() {
+        let mut swept = SweptPaths::new();
+        assert!(swept.is_empty());
+
+        swept.record("/repo/b.rs".to_string());
+        swept.record("/repo/a.rs".to_string());
+        swept.record("/repo/b.rs".to_string());
+
+        assert!(!swept.is_empty());
+        assert_eq!(
+            swept.take(),
+            Some(vec!["/repo/a.rs".to_string(), "/repo/b.rs".to_string()])
+        );
+        assert!(swept.is_empty(), "taking the sweep leaves nothing owed");
+        assert_eq!(swept.take(), Some(Vec::new()));
+    }
+
+    #[test]
+    fn past_the_cap_a_sweep_carries_no_path() {
+        let mut swept = SweptPaths::with_cap(2);
+        for name in ["a", "b", "c", "d"] {
+            swept.record(format!("/repo/{name}.rs"));
+        }
+
+        assert!(!swept.is_empty(), "an overflowed record still owes a sweep");
+        assert_eq!(swept.take(), None);
+
+        swept.record("/repo/e.rs".to_string());
+        assert_eq!(
+            swept.take(),
+            Some(vec!["/repo/e.rs".to_string()]),
+            "the cap applies afresh after each sweep"
+        );
+    }
+
+    #[test]
+    fn the_cap_itself_still_fits() {
+        let mut swept = SweptPaths::with_cap(2);
+        swept.record("/repo/a.rs".to_string());
+        swept.record("/repo/b.rs".to_string());
+
+        assert_eq!(swept.take().map(|paths| paths.len()), Some(2));
     }
 }

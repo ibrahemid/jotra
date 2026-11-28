@@ -150,11 +150,47 @@ impl FileStamp {
     }
 }
 
-/// One row of the index: the summary, and the file it was read from.
+/// How far past a file's modification time a row must have been written for
+/// the stamp to vouch for it. A filesystem that keeps whole seconds (HFS+) or
+/// two (FAT) gives a second write inside that window the time the first had,
+/// so a row written then cannot tell the two apart.
+const STAMP_GRANULARITY_NS: u64 = 2_000_000_000;
+
+/// One row of the index: the summary, the file it was read from, and when the
+/// row was written.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct IndexRow {
     summary: ConversationSummary,
     stamp: FileStamp,
+    /// When the row was written, in nanoseconds since the epoch; zero for a
+    /// row an earlier build wrote, which is read again once.
+    #[serde(default)]
+    verified: u64,
+}
+
+impl IndexRow {
+    fn new(summary: ConversationSummary, stamp: FileStamp) -> Self {
+        Self {
+            summary,
+            stamp,
+            verified: now_ns(),
+        }
+    }
+
+    /// The row still describes a file with this stamp: the stamp matches, and
+    /// the row was written late enough after the file's time that a same-size
+    /// write since would have moved the time.
+    fn describes(&self, stamp: &FileStamp) -> bool {
+        self.stamp == *stamp && self.verified >= stamp.modified.saturating_add(STAMP_GRANULARITY_NS)
+    }
+}
+
+fn now_ns() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |since| {
+            u64::try_from(since.as_nanos()).unwrap_or(u64::MAX)
+        })
 }
 
 /// `chats/index.json`, keyed by conversation id.
@@ -205,8 +241,9 @@ impl ChatStore {
     /// A folder that does not exist yet is an empty list rather than an error:
     /// the pane asks for the list the first time it opens, before anything has
     /// been written. Rows come from the index; a file the index has no row
-    /// for, or whose size or time moved since its row was written, is read
-    /// and its row rewritten, and a row whose file is gone is dropped. A file
+    /// for, whose size or time moved since its row was written, or whose row
+    /// was written too soon after its time to vouch for it, is read and its
+    /// row rewritten, and a row whose file is gone is dropped. A file
     /// that does not parse is skipped with a warning naming the file, so one
     /// bad file does not hide the rest.
     pub fn list(&self) -> Result<Vec<ConversationSummary>, ChatStoreError> {
@@ -237,7 +274,7 @@ impl ChatStore {
         let mut changed = false;
         let mut summaries: Vec<ConversationSummary> = Vec::with_capacity(files.len());
         for (id, path, stamp) in &files {
-            if let Some(row) = index.rows.get(id).filter(|row| row.stamp == *stamp) {
+            if let Some(row) = index.rows.get(id).filter(|row| row.describes(stamp)) {
                 summaries.push(row.summary.clone());
                 continue;
             }
@@ -249,13 +286,9 @@ impl ChatStore {
                 }) {
                 Ok(conversation) => {
                     let summary = ConversationSummary::from(&conversation);
-                    index.rows.insert(
-                        id.clone(),
-                        IndexRow {
-                            summary: summary.clone(),
-                            stamp: *stamp,
-                        },
-                    );
+                    index
+                        .rows
+                        .insert(id.clone(), IndexRow::new(summary.clone(), *stamp));
                     summaries.push(summary);
                 }
                 // The file name, and nothing the file holds: what failed to
@@ -327,10 +360,10 @@ impl ChatStore {
                 let mut index = self.read_index();
                 index.rows.insert(
                     conversation.id.clone(),
-                    IndexRow {
-                        summary: ConversationSummary::from(conversation),
-                        stamp: FileStamp::of(&meta),
-                    },
+                    IndexRow::new(
+                        ConversationSummary::from(conversation),
+                        FileStamp::of(&meta),
+                    ),
                 );
                 self.write_index(&index);
             }

@@ -695,6 +695,7 @@ fn index_backed_commands_answer_within_budget_while_a_walk_holds_the_index() {
                     "md",
                     WriteOrigin::Editor,
                     None,
+                    None,
                 )
                 .expect("create the note's file");
                 let created = start.elapsed().as_millis();
@@ -915,7 +916,7 @@ fn a_rename_with_its_links_at_5000_notes_stays_under_budget() {
     };
     for file in &linking {
         let outcome =
-            note_ops::rewrite_links_in_file(Path::new(file), &rename, None, None, None, None)
+            note_ops::rewrite_links_in_file(Path::new(file), &rename, None, None, None, None, None)
                 .expect("rewrite must not fail");
         assert_eq!(outcome, LinkRewrite::Written, "{file}");
     }
