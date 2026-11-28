@@ -195,9 +195,11 @@ pub struct GuardedWrite<'a> {
     pub on_conflict: ConflictPolicy,
     /// Where the write is captured, if anywhere.
     pub history: HistoryHook<'a>,
-    /// The data folder's write lock, held across the last read of the file
-    /// and the rename. `None` writes without it: the last read still decides,
-    /// and nothing holds another process off between that read and the rename.
+    /// The data folder's write lock, held across the last read of the file,
+    /// the rename and the version the write keeps, so a reader that waits for
+    /// the lock finds the version of the bytes it read. `None` writes without
+    /// it: the last read still decides, and nothing holds another process off
+    /// between that read and the rename.
     pub lock: Option<&'a WriteLock>,
 }
 
@@ -399,6 +401,13 @@ fn land_with(
                     before_write,
                 ));
             }
+            (SaveDecision::Refuse, None) => {
+                drop(held);
+                drop(prepared);
+                return Err(StorageError::SourceRemoved {
+                    path: target.to_string_lossy().into_owned(),
+                });
+            }
             _ => {}
         }
         crate::atomic::refuse_unreplaceable_destination(target)
@@ -419,7 +428,6 @@ fn land_with(
                 continue;
             }
         };
-        drop(held);
         placed.finish();
         let after = written_state(target, incoming, req.bytes.len() as u64);
         if let Some(hook) = req.history {
@@ -432,6 +440,7 @@ fn land_with(
                 before_hash: found.map(|state| state.hash),
             });
         }
+        drop(held);
         return Ok(WriteOutcome {
             disk_state: after,
             found,
@@ -444,22 +453,27 @@ fn land_with(
 /// The decision for a file that holds something other than what the first
 /// read found.
 ///
-/// A file that went away is written, as a write to a missing file always is,
-/// and one that already holds the incoming bytes needs no write. Otherwise it
+/// One that already holds the incoming bytes needs no write. Otherwise it
 /// depends on what the write was built from. A caller that handed over its own
 /// read ([`DiskRead::Read`]) built its bytes from that text, and the file no
 /// longer holds it, so the write is refused: a link rewrite of old text, a
-/// program's write against the text it read, or a new note where a file has
-/// since appeared would each replace text nobody read. A caller whose bytes
-/// owe nothing to the disk ([`DiskRead::Fresh`]) is judged again by the guard
-/// against what the file holds now.
+/// program's write against the text it read (or one the person applied after
+/// reviewing it), or a new note where a file has since appeared would each
+/// replace text nobody read. The same holds for a file read and then removed,
+/// which the write would bring back. A caller whose bytes owe nothing to the
+/// disk ([`DiskRead::Fresh`]) writes a file that went away, as a write to a
+/// missing file always does, and is judged again by the guard against what a
+/// file that is there holds now.
 fn decide_again(
     req: &GuardedWrite<'_>,
     found: Option<DiskState>,
     incoming: Sha256Digest,
 ) -> SaveDecision {
     match found {
-        None => SaveDecision::Proceed,
+        None => match req.on_disk {
+            DiskRead::Read(Some(_)) => SaveDecision::Refuse,
+            DiskRead::Read(None) | DiskRead::Fresh => SaveDecision::Proceed,
+        },
         Some(state) if state.hash == incoming => SaveDecision::AlreadyIdentical,
         Some(state) => match req.on_disk {
             DiskRead::Read(_) => SaveDecision::Refuse,
@@ -523,6 +537,29 @@ pub fn create_note_guarded(
     req: CreateNote<'_>,
     before_write: BeforeWrite<'_>,
 ) -> StorageResult<PathBuf> {
+    mint_note_file(req, before_write, Some(LineEnding::Lf))
+}
+
+/// Mints a note as [`create_note_guarded`] does, keeping the line endings
+/// `req.content` carries: piped text brings the convention of whatever
+/// produced it.
+///
+/// # Errors
+///
+/// [`create_note_guarded`]'s.
+pub fn create_piped_note_guarded(
+    req: CreateNote<'_>,
+    before_write: BeforeWrite<'_>,
+) -> StorageResult<PathBuf> {
+    mint_note_file(req, before_write, None)
+}
+
+/// Mints a note, writing its text with `line_ending`, or as given for `None`.
+fn mint_note_file(
+    req: CreateNote<'_>,
+    before_write: BeforeWrite<'_>,
+    line_ending: Option<LineEnding>,
+) -> StorageResult<PathBuf> {
     let stem = jotra_core::notes::note_stem_for(req.stem.trim(), req.extension)
         .ok_or(StorageError::NoteNameEmpty)?;
     std::fs::create_dir_all(req.notes_root)?;
@@ -547,10 +584,11 @@ pub fn create_note_guarded(
             folder: req.notes_root.to_path_buf(),
         });
     }
-    // A file that does not exist yet has no convention to keep, so a note Jotra
-    // mints is LF whatever the text handed in carries.
-    let content = LineEnding::Lf.apply(req.content);
-    write_note_guarded(
+    let content = match line_ending {
+        Some(ending) => ending.apply(req.content),
+        None => std::borrow::Cow::Borrowed(req.content),
+    };
+    let outcome = write_note_guarded(
         GuardedWrite {
             target: &path,
             bytes: content.as_bytes(),
@@ -574,6 +612,14 @@ pub fn create_note_guarded(
         },
         other => other,
     })?;
+    // Another writer minted the same bytes under this name first. That file
+    // is theirs, so this note still needs a name of its own.
+    if outcome.decision == SaveDecision::AlreadyIdentical {
+        return Err(StorageError::NoteNameTaken {
+            name,
+            folder: req.notes_root.to_path_buf(),
+        });
+    }
     Ok(path)
 }
 

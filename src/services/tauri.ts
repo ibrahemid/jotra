@@ -888,6 +888,11 @@ export async function openFileConfirmed(path: string): Promise<FileOpenResult> {
   return invoke("open_file_confirmed", { path });
 }
 
+// Files handed to the window that got no tab, so a `jotra --wait` on them returns.
+export async function filesNotOpened(paths: string[]): Promise<void> {
+  return invoke("files_not_opened", { paths });
+}
+
 // The language chosen for a file, or null to let its name decide. Answers the
 // row as it now stands.
 export async function setBufferLanguage(
@@ -1563,6 +1568,10 @@ export async function listDefaultAppTypes(): Promise<ClaimableType[]> {
 
 export async function getDefaultAppStatus(id: string): Promise<DefaultAppStatus> {
   return invoke("get_default_app_status", { id });
+}
+
+export async function getDefaultAppSupport(): Promise<boolean> {
+  return invoke("get_default_app_support");
 }
 
 export async function setDefaultApp(id: string): Promise<void> {

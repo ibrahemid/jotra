@@ -16,6 +16,7 @@
 use std::ffi::OsStr;
 use std::path::{Component, Path, PathBuf};
 
+use crate::bundle_rename::BUNDLE_IDENTIFIER;
 use crate::legacy_names;
 
 /// The command's name on the PATH.
@@ -24,7 +25,8 @@ pub const COMMAND_NAME: &str = "jotra";
 /// The suffix the command's file name carries on Windows.
 const WINDOWS_SUFFIX: &str = ".exe";
 
-/// Where the command is linked on macOS and on a Linux package install.
+/// Where the command is linked on macOS, and on Linux outside a package and an
+/// AppImage.
 pub const SYSTEM_LINK: &str = "/usr/local/bin/jotra";
 
 /// The folder, under the home folder, an AppImage copies the command into.
@@ -58,6 +60,9 @@ pub struct InstallFacts<'a> {
     pub windows: bool,
     /// The app runs from an AppImage.
     pub in_appimage: bool,
+    /// The app was installed from a `.deb` or `.rpm`, which puts the command
+    /// on the PATH beside it.
+    pub linux_package: bool,
     /// The user's home folder.
     pub home: Option<&'a Path>,
 }
@@ -65,7 +70,7 @@ pub struct InstallFacts<'a> {
 /// Where the command goes for an app running as `facts` describe, or `None`
 /// for an AppImage with no home folder to copy into.
 pub fn install_target(facts: InstallFacts<'_>) -> Option<InstallTarget> {
-    if facts.windows {
+    if facts.windows || facts.linux_package {
         return Some(InstallTarget::ByInstaller);
     }
     if facts.in_appimage {
@@ -117,18 +122,19 @@ pub fn is_jotra_command_target(target: &Path, beside_app: bool) -> bool {
     if beside_app || is_in_appimage_mount(target) {
         return true;
     }
-    let mut ancestors = target.ancestors().skip(1);
-    let in_macos_folder = ancestors
-        .next()
-        .is_some_and(|dir| dir.file_name().is_some_and(|name| name == "MacOS"));
-    let in_contents = ancestors
-        .next()
-        .is_some_and(|dir| dir.file_name().is_some_and(|name| name == "Contents"));
-    let in_app = ancestors.next().is_some_and(|dir| {
+    app_bundle_of_command(target).is_some()
+}
+
+/// The `<name>.app` folder a command at `<name>.app/Contents/MacOS/<command>`
+/// sits in.
+pub fn app_bundle_of_command(target: &Path) -> Option<&Path> {
+    let named = |dir: &&Path, folder: &str| dir.file_name().is_some_and(|name| name == folder);
+    let macos = target.parent().filter(|dir| named(dir, "MacOS"))?;
+    let contents = macos.parent().filter(|dir| named(dir, "Contents"))?;
+    contents.parent().filter(|dir| {
         dir.extension()
             .is_some_and(|extension| extension.eq_ignore_ascii_case("app"))
-    });
-    in_macos_folder && in_contents && in_app
+    })
 }
 
 /// Whether `bytes` are a build of the `jotra` command ([`CLI_SIGNATURE`]).
@@ -149,6 +155,9 @@ pub enum InstalledEntry {
         target: PathBuf,
         /// Whether the app binary sits beside that target.
         beside_app: bool,
+        /// The `CFBundleIdentifier` of the app bundle the target sits in,
+        /// when that bundle exists and names one.
+        bundle_identifier: Option<String>,
     },
     /// A file, and whether it is a build of the `jotra` command.
     File {
@@ -161,11 +170,20 @@ pub enum InstalledEntry {
 
 /// Whether an install may put the command where `entry` is. Anything that is
 /// not Jotra's own command is left alone: a different tool named `jotra` is
-/// never deleted.
+/// never deleted, and neither is a link into another app's bundle.
 pub fn may_replace(entry: &InstalledEntry) -> bool {
     match entry {
         InstalledEntry::Absent => true,
-        InstalledEntry::Link { target, beside_app } => is_jotra_command_target(target, *beside_app),
+        InstalledEntry::Link {
+            target,
+            beside_app,
+            bundle_identifier,
+        } => {
+            is_jotra_command_target(target, *beside_app)
+                && bundle_identifier
+                    .as_deref()
+                    .is_none_or(|identifier| identifier == BUNDLE_IDENTIFIER)
+        }
         InstalledEntry::File { is_jotra_command } => *is_jotra_command,
         InstalledEntry::Other => false,
     }

@@ -18,7 +18,7 @@ use std::time::{Duration, Instant};
 use jotra_core::config::mcp::McpConfig;
 use jotra_core::diff::{line_diff_exact, Hunk};
 use jotra_core::instance::{is_wait_token, ReviewAsk};
-use jotra_core::write_review::{ProposedChange, ReviewAnswer, WriteProposal, REVIEW_WAIT};
+use jotra_core::write_review::{review_wait_for, ProposedChange, ReviewAnswer, WriteProposal};
 use serde::Serialize;
 use tauri::{AppHandle, Manager};
 use tracing::warn;
@@ -32,11 +32,12 @@ use crate::state::AppState;
 /// Apply never lands in a file the program has stopped looking for.
 pub const REVIEW_MARGIN: Duration = Duration::from_secs(2);
 
-/// How long a held write sent at `sent_at_ms` still takes an answer at
-/// `now_ms`: what is left of [`REVIEW_WAIT`], less [`REVIEW_MARGIN`].
-pub fn remaining_wait(sent_at_ms: i64, now_ms: i64) -> Duration {
+/// How long a held write from `program` sent at `sent_at_ms` still takes an
+/// answer at `now_ms`: what is left of the wait `jotra mcp` gives that program
+/// ([`review_wait_for`]), less [`REVIEW_MARGIN`].
+pub fn remaining_wait(program: &str, sent_at_ms: i64, now_ms: i64) -> Duration {
     let elapsed = u64::try_from(now_ms.saturating_sub(sent_at_ms)).unwrap_or(0);
-    REVIEW_WAIT
+    review_wait_for(program)
         .saturating_sub(Duration::from_millis(elapsed))
         .saturating_sub(REVIEW_MARGIN)
 }
@@ -191,7 +192,7 @@ fn answer_not_shown(jotra_dir: &Path, token: &str) {
 /// forward, or answers that it was not shown.
 pub fn show_review(app: &AppHandle, ask: &ReviewAsk, sent_at_ms: i64, now_ms: i64) {
     let state = app.state::<AppState>();
-    let wait = remaining_wait(sent_at_ms, now_ms);
+    let wait = remaining_wait(&ask.program, sent_at_ms, now_ms);
     if wait.is_zero() {
         answer_not_shown(&state.jotra_dir, &ask.token);
         return;
@@ -260,6 +261,7 @@ pub fn answer_inner(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use jotra_core::write_review::REVIEW_WAIT;
 
     #[test]
     fn a_held_write_is_taken_once_and_not_after_it_stopped_waiting() {
@@ -276,19 +278,32 @@ mod tests {
 
     #[test]
     fn the_app_stops_taking_an_answer_before_the_program_stops_waiting() {
+        let program = "claude-code";
         let waited = i64::try_from(REVIEW_WAIT.as_millis()).expect("fits");
-        assert_eq!(remaining_wait(1_000, 1_000), REVIEW_WAIT - REVIEW_MARGIN);
         assert_eq!(
-            remaining_wait(1_000, 61_000),
+            remaining_wait(program, 1_000, 1_000),
+            REVIEW_WAIT - REVIEW_MARGIN
+        );
+        assert_eq!(
+            remaining_wait(program, 1_000, 61_000),
             REVIEW_WAIT - Duration::from_secs(60) - REVIEW_MARGIN
         );
-        assert_eq!(remaining_wait(0, waited), Duration::ZERO);
-        assert_eq!(remaining_wait(0, waited + 10_000), Duration::ZERO);
+        assert_eq!(remaining_wait(program, 0, waited), Duration::ZERO);
+        assert_eq!(remaining_wait(program, 0, waited + 10_000), Duration::ZERO);
         assert_eq!(
-            remaining_wait(5_000, 1_000),
+            remaining_wait(program, 5_000, 1_000),
             REVIEW_WAIT - REVIEW_MARGIN,
             "a clock moved back takes nothing off"
         );
+    }
+
+    #[test]
+    fn a_codex_write_stops_taking_an_answer_before_codex_gives_up_on_the_call() {
+        let codex = "codex-mcp-client";
+        let shown = remaining_wait(codex, 1_000, 1_000);
+        assert!(shown < jotra_core::write_review::CODEX_TOOL_TIMEOUT);
+        assert_eq!(shown, review_wait_for(codex) - REVIEW_MARGIN);
+        assert_eq!(remaining_wait(codex, 0, 60_000), Duration::ZERO);
     }
 
     #[test]

@@ -227,6 +227,7 @@ fn the_install_accepts_both_command_names() {
     assert!(may_replace(&InstalledEntry::Link {
         target: PathBuf::from("/Applications/Writ.app/Contents/MacOS/writ"),
         beside_app: false,
+        bundle_identifier: None,
     }));
 }
 
@@ -251,6 +252,7 @@ fn an_install_keeps_only_an_existing_legacy_name_of_ours_current() {
     assert!(should_refresh_legacy_command(&InstalledEntry::Link {
         target: PathBuf::from("/Applications/Writ.app/Contents/MacOS/writ"),
         beside_app: false,
+        bundle_identifier: None,
     }));
     assert!(should_refresh_legacy_command(&InstalledEntry::File {
         is_jotra_command: true
@@ -261,6 +263,7 @@ fn an_install_keeps_only_an_existing_legacy_name_of_ours_current() {
     assert!(!should_refresh_legacy_command(&InstalledEntry::Link {
         target: PathBuf::from("/opt/other/bin/writ"),
         beside_app: false,
+        bundle_identifier: None,
     }));
     assert!(!should_refresh_legacy_command(&InstalledEntry::Other));
 }

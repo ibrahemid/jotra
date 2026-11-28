@@ -10,8 +10,10 @@
 //! The lock is a file in the data folder that carries no data. Nothing is
 //! written to it, nothing reads it, and the app learns of a program's write the
 //! way it always has, through the folder watcher (ADR-033). What it is held
-//! around is a read of the note and a rename, so it is held for microseconds:
-//! the replacement is written and synced before it is taken.
+//! around is a read of the note, a rename and, for a writer keeping versions,
+//! the version of what landed: the replacement is written and synced before it
+//! is taken. A watcher that finds no version for the bytes it read waits for
+//! the lock and asks again, so a version kept slowly still names its writer.
 //!
 //! A writer that cannot have it writes without it rather than not at all: a
 //! lock file that will not open, a data folder that is not writable, or a
@@ -28,8 +30,9 @@ use tracing::warn;
 pub const WRITE_LOCK_FILE: &str = "write.lock";
 
 /// How long a writer waits for another to let go before writing without the
-/// lock. A holder lets go after one read and one rename; one that has not
-/// within this is stopped or hung, and a save is not held behind it.
+/// lock. A holder lets go after one read, one rename and the version it keeps;
+/// one that has not within this is stopped or hung, and a save is not held
+/// behind it.
 pub const WAIT: Duration = Duration::from_secs(2);
 
 /// How long a waiting writer sleeps between tries.

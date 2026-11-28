@@ -15,7 +15,7 @@ use std::path::{Path, PathBuf};
 use jotra_core::instance::is_wait_token;
 use jotra_core::open_context::OpenContext;
 
-use crate::atomic::write_new;
+use crate::atomic::write_new_private;
 use crate::errors::StorageResult;
 
 /// The folder answers land in.
@@ -34,9 +34,9 @@ pub fn answer_path(jotra_dir: &Path, token: &str) -> Option<PathBuf> {
 
 /// Leaves `context` for the `get_context` call holding `token`.
 ///
-/// Written whole through [`write_new`], so a reader never sees half an answer
-/// and an answer already there is never replaced; the temp file it is written
-/// through is created readable by its owner only, and the answer keeps that.
+/// Written whole through [`write_new_private`], so a reader never sees half an
+/// answer, an answer already there is never replaced, and only the current
+/// user can open it, on every platform.
 ///
 /// # Errors
 ///
@@ -46,7 +46,7 @@ pub fn write_answer(jotra_dir: &Path, token: &str, context: &OpenContext) -> Sto
     let path = answer_path(jotra_dir, token)
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "not a context token"))?;
     std::fs::create_dir_all(answers_dir(jotra_dir))?;
-    write_new(&path, &serde_json::to_vec(context)?)?;
+    write_new_private(&path, &serde_json::to_vec(context)?)?;
     Ok(())
 }
 

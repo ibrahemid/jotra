@@ -13,7 +13,7 @@ use std::ffi::{OsStr, OsString};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
-use std::sync::mpsc;
+use std::sync::{mpsc, OnceLock};
 use std::time::{Duration, Instant};
 
 use jotra_core::activity::OffCall;
@@ -213,7 +213,7 @@ fn is_runnable(path: &Path) -> bool {
     path.is_file()
 }
 
-/// The `PATH` the person's login shell sets, read by running it once.
+/// The `PATH` the person's login shell sets, read by running it.
 ///
 /// Interactive as well as login, so the startup file most people add their
 /// tools in is read too. Its stdin is closed and it is stopped after five
@@ -240,10 +240,21 @@ fn login_shell_path() -> Option<String> {
     None
 }
 
+/// The login shell's `PATH`, read by `read` the first time it is asked for and
+/// kept in `cell` after that, a failed read included, so loading the client
+/// cards again starts no shell.
+pub fn remembered_login_path(
+    cell: &OnceLock<Option<String>>,
+    read: impl FnOnce() -> Option<String>,
+) -> Option<&str> {
+    cell.get_or_init(read).as_deref()
+}
+
 /// Where this app looks for a client's command now.
 fn current_search() -> ProgramSearch {
+    static LOGIN_PATH: OnceLock<Option<String>> = OnceLock::new();
     program_search(
-        login_shell_path().as_deref(),
+        remembered_login_path(&LOGIN_PATH, login_shell_path),
         std::env::var_os("PATH").as_deref(),
         dirs::home_dir().as_deref(),
     )
@@ -536,7 +547,7 @@ fn ready_server() -> Result<PathBuf, ConnectError> {
 }
 
 /// IPC: every card, with whether each client's own command was found. Off the
-/// main thread: it runs the login shell once.
+/// main thread: the first load runs the login shell.
 #[tauri::command]
 pub async fn mcp_connect_cards() -> Result<Vec<ClientCard>, String> {
     super::offload::run_detached(super::offload::ERR_COMMAND_STOPPED, || {

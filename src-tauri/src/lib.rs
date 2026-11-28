@@ -406,8 +406,8 @@ fn restore_main_window_geometry(
 pub fn run() {
     #[cfg(target_os = "windows")]
     let app_user_model_id = windows_rename::set_app_user_model_id();
-    let jotra_dir = match state::locate_data_folder() {
-        Ok(data_folder) => data_folder.folder,
+    let (jotra_dir, data_folder_origin) = match state::locate_data_folder() {
+        Ok(data_folder) => (data_folder.folder, data_folder.origin),
         Err(error) => startup_failure::abort_with_report(
             &StartupFailure::new(
                 StartupStage::DataDirectory,
@@ -438,7 +438,10 @@ pub fn run() {
     // Before the logs, the database or anything else in the folder is
     // touched: a launch that finds another Jotra on this folder hands its
     // paths over and ends here, so two processes never write the same notes.
-    let instance_lock = instance::claim_or_hand_over(&jotra_dir);
+    let instance::LaunchClaim {
+        lock: instance_lock,
+        context,
+    } = instance::claim_for_launch(&jotra_dir, data_folder_origin, tauri::generate_context!());
 
     let logs_dir = jotra_dir.join("logs");
     // Installed first: setting the hook touches nothing, while opening the
@@ -634,6 +637,7 @@ pub fn run() {
             commands::note_history::compare_note_version,
             commands::file::open_file,
             commands::file::open_file_confirmed,
+            commands::file::files_not_opened,
             commands::file::pick_files_to_open,
             commands::file::pick_note_save_path,
             commands::materialise::materialise_note,
@@ -695,6 +699,7 @@ pub fn run() {
             commands::cli::install_cli,
             commands::default_app::list_default_app_types,
             commands::default_app::get_default_app_status,
+            commands::default_app::get_default_app_support,
             commands::default_app::set_default_app,
             commands::inbox::pick_inbox_folder,
             commands::inbox::clear_inbox,
@@ -1092,11 +1097,10 @@ pub fn run() {
 
     // A missing or broken system web view fails here, before any window exists
     // to show it in.
-    let app = startup_failure::build_window(|| builder.build(tauri::generate_context!()))
-        .unwrap_or_else(|failure| {
-            log_guard.flush();
-            startup_failure::abort_with_report(&failure, Some(logs_dir.as_path()))
-        });
+    let app = startup_failure::build_window(|| builder.build(context)).unwrap_or_else(|failure| {
+        log_guard.flush();
+        startup_failure::abort_with_report(&failure, Some(logs_dir.as_path()))
+    });
 
     app.run(move |app_handle, event| {
         // Held by the loop for the life of the process: the event loop ends it

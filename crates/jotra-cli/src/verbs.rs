@@ -49,7 +49,11 @@ pub enum Verb {
     /// A note's tags, or every tag in the notes folder.
     Tags { note: Option<String>, json: bool },
     /// Create a note in the notes folder.
-    New { name: Option<String>, json: bool },
+    New {
+        name: Option<String>,
+        json: bool,
+        wait_for_stdin: bool,
+    },
     /// Rename a note in place.
     Rename {
         note: String,
@@ -69,13 +73,18 @@ pub enum Verb {
     /// Every note in the folder, or in one folder inside it.
     Ls { folder: Option<String>, json: bool },
     /// Piped text added to the end of a note.
-    Append { note: String, json: bool },
+    Append {
+        note: String,
+        json: bool,
+        wait_for_stdin: bool,
+    },
     /// Today's file, minted when the day has none, with piped text added
     /// first when `append` is set.
     Today {
         append: bool,
         open: bool,
         json: bool,
+        wait_for_stdin: bool,
     },
     /// A note opened by name, at a line when the name ends in `:LINE`.
     Open {
@@ -91,6 +100,24 @@ impl Verb {
         matches!(
             self,
             Verb::Append { .. } | Verb::New { .. } | Verb::Today { append: true, .. }
+        )
+    }
+
+    /// Whether a lone `-` was given: stdin is read until it closes, however
+    /// long its writer takes, instead of within [`crate::PIPE_FIRST_BYTE_WAIT`].
+    pub fn waits_for_stdin(&self) -> bool {
+        matches!(
+            self,
+            Verb::Append {
+                wait_for_stdin: true,
+                ..
+            } | Verb::New {
+                wait_for_stdin: true,
+                ..
+            } | Verb::Today {
+                wait_for_stdin: true,
+                ..
+            }
         )
     }
 }
@@ -193,12 +220,14 @@ pub fn run(verb: Verb, ctx: &Context) -> Outcome {
             json,
         } => read_verb(&note, json, ctx, note_tags_document),
         Verb::Tags { note: None, json } => folder_tags(json, ctx),
-        Verb::New { name, json } => new_note(name.as_deref(), json, ctx),
+        Verb::New { name, json, .. } => new_note(name.as_deref(), json, ctx),
         Verb::Search { query, limit, json } => crate::host_verbs::search(&query, limit, json, ctx),
         Verb::Cat { note, json } => crate::host_verbs::cat(&note, json, ctx),
         Verb::Ls { folder, json } => crate::host_verbs::ls(folder.as_deref(), json, ctx),
-        Verb::Append { note, json } => crate::host_verbs::append(&note, json, ctx),
-        Verb::Today { append, open, json } => crate::host_verbs::today(append, open, json, ctx),
+        Verb::Append { note, json, .. } => crate::host_verbs::append(&note, json, ctx),
+        Verb::Today {
+            append, open, json, ..
+        } => crate::host_verbs::today(append, open, json, ctx),
         Verb::Open { note, wait, json } => crate::host_verbs::open(&note, wait, json, ctx),
         Verb::Rename {
             note,
@@ -220,6 +249,9 @@ pub(crate) enum IndexError {
     Older { db: i32, binary: i32 },
     /// A note index a newer Jotra wrote.
     Newer { db: i32, binary: i32 },
+    /// A note index at this build's version that has not recorded every
+    /// migration below it, so a column a verb reads may not be there.
+    Incomplete { missing: i32 },
     /// A file is there and this build could not query it: a truncated or
     /// corrupt database, one another process holds, one it may not read. Kept
     /// apart from [`IndexError::Older`] because running the app fixes that one
@@ -246,6 +278,11 @@ impl std::fmt::Display for IndexError {
                 "the index is at version {db}, past the version {binary} this jotra reads. \
                  It was written by a newer Jotra."
             ),
+            IndexError::Incomplete { missing } => write!(
+                f,
+                "the index has not taken update {missing} that this jotra reads. \
+                 Jotra brings it up to date the next time it runs."
+            ),
             IndexError::Unreadable(path) => write!(
                 f,
                 "the file at {} could not be read as an index.",
@@ -258,9 +295,10 @@ impl std::fmt::Display for IndexError {
 /// Opens the index read-only and checks it was written by this build's schema.
 ///
 /// A version older than this binary's means the app has not migrated yet, and
-/// the columns a verb reads may not be there. A newer one was written by a
-/// build that knows more than this one. Both are refused rather than read
-/// through the wrong column layout, and neither is repaired: migrating is the
+/// the columns a verb reads may not be there, and the same holds for one at
+/// this version that skipped a migration below it. A newer one was written by a
+/// build that knows more than this one. Each is refused rather than read
+/// through the wrong column layout, and none is repaired: migrating is the
 /// app's, and only the app's.
 pub(crate) fn open_index(db_path: &Path) -> Result<NotesIndexStore, IndexError> {
     if !db_path.is_file() {
@@ -279,7 +317,15 @@ pub(crate) fn open_index(db_path: &Path) -> Result<NotesIndexStore, IndexError> 
     match db.cmp(&binary) {
         std::cmp::Ordering::Less => Err(IndexError::Older { db, binary }),
         std::cmp::Ordering::Greater => Err(IndexError::Newer { db, binary }),
-        std::cmp::Ordering::Equal => Ok(store),
+        std::cmp::Ordering::Equal => {
+            let pending = store
+                .pending_schema_versions()
+                .map_err(|_| IndexError::Unreadable(db_path.to_path_buf()))?;
+            match pending.first() {
+                Some(&missing) => Err(IndexError::Incomplete { missing }),
+                None => Ok(store),
+            }
+        }
     }
 }
 
@@ -792,6 +838,7 @@ mod tests {
             IndexError::Absent(PathBuf::from("/a/jotra.db")),
             IndexError::Older { db: 41, binary: 42 },
             IndexError::Newer { db: 43, binary: 42 },
+            IndexError::Incomplete { missing: 41 },
             IndexError::Unreadable(PathBuf::from("/a/jotra.db")),
         ]
         .iter()

@@ -26,6 +26,7 @@ const h = await vi.hoisted(async () => {
     refresh: vi.fn().mockResolvedValue(undefined),
     clear: vi.fn().mockResolvedValue(undefined),
     setPermission: vi.fn().mockResolvedValue(undefined),
+    setContext: vi.fn().mockResolvedValue(undefined),
     focusEditor: vi.fn(),
   };
 });
@@ -46,6 +47,7 @@ vi.mock("../../stores/global/activity", () => ({
     refresh: h.refresh,
     clear: h.clear,
     setPermission: h.setPermission,
+    setContext: h.setContext,
   },
 }));
 
@@ -105,6 +107,7 @@ afterEach(() => {
   h.refresh.mockClear();
   h.clear.mockClear();
   h.setPermission.mockClear();
+  h.setContext.mockClear();
   vi.useRealTimers();
   cleanup();
 });
@@ -333,6 +336,20 @@ describe("ActivityPanel", () => {
 
     expect(h.setPermission).toHaveBeenCalledTimes(1);
     expect(h.setPermission).toHaveBeenCalledWith("Claude Code", true, false);
+  });
+
+  it("a program can be let see the open file from its waiting row", () => {
+    h.setPending([waitingFor("Claude Code")]);
+    openActivity();
+    const { container } = render(() => <ActivityPanel />);
+
+    const control = container.querySelector('[data-action="approve-context"]')!;
+    expect(control.textContent).toBe("Let it see the open file");
+
+    fireEvent.click(control);
+    expect(h.setContext).toHaveBeenCalledTimes(1);
+    expect(h.setContext).toHaveBeenCalledWith("Claude Code", true);
+    expect(h.setPermission).not.toHaveBeenCalled();
   });
 
   it("the writing control says it grants reading too, and grants it", () => {

@@ -16,11 +16,14 @@ use jotra_core::text_encoding::TextEncoding;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use jotra_core::hash::Sha256Digest;
+use jotra_core::note_history::VersionKey;
 use jotra_core::notes::guard::DiskState;
 use jotra_core::notes::identity::{FileIdentity, IdentityProbe};
 use jotra_core::notes::Writer;
 use jotra_core::watcher::pending::RemovalHolds;
 use jotra_storage::paths::file_name_only;
+use jotra_storage::write_lock::WriteLock;
 use tauri::{AppHandle, Manager};
 
 use crate::state::AppState;
@@ -310,12 +313,29 @@ impl NoteFiles for SharedNoteFiles {
 
 /// What wrote `bytes` into the note at `path`, as the version store records
 /// it. Reads the store only; never the buffer store, and never the file.
+///
+/// A writer keeps the version of what it landed before it lets go of the data
+/// folder's write lock. Bytes with no version yet are asked about again once
+/// the lock is had, so a version kept slower than the watcher's window still
+/// names its writer, and bytes nobody versions cost one more read.
 pub(crate) fn writer_of_file(state: &AppState, path: &Path, bytes: &[u8]) -> Option<Writer> {
     let key = state.note_history.key_for(path)?;
-    match state
-        .note_history
-        .writer_of(&key, jotra_core::hash::sha256_bytes(bytes))
-    {
+    let digest = jotra_core::hash::sha256_bytes(bytes);
+    stored_writer(state, &key, digest, path).or_else(|| {
+        let _held = WriteLock::in_data_folder(&state.jotra_dir).hold()?;
+        stored_writer(state, &key, digest, path)
+    })
+}
+
+/// The writer the version store records for `digest` as the note's newest
+/// version, or `None` when it records none or could not be read.
+fn stored_writer(
+    state: &AppState,
+    key: &VersionKey,
+    digest: Sha256Digest,
+    path: &Path,
+) -> Option<Writer> {
+    match state.note_history.writer_of(key, digest) {
         Ok(stored) => stored.as_deref().and_then(Writer::from_stored),
         Err(error) => {
             tracing::warn!(
@@ -420,6 +440,7 @@ fn apply_move(state: &AppState, note_id: &str, from: &Path, to: &Path) -> MoveOu
     }
     state.follow_note_path(note_id, to);
     state.observe_source_file(note_id, to);
+    crate::instance::tab_moved(state, from, to);
     tracing::info!(
         note = %note_id,
         from = %file_name_only(&from.to_string_lossy()),

@@ -91,6 +91,29 @@ pub fn acquire(jotra_dir: &Path) -> Result<InstanceLock, InstanceLockError> {
     }
 }
 
+/// Whether a running app holds `jotra_dir`.
+///
+/// Asked with a shared lock taken and let go at once, so two commands asking
+/// in the same instant do not read each other's look as a running app. A
+/// launch that meets the look waits for it and takes the folder. A folder that
+/// cannot be locked at all answers `false`: the app then runs without the lock
+/// too, and starting it again only brings it forward.
+pub fn is_held(jotra_dir: &Path) -> bool {
+    if std::fs::create_dir_all(jotra_dir).is_err() {
+        return false;
+    }
+    let Ok(file) = OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(lock_path(jotra_dir))
+    else {
+        return false;
+    };
+    matches!(file.try_lock_shared(), Err(TryLockError::WouldBlock))
+}
+
 /// Where a waiting `jotra` leaves its markers inside `jotra_dir`.
 pub fn waits_dir(jotra_dir: &Path) -> PathBuf {
     jotra_dir.join(WAITS_DIR)

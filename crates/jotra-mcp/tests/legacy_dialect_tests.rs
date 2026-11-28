@@ -12,7 +12,8 @@ use jotra_core::mcp_dialect::Dialect;
 use jotra_mcp::consent::EnabledReads;
 use jotra_mcp::server::JotraServer;
 use jotra_mcp::tools::{
-    FixedAppFolder, JotraNotReached, JotraOpener, ToolHost, CONTEXT_TOOLS, READ_TOOLS, WRITE_TOOLS,
+    FixedAppFolder, JotraNotReached, JotraOpener, LinkHanded, ToolHost, CONTEXT_TOOLS, READ_TOOLS,
+    WRITE_TOOLS,
 };
 
 const PROTOCOL_VERSION: &str = "2025-06-18";
@@ -50,9 +51,9 @@ fn fixture() -> Fixture {
 struct RecordingOpener(Arc<Mutex<Vec<String>>>);
 
 impl JotraOpener for RecordingOpener {
-    fn open_link(&self, link: &str) -> Result<(), JotraNotReached> {
+    fn open_link(&self, link: &str) -> Result<LinkHanded, JotraNotReached> {
         self.0.lock().expect("links").push(link.to_string());
-        Ok(())
+        Ok(LinkHanded::Taken)
     }
 }
 

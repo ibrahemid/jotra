@@ -884,6 +884,7 @@ fn legacy_bundle_link() -> InstalledEntry {
     InstalledEntry::Link {
         target: executable_in_bundle(&legacy_in(ADMIN_FOLDER), legacy_names::COMMAND_NAME),
         beside_app: false,
+        bundle_identifier: None,
     }
 }
 
@@ -908,10 +909,12 @@ fn a_legacy_command_that_is_not_jotras_is_untouched() {
         InstalledEntry::Link {
             target: PathBuf::from("/opt/homebrew/Cellar/writ/2.0/bin/writ"),
             beside_app: false,
+            bundle_identifier: None,
         },
         InstalledEntry::Link {
             target: executable_in_bundle(&legacy_in(ADMIN_FOLDER), "backup"),
             beside_app: false,
+            bundle_identifier: None,
         },
     ] {
         for writable in [true, false] {
@@ -945,6 +948,7 @@ fn a_legacy_link_into_a_bundle_that_is_gone_is_relinked() {
     let dangling = InstalledEntry::Link {
         target: executable_in_bundle(&legacy_in(ADMIN_FOLDER), legacy_names::COMMAND_NAME),
         beside_app: false,
+        bundle_identifier: None,
     };
     assert_eq!(
         plan_command_links(&link_facts(dangling, InstalledEntry::Absent, true)),
@@ -993,6 +997,7 @@ fn the_legacy_command_is_relinked_and_the_new_name_added_where_allowed() {
     let bundle_link = InstalledEntry::Link {
         target: executable_in_bundle(&legacy_in(ADMIN_FOLDER), "jotra"),
         beside_app: false,
+        bundle_identifier: None,
     };
     for (current, add_current) in [
         (InstalledEntry::Absent, true),

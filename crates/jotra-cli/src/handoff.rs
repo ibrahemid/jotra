@@ -25,9 +25,7 @@ use std::time::{Duration, Instant};
 use jotra_core::instance::{ContextAsk, OpenRequest, ReviewAsk, OPEN_REQUEST_FRESH_MS};
 use jotra_core::open_context::OpenContext;
 use jotra_core::write_review::{ReviewAnswer, ReviewUnavailable, WriteProposal};
-use jotra_storage::instance::{
-    acquire, create_wait_marker, new_wait_token, send_request, InstanceLockError,
-};
+use jotra_storage::instance::{create_wait_marker, new_wait_token, send_request};
 use jotra_storage::open_context::{take_answer, withdraw_answer};
 use jotra_storage::write_review;
 
@@ -102,16 +100,10 @@ impl std::fmt::Display for HandoffError {
     }
 }
 
-/// Whether an app holds the data folder at `jotra_dir`.
-///
-/// Asked by trying the lock the app holds for its whole life
-/// ([`jotra_storage::instance::acquire`]) and letting go at once. A launch
-/// that meets the lock in that instant waits for it and takes it, so the look
-/// costs nothing. A folder that cannot be locked at all answers `false`: the
-/// app then runs without the lock too, and starting it again only brings it
-/// forward.
+/// Whether an app holds the data folder at `jotra_dir`
+/// ([`jotra_storage::instance::is_held`]).
 pub fn is_app_running(jotra_dir: &Path) -> bool {
-    matches!(acquire(jotra_dir), Err(InstanceLockError::Held))
+    jotra_storage::instance::is_held(jotra_dir)
 }
 
 /// Opens `plan` in the app holding `jotra_dir`, starting it through `launch`
@@ -194,8 +186,19 @@ pub fn deliver(
     }
 }
 
+/// How far a link handed with [`deliver_link`] got.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LinkDelivery {
+    /// The app took the link.
+    Taken,
+    /// The app was started and had not taken the link when the wait ran out.
+    /// The request is left for it to take as it opens.
+    Starting,
+}
+
 /// Hands the `jotra://` link `link` to the app holding `jotra_dir`, starting it
-/// through `launch` when none does, and returns once the app has taken it.
+/// through `launch` when none does, and returns once the app has taken it, or,
+/// for an app it started, once `timings.launched` has passed.
 ///
 /// The link travels as a request and the app reads it through the same
 /// grammar as a clicked link (ADR-052), so `jotra mcp` can ask for nothing a
@@ -203,13 +206,14 @@ pub fn deliver(
 ///
 /// # Errors
 ///
-/// [`HandoffError`]: the link was not taken, and no request is left.
+/// [`HandoffError`]: the link was not taken by a running app, or the app
+/// could not be started, and no request is left.
 pub fn deliver_link(
     jotra_dir: &Path,
     link: &str,
     launch: impl FnOnce() -> bool,
     timings: Timings,
-) -> Result<(), HandoffError> {
+) -> Result<LinkDelivery, HandoffError> {
     let running = is_app_running(jotra_dir);
     let request = OpenRequest {
         sent_at_ms: now_ms(),
@@ -229,11 +233,14 @@ pub fn deliver_link(
     } else {
         timings.launched
     };
-    if !is_taken(&sent, allowed, timings.poll) {
-        let _ = std::fs::remove_file(&sent);
-        return Err(HandoffError::Unanswered);
+    if is_taken(&sent, allowed, timings.poll) {
+        return Ok(LinkDelivery::Taken);
     }
-    Ok(())
+    if !running {
+        return Ok(LinkDelivery::Starting);
+    }
+    let _ = std::fs::remove_file(&sent);
+    Err(HandoffError::Unanswered)
 }
 
 /// Asks the app holding `jotra_dir` which file is open and what is selected in
@@ -382,7 +389,7 @@ fn now_ms() -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use jotra_storage::instance::{clear_waits, release_wait, take_requests, waits_dir};
+    use jotra_storage::instance::{acquire, clear_waits, release_wait, take_requests, waits_dir};
     use std::cell::RefCell;
 
     fn quick() -> Timings {
@@ -622,7 +629,7 @@ mod tests {
             || panic!("nothing is launched while the app runs"),
             quick(),
         );
-        assert_eq!(delivered, Ok(()));
+        assert_eq!(delivered, Ok(LinkDelivery::Taken));
         let request = rx.recv().expect("taken");
         assert_eq!(request.links, vec![link.to_string()]);
         assert!(request.paths.is_empty());
@@ -643,8 +650,27 @@ mod tests {
             },
             quick(),
         );
-        assert_eq!(delivered, Ok(()));
+        assert_eq!(delivered, Ok(LinkDelivery::Taken));
         assert!(launched.into_inner());
+    }
+
+    #[test]
+    fn a_link_for_an_app_still_starting_is_left_for_it_once_the_wait_runs_out() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let starting = Timings {
+            launched: Duration::from_millis(50),
+            ..quick()
+        };
+        assert_eq!(
+            deliver_link(dir.path(), "jotra://open?path=Plan.md", || true, starting),
+            Ok(LinkDelivery::Starting)
+        );
+        let waiting = take_requests(dir.path());
+        assert_eq!(waiting.len(), 1);
+        assert_eq!(
+            waiting[0].links,
+            vec!["jotra://open?path=Plan.md".to_string()]
+        );
     }
 
     #[test]

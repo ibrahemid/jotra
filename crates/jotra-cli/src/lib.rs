@@ -7,7 +7,7 @@
 //!
 //! The notes folder is resolved by `jotra_core::notes::resolve_notes_root_from`,
 //! the function the app resolves it with, and piped text becomes a note
-//! through `jotra_storage::guarded::create_note_guarded`, the mint every note
+//! through `jotra_storage::guarded::create_piped_note_guarded`, the mint every note
 //! write goes through: one sanitiser, one dedupe, and the data folder's write
 //! lock shared with the app.
 
@@ -25,7 +25,10 @@ pub mod mcp;
 pub mod verbs;
 
 use std::ffi::OsString;
+use std::io::Read;
 use std::path::{Path, PathBuf};
+use std::sync::mpsc;
+use std::time::Duration;
 
 use chrono::{DateTime, Utc};
 use jotra_core::config::{FileExtension, FilesConfig, NotesConfig};
@@ -34,8 +37,9 @@ use jotra_core::notes::{
     minted_stem, resolve_notes_root_from, sanitize_title, NotesRootError, NotesRootSources,
     WriteOrigin,
 };
+use jotra_core::user_variables::UserVariable;
 use jotra_storage::errors::{StorageError, StorageResult};
-use jotra_storage::guarded::{create_note_guarded, CreateNote, TakenName};
+use jotra_storage::guarded::{create_piped_note_guarded, CreateNote, TakenName};
 use jotra_storage::write_lock::WriteLock;
 
 /// Environment variable naming the Jotra application binary to launch.
@@ -190,6 +194,22 @@ pub fn resolve_gui_binary(env_override: Option<&Path>, current_exe: Option<&Path
     GuiLaunch::OsDefault
 }
 
+/// [`resolve_gui_binary`], then the AppImage the app recorded it runs from
+/// (`jotra_storage::app_image`): a copy of the command in `~/.local/bin` has
+/// no app beside it. `recorded_image` is read only when nothing else is found.
+pub fn resolve_gui_launch(
+    env_override: Option<&Path>,
+    current_exe: Option<&Path>,
+    recorded_image: impl FnOnce() -> Option<PathBuf>,
+) -> GuiLaunch {
+    match resolve_gui_binary(env_override, current_exe) {
+        GuiLaunch::OsDefault => recorded_image()
+            .filter(|image| image.is_file() && !is_current_exe(image, current_exe))
+            .map_or(GuiLaunch::OsDefault, GuiLaunch::Binary),
+        found => found,
+    }
+}
+
 /// Whether `candidate` is the running CLI.
 ///
 /// Both paths are canonicalized so a symlink to the CLI is recognized as the
@@ -214,6 +234,30 @@ pub fn is_failed_startup(exit_success: Option<bool>) -> bool {
     exit_success == Some(false)
 }
 
+/// The arguments `open` takes to start the macOS app `bundle_id` on `paths`.
+///
+/// LaunchServices starts an app with launchd's environment rather than this
+/// command's, so a data folder a variable names (`data_dir`, absolute) goes
+/// with `--env`, and `-n` starts a copy for it beside one running on another
+/// folder. Both are left off when an app already holds that folder.
+pub fn macos_open_args(
+    bundle_id: &str,
+    data_dir: Option<&Path>,
+    is_folder_held: bool,
+    paths: &[PathBuf],
+) -> Vec<OsString> {
+    let mut args: Vec<OsString> = Vec::with_capacity(paths.len() + 5);
+    if let Some(folder) = data_dir.filter(|_| !is_folder_held) {
+        let mut assignment = OsString::from(UserVariable::DataDir.current_name());
+        assignment.push("=");
+        assignment.push(folder);
+        args.extend(["-n".into(), "--env".into(), assignment]);
+    }
+    args.extend(["-b".into(), bundle_id.into()]);
+    args.extend(paths.iter().map(|path| path.as_os_str().to_owned()));
+    args
+}
+
 /// Whether a piped payload carries nothing worth opening.
 ///
 /// Editor hooks pipe the output of a filter that matches nothing on most
@@ -230,6 +274,152 @@ pub fn is_empty_payload(content: &str) -> bool {
 /// pipe has no file whose encoding there is to keep.
 pub fn piped_text(bytes: &[u8]) -> Option<String> {
     jotra_core::text_encoding::decode_file(bytes).map(|decoded| decoded.text.into_owned())
+}
+
+/// How long a verb waits for a pipe's first byte: the bound without `-`, and
+/// the wait before it says it is still waiting with `-`.
+pub const PIPE_FIRST_BYTE_WAIT: Duration = Duration::from_secs(5);
+
+/// How long a read on a pipe that will not block waits before trying again.
+const NONBLOCKING_RETRY: Duration = Duration::from_millis(10);
+
+/// How [`read_pipe`] waits for a pipe's first byte. Once one has come, the
+/// rest is read until the pipe closes, however long its writer takes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PipeWait {
+    /// However long it takes, as `-` asks; `on_wait` runs once when nothing
+    /// has come after `notice_after`.
+    UntilClosed { notice_after: Duration },
+    /// At most this long, then [`PipeReadError::NothingInTime`].
+    FirstByteWithin(Duration),
+}
+
+/// Why [`read_pipe`] returned no text.
+#[derive(Debug)]
+pub enum PipeReadError {
+    /// The pipe stayed open with nothing in it for the whole bound.
+    NothingInTime(Duration),
+    /// Reading the pipe failed.
+    Failed(std::io::Error),
+}
+
+impl std::fmt::Display for PipeReadError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            PipeReadError::NothingInTime(limit) => write!(
+                f,
+                "nothing came on stdin in {} seconds and it is still open: pass - to wait for slow input, or close stdin",
+                limit.as_secs()
+            ),
+            PipeReadError::Failed(error) => write!(f, "failed to read stdin: {error}"),
+        }
+    }
+}
+
+impl std::error::Error for PipeReadError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            PipeReadError::NothingInTime(_) => None,
+            PipeReadError::Failed(error) => Some(error),
+        }
+    }
+}
+
+/// What the reader thread of [`read_pipe`] reports.
+enum PipeEvent {
+    FirstByte,
+    Ended(std::io::Result<Vec<u8>>),
+}
+
+/// Reads `source` to its end, waiting for its first byte as `wait` says.
+///
+/// Only the end of the pipe ends a read that has begun, so a writer that
+/// pauses loses nothing. A read cut short by a signal, or one a pipe that will
+/// not block has nothing for yet, is tried again; any other failure is an
+/// error, never a shorter text.
+///
+/// # Errors
+///
+/// [`PipeReadError::NothingInTime`] when [`PipeWait::FirstByteWithin`] passes
+/// with the pipe open and empty, and [`PipeReadError::Failed`] when a read
+/// fails.
+pub fn read_pipe(
+    source: impl Read + Send + 'static,
+    wait: PipeWait,
+    on_wait: impl FnOnce(),
+) -> Result<Vec<u8>, PipeReadError> {
+    let (sender, receiver) = mpsc::channel::<PipeEvent>();
+    std::thread::spawn(move || {
+        let mut source = source;
+        let mut bytes = Vec::new();
+        let mut chunk = [0u8; 8192];
+        let read = loop {
+            match source.read(&mut chunk) {
+                Ok(0) => break Ok(bytes),
+                Ok(count) => {
+                    if bytes.is_empty() {
+                        let _ = sender.send(PipeEvent::FirstByte);
+                    }
+                    bytes.extend_from_slice(&chunk[..count]);
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    std::thread::sleep(NONBLOCKING_RETRY);
+                }
+                Err(error) => break Err(error),
+            }
+        };
+        let _ = sender.send(PipeEvent::Ended(read));
+    });
+
+    let stopped = || PipeReadError::Failed(std::io::Error::other("the stdin reader stopped"));
+    let mut event = match wait {
+        PipeWait::UntilClosed { notice_after } => match receiver.recv_timeout(notice_after) {
+            Ok(event) => event,
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                on_wait();
+                receiver.recv().map_err(|_| stopped())?
+            }
+            Err(mpsc::RecvTimeoutError::Disconnected) => return Err(stopped()),
+        },
+        PipeWait::FirstByteWithin(limit) => match receiver.recv_timeout(limit) {
+            Ok(event) => event,
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                return Err(PipeReadError::NothingInTime(limit))
+            }
+            Err(mpsc::RecvTimeoutError::Disconnected) => return Err(stopped()),
+        },
+    };
+    loop {
+        match event {
+            PipeEvent::Ended(read) => return read.map_err(PipeReadError::Failed),
+            PipeEvent::FirstByte => event = receiver.recv().map_err(|_| stopped())?,
+        }
+    }
+}
+
+/// How a verb that takes piped text reads stdin.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VerbStdin {
+    /// Read the pipe or file on stdin, waiting as this says.
+    Read(PipeWait),
+    /// Stdin is a terminal or nothing a pipe could fill: run with no text.
+    Nothing,
+    /// `-` was given and stdin is a terminal or nothing a pipe could fill.
+    NothingPiped,
+}
+
+/// Decide how a verb that takes piped text reads stdin, `dash_given` when a
+/// lone `-` asks it to wait however long the pipe takes.
+pub fn verb_stdin(stdin: StdinKind, dash_given: bool) -> VerbStdin {
+    match stdin {
+        StdinKind::Payload if dash_given => VerbStdin::Read(PipeWait::UntilClosed {
+            notice_after: PIPE_FIRST_BYTE_WAIT,
+        }),
+        StdinKind::Payload => VerbStdin::Read(PipeWait::FirstByteWithin(PIPE_FIRST_BYTE_WAIT)),
+        StdinKind::Terminal | StdinKind::Other if dash_given => VerbStdin::NothingPiped,
+        StdinKind::Terminal | StdinKind::Other => VerbStdin::Nothing,
+    }
 }
 
 /// Decide what to do when no paths were given.
@@ -478,7 +668,7 @@ pub fn piped_note_stem(title: Option<&str>, now: DateTime<Utc>) -> String {
 
 /// Writes piped text as a new note in `notes_dir` and returns its path.
 ///
-/// The note is minted by [`create_note_guarded`] under the write lock in
+/// The note is minted by [`create_piped_note_guarded`] under the write lock in
 /// `jotra_dir`, the one the app and every other `jotra` process share, so the
 /// name is deduped against the folder and never replaces a file. Two pipes
 /// started together can pick the same free name; the one that loses finds it
@@ -486,7 +676,7 @@ pub fn piped_note_stem(title: Option<&str>, now: DateTime<Utc>) -> String {
 ///
 /// # Errors
 ///
-/// [`create_note_guarded`]'s, and [`StorageError::NoteNameTaken`] when every
+/// [`create_piped_note_guarded`]'s, and [`StorageError::NoteNameTaken`] when every
 /// one of [`PIPED_WRITE_ATTEMPTS`] lost its name to another writer.
 pub fn write_piped_note(
     notes_dir: &Path,
@@ -514,7 +704,7 @@ pub fn mint_note(
     let lock = WriteLock::in_data_folder(jotra_dir);
     let mut attempt = 1;
     loop {
-        let written = create_note_guarded(
+        let written = create_piped_note_guarded(
             CreateNote {
                 notes_root: notes_dir,
                 stem,
@@ -893,6 +1083,63 @@ mod tests {
     }
 
     #[test]
+    fn a_pipe_whose_name_another_pipe_took_with_the_same_bytes_gets_its_own_file() {
+        let dir = TempDir::new().unwrap();
+        let notes = dir.path().join("notes");
+        let jotra = dir.path().join("data");
+        std::fs::create_dir_all(&notes).unwrap();
+        std::fs::create_dir_all(&jotra).unwrap();
+        let other_pipe = WriteLock::in_data_folder(&jotra)
+            .hold()
+            .expect("the other pipe holds the lock");
+
+        let minting = {
+            let (notes, jotra) = (notes.clone(), jotra.clone());
+            std::thread::spawn(move || {
+                write_piped_note(&notes, &jotra, "same", FileExtension::Txt, "payload\n")
+            })
+        };
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        while std::fs::read_dir(&notes).unwrap().next().is_none() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the pipe never reached its write"
+            );
+            std::thread::yield_now();
+        }
+        std::fs::write(notes.join("same.txt"), "payload\n").unwrap();
+        drop(other_pipe);
+
+        let path = minting.join().unwrap().expect("written");
+        assert_eq!(
+            path,
+            notes.join("same-2.txt"),
+            "two pipes ended in one file"
+        );
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "payload\n");
+        assert_eq!(
+            std::fs::read_to_string(notes.join("same.txt")).unwrap(),
+            "payload\n"
+        );
+    }
+
+    #[test]
+    fn a_pipe_keeps_the_line_endings_it_was_sent_with() {
+        let dir = TempDir::new().unwrap();
+
+        let path = write_piped_note(
+            dir.path(),
+            dir.path(),
+            "from windows",
+            FileExtension::Txt,
+            "one\r\ntwo\r\n",
+        )
+        .expect("written");
+
+        assert_eq!(std::fs::read(&path).unwrap(), b"one\r\ntwo\r\n");
+    }
+
+    #[test]
     fn read_files_config_reads_the_table_and_tolerates_everything_else() {
         let dir = TempDir::new().unwrap();
         assert_eq!(
@@ -1127,6 +1374,35 @@ mod tests {
     }
 
     #[test]
+    fn a_copy_with_no_app_beside_it_starts_the_image_the_app_recorded() {
+        let bin = TempDir::new().unwrap();
+        let cli = bin.path().join("jotra");
+        touch(&cli);
+        let apps = TempDir::new().unwrap();
+        let image = apps.path().join("Jotra.AppImage");
+        touch(&image);
+
+        assert_eq!(
+            resolve_gui_launch(None, Some(&cli), || Some(image.clone())),
+            GuiLaunch::Binary(image.clone())
+        );
+        assert_eq!(
+            resolve_gui_launch(None, Some(&cli), || Some(apps.path().join("gone"))),
+            GuiLaunch::OsDefault
+        );
+        assert_eq!(
+            resolve_gui_launch(None, Some(&cli), || None),
+            GuiLaunch::OsDefault
+        );
+        let sibling = bin.path().join(GUI_BINARY_NAME);
+        touch(&sibling);
+        assert_eq!(
+            resolve_gui_launch(None, Some(&cli), || panic!("the sibling is found first")),
+            GuiLaunch::Binary(sibling)
+        );
+    }
+
+    #[test]
     fn env_override_pointing_at_the_cli_itself_is_skipped() {
         let dir = TempDir::new().unwrap();
         let cli = dir.path().join("jotra");
@@ -1242,6 +1518,29 @@ mod tests {
             no_path_action(StdinKind::Terminal, true),
             NoPathAction::NothingPiped
         );
+    }
+
+    #[test]
+    fn a_verb_waits_on_a_pipe_without_limit_only_when_given_a_dash() {
+        assert_eq!(
+            verb_stdin(StdinKind::Payload, true),
+            VerbStdin::Read(PipeWait::UntilClosed {
+                notice_after: PIPE_FIRST_BYTE_WAIT
+            })
+        );
+        assert_eq!(
+            verb_stdin(StdinKind::Payload, false),
+            VerbStdin::Read(PipeWait::FirstByteWithin(PIPE_FIRST_BYTE_WAIT))
+        );
+        assert_eq!(PIPE_FIRST_BYTE_WAIT, Duration::from_secs(5));
+    }
+
+    #[test]
+    fn a_verb_reads_no_stdin_that_no_pipe_could_fill() {
+        for kind in [StdinKind::Terminal, StdinKind::Other] {
+            assert_eq!(verb_stdin(kind, false), VerbStdin::Nothing);
+            assert_eq!(verb_stdin(kind, true), VerbStdin::NothingPiped);
+        }
     }
 
     #[cfg(windows)]

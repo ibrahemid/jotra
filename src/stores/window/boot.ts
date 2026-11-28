@@ -230,7 +230,8 @@ export async function receiveDroppedFiles(paths: string[], position?: DropPoint)
 
 /**
  * Opens files the OS, a drop or the `jotra` command handed to the window, one
- * line for every refusal, each at the line `lines` names for it.
+ * line for every refusal, each at the line `lines` names for it. The files
+ * that got no tab are reported back, which answers a `jotra --wait` on them.
  */
 export async function openPendingPaths(
   paths: string[],
@@ -248,6 +249,7 @@ export async function openPendingPaths(
     return;
   }
   const outcomes: OpenOutcome[] = [];
+  const unopened: string[] = [];
   for (const path of paths) {
     try {
       const outcome = await win.tabs.openPath(path);
@@ -255,12 +257,19 @@ export async function openPendingPaths(
       if (outcome.kind === "opened" && typeof line === "number") {
         win.editor.requestReveal(outcome.doc.id, line);
       }
+      if (outcome.kind === "declined" || outcome.kind === "refused") unopened.push(path);
       outcomes.push(outcome);
     } catch (error) {
+      unopened.push(path);
       outcomes.push({ kind: "refused", path, reason: openFailureReason(error) });
     }
   }
   reportOpenOutcomes(outcomes);
+  if (unopened.length > 0) {
+    await api.filesNotOpened(unopened).catch(() => {
+      logFailure("a waiting jotra command was not told a file did not open");
+    });
+  }
 }
 
 /** Reports the time to the next frame to Rust's startup log. */

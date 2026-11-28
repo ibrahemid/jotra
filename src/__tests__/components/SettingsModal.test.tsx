@@ -39,6 +39,7 @@ const mocks = vi.hoisted(() => ({
   checkForUpdate: vi.fn().mockResolvedValue(undefined),
   rebindHotkey: vi.fn(),
   fetchDefaultAppStatus: vi.fn().mockResolvedValue({ status: "unsupported" }),
+  fetchDefaultAppSupport: vi.fn().mockResolvedValue(false),
   claimDefaultApp: vi.fn().mockResolvedValue(undefined),
   fetchDefaultAppTypes: vi.fn(),
   fetchCliStatus: vi.fn().mockResolvedValue({ installed: false }),
@@ -266,6 +267,7 @@ vi.mock("../../services/events", () => ({
 
 vi.mock("../../stores/global/default-app", () => ({
   fetchDefaultAppStatus: mocks.fetchDefaultAppStatus,
+  fetchDefaultAppSupport: mocks.fetchDefaultAppSupport,
   claimDefaultApp: mocks.claimDefaultApp,
   fetchDefaultAppTypes: mocks.fetchDefaultAppTypes,
 }));
@@ -446,6 +448,7 @@ describe("SettingsModal", () => {
     mocks.checkForUpdate.mockReset().mockResolvedValue(undefined);
     mocks.rebindHotkey.mockReset();
     mocks.fetchDefaultAppStatus.mockReset().mockResolvedValue({ status: "unsupported" });
+    mocks.fetchDefaultAppSupport.mockReset().mockResolvedValue(false);
     mocks.claimDefaultApp.mockReset().mockResolvedValue(undefined);
     mocks.fetchDefaultAppTypes.mockReset().mockResolvedValue([TEST_CLAIMABLE_TYPE]);
     mocks.fetchCliStatus.mockReset().mockResolvedValue({ installed: false });
@@ -1215,6 +1218,7 @@ describe("SettingsModal", () => {
     // heading and row are there to read the moment the nav switches.
     it("shows the Integrations heading on first render once support is known", async () => {
       mocks.fetchDefaultAppStatus.mockResolvedValue({ status: "no_handler" });
+      mocks.fetchDefaultAppSupport.mockResolvedValue(true);
       await probeDefaultAppSupport();
       mocks.fetchDefaultAppTypes.mockReturnValue(new Promise(() => {}));
 
@@ -1230,6 +1234,7 @@ describe("SettingsModal", () => {
     // The heading stays, because the rows beside it are every platform's.
     it("drops the file-types row when a known type turns out unclaimable", async () => {
       mocks.fetchDefaultAppStatus.mockResolvedValue({ status: "no_handler" });
+      mocks.fetchDefaultAppSupport.mockResolvedValue(true);
       await probeDefaultAppSupport();
       mocks.fetchDefaultAppStatus.mockResolvedValue({ status: "unsupported" });
 
@@ -1687,6 +1692,7 @@ describe("SettingsModal", () => {
         { id: "config-data", label: "Config & data", exts: ["json"], utis: ["public.json"] },
       ]);
       mocks.fetchDefaultAppStatus.mockResolvedValue({ status: "no_handler" });
+      mocks.fetchDefaultAppSupport.mockResolvedValue(true);
       await probeDefaultAppSupport();
 
       const { container } = render(() => <SettingsModal />);
@@ -3001,7 +3007,7 @@ describe("Connected programs section, waiting for you", () => {
     cleanup();
   });
 
-  it("lists a waiting program with its three choices", async () => {
+  it("lists a waiting program with its choices", async () => {
     const { container } = await openPrograms();
 
     const selector = "[data-setting-id='mcp.waiting'] [data-program='Claude Code']";
@@ -3011,6 +3017,7 @@ describe("Connected programs section, waiting for you", () => {
     expect(Array.from(row.querySelectorAll("button"), (button) => button.textContent?.trim())).toEqual([
       "Approve reading",
       "Approve reading and writing",
+      "Let it see the open file",
       "Don't allow",
     ]);
 

@@ -63,6 +63,13 @@ describe("the tools that change part of a file or show one", () => {
     expect(describeCall("read_index", false, "allow")).toBe("read the index of your folder");
   });
 
+  it("says what today did with the day's file", () => {
+    expect(describeCall("today", true, "allow", null)).toBe("found");
+    expect(describeCall("today", true, "allow", 0)).toBe("made");
+    expect(describeCall("today", true, "allow", 18)).toBe("added to");
+    expect(describeCall("today", false, "allow", 18)).toBe("added to today's file");
+  });
+
   it("counts showing a file as a read", () => {
     expect(isReadAction("open_in_jotra")).toBe(true);
     expect(isReadAction("append_note")).toBe(false);

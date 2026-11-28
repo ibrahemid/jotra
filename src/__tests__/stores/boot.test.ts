@@ -11,6 +11,12 @@ const h = vi.hoisted(() => ({
   subscribed: [] as string[],
   handlers: new Map<string, (payload: unknown) => void>(),
   takeDroppedImages: vi.fn(async (paths: string[]) => paths),
+  filesNotOpened: vi.fn(async (_paths: string[]) => {}),
+}));
+
+vi.mock("../../services/tauri", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("../../services/tauri")>()),
+  filesNotOpened: h.filesNotOpened,
 }));
 
 vi.mock("../../stores/global/images", () => ({ takeDroppedImages: h.takeDroppedImages }));
@@ -80,6 +86,7 @@ function boot() {
 
 beforeEach(() => {
   h.showToast.mockReset();
+  h.filesNotOpened.mockClear();
   h.subscribed.length = 0;
   vi.spyOn(console, "error").mockImplementation(() => {});
 });
@@ -258,6 +265,33 @@ describe("files handed to the window", () => {
       unregister();
     }
     expect(reveals).toEqual([["id:/n/b.md", 12]]);
+    expect(h.filesNotOpened).not.toHaveBeenCalled();
+  });
+
+  it("reports the files that got no tab, so a jotra --wait on them returns", async () => {
+    const outcomes: Record<string, unknown> = {
+      "/n/a.md": { kind: "opened", doc: { id: "a" }, existed: false, mode: "Normal" },
+      "/n/big.log": { kind: "declined", path: "/n/big.log" },
+      "/n/app.bin": { kind: "refused", path: "/n/app.bin", reason: "it is not text" },
+    };
+    const win = {
+      windowId: 9102,
+      tabs: {
+        openPath: vi.fn(async (path: string) => {
+          if (path === "/n/gone.md") throw new Error("ERR_OPEN_FILE_MISSING");
+          return outcomes[path];
+        }),
+      },
+      editor: { requestReveal: () => {} },
+    } as unknown as WindowState;
+    const unregister = windowRegistry.register(win);
+    windowRegistry.focus(9102);
+    try {
+      await openPendingPaths(["/n/a.md", "/n/big.log", "/n/app.bin", "/n/gone.md"]);
+    } finally {
+      unregister();
+    }
+    expect(h.filesNotOpened).toHaveBeenCalledWith(["/n/big.log", "/n/app.bin", "/n/gone.md"]);
   });
 });
 

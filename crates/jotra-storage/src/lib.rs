@@ -38,15 +38,18 @@
 
 // Denied rather than forbidden: `atomic::metadata` lifts it for the handful
 // of `libc` calls that carry a file's extended attributes and creation date
-// across the rename a save performs, `identity` for the one Windows call
-// that reads a file's id, and `note_ops` for the rename that refuses to
-// replace a file. Nothing else in the crate may.
+// across the rename a save performs and the Windows calls that limit a
+// private file to its owner, `identity` for the one Windows call that reads a
+// file's id, and `note_ops` for the rename that refuses to replace a file.
+// Nothing else in the crate may.
 #![deny(unsafe_code)]
 #![warn(missing_docs)]
 #![warn(rustdoc::broken_intra_doc_links)]
 
 /// Append-only JSONL log of what the harness did.
 pub mod activity_log;
+/// The AppImage the app last ran from, for a copy of the command to start.
+pub mod app_image;
 /// Crash-safe file writes via temp-file + fsync + rename.
 pub mod atomic;
 /// High-level buffer CRUD built on top of [`database`].
