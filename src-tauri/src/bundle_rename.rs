@@ -9,9 +9,10 @@
 use std::ffi::{CStr, CString, OsStr, OsString};
 use std::fmt;
 use std::io;
-use std::os::unix::ffi::OsStrExt;
+use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::time::{Duration, Instant};
 
 use core_foundation::base::{kCFAllocatorDefault, Boolean, TCFType};
 use core_foundation::data::CFData;
@@ -35,7 +36,9 @@ use jotra_core::legacy_names;
 use jotra_core::name_migration::{MigrationStep, NameMigrationRecord};
 use jotra_storage::errors::{StorageError, StorageResult};
 use jotra_storage::instance::InstanceLock;
-use jotra_storage::launchpad::{retitle_launchpad_app, LaunchpadRetitle, LaunchpadUpdate};
+use jotra_storage::launchpad::{
+    read_launchpad_row, retitle_launchpad_app, LaunchpadRetitle, LaunchpadRow, LaunchpadUpdate,
+};
 use jotra_storage::name_migration::{
     read_name_migration_record, run_migration_step, StepCompletion, StepRun,
 };
@@ -52,8 +55,6 @@ use crate::state::AppState;
 
 const OSASCRIPT: &str = "/usr/bin/osascript";
 const OPEN: &str = "/usr/bin/open";
-const KILLALL: &str = "/usr/bin/killall";
-const DOCK_PROCESS: &str = "Dock";
 const DOCK_DOMAIN: &str = "com.apple.dock";
 const DOCK_PINNED_KEY: &str = "persistent-apps";
 const DOCK_RECENT_KEY: &str = "recent-apps";
@@ -68,6 +69,16 @@ const DOCK_TILES_OPERATION: &str = "dock tiles";
 const LAUNCHPAD_OPERATION: &str = "launchpad retitle";
 /// The Launchpad file inside this user's `_CS_DARWIN_USER_DIR` folder.
 const LAUNCHPAD_DATABASE: &str = "com.apple.dock.launchpad/db/db";
+const DOCK_EXECUTABLE: &str = "/System/Library/CoreServices/Dock.app/Contents/MacOS/Dock";
+/// How long the Dock step waits for a new Dock once it ended the old one.
+const DOCK_START_BOUND: Duration = Duration::from_secs(10);
+/// How long a new Dock runs before the step reads its settings back.
+const DOCK_SETTLE: Duration = Duration::from_secs(3);
+const DOCK_POLL: Duration = Duration::from_millis(100);
+/// How many times the Dock step writes the tiles before it fails.
+const DOCK_ATTEMPTS: usize = 2;
+/// Room for processes that start between counting them and listing them.
+const PID_HEADROOM: usize = 64;
 
 /// Why a step of the bundle rename or the per-user steps did not finish.
 #[derive(Debug, thiserror::Error)]
@@ -117,9 +128,15 @@ pub(crate) enum BundleRenameError {
         expected: usize,
         actual: usize,
     },
-    /// The Dock did not restart.
-    #[error("the Dock did not restart: {reason}")]
-    DockRestart { reason: String },
+    /// The Dock did not end.
+    #[error("the Dock did not end: {source}")]
+    DockEnd {
+        #[source]
+        source: io::Error,
+    },
+    /// The Dock's tiles went back to the old name after the last write.
+    #[error("the Dock tiles went back after the second write")]
+    DockTilesReverted,
 }
 
 /// Why a Dock setting is left as it is.
@@ -180,6 +197,12 @@ pub(crate) struct MacHost;
 #[link(name = "CoreServices", kind = "framework")]
 extern "C" {
     fn LSRegisterURL(inURL: core_foundation::url::CFURLRef, inUpdate: u8) -> i32;
+    fn FSEventsGetCurrentEventId() -> u64;
+}
+
+/// The id of the last file system event the system has issued.
+pub(crate) fn current_fsevent_id() -> u64 {
+    unsafe { FSEventsGetCurrentEventId() }
 }
 
 impl BundleHost for MacHost {
@@ -552,15 +575,47 @@ pub(crate) fn execute_plan(
     }
 }
 
+/// The file system event the Launchpad's application folder sources resume
+/// from once the Dock step has written them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum EventMark {
+    /// The id when this launch started: it moved, trashed and linked no
+    /// bundle, so the events of the rename before it are all older.
+    LaunchStart(u64),
+    /// The id at the write: this launch moved, trashed or linked a bundle and
+    /// carried on, so its own events are newer than its start.
+    AtWrite,
+}
+
+/// The mark for a launch that started at `launch_event_id` and carried out
+/// `plan`, or no plan.
+pub(crate) fn event_mark_for(plan: Option<&BundlePlan>, launch_event_id: u64) -> EventMark {
+    match plan {
+        None | Some(BundlePlan::OpenCanonical(_) | BundlePlan::OpenSibling(_)) => {
+            EventMark::LaunchStart(launch_event_id)
+        }
+        Some(
+            BundlePlan::Rename(_)
+            | BundlePlan::ReplaceLegacy { .. }
+            | BundlePlan::RestoreLink { .. },
+        ) => EventMark::AtWrite,
+    }
+}
+
 /// What the per-user steps need from the launch that runs them.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct PerUserSteps {
     bundle: PathBuf,
     version: String,
     data_dir: PathBuf,
+    event_mark: EventMark,
 }
 
-fn per_user_steps(facts: &BundleFacts, data_dir: &Path) -> Option<PerUserSteps> {
+fn per_user_steps(
+    facts: &BundleFacts,
+    data_dir: &Path,
+    event_mark: EventMark,
+) -> Option<PerUserSteps> {
     if !per_user_steps_apply(facts) {
         return None;
     }
@@ -568,20 +623,25 @@ fn per_user_steps(facts: &BundleFacts, data_dir: &Path) -> Option<PerUserSteps> 
         bundle: facts.bundle.clone()?,
         version: facts.running.as_ref()?.version.clone(),
         data_dir: data_dir.to_path_buf(),
+        event_mark,
     })
 }
 
-/// Plans and carries out the rename for the launch started as `exe`, and
-/// whether the per-user steps run once the app is set up.
+/// Plans and carries out the rename for the launch started as `exe` when the
+/// file system's event id was `launch_event_id`, and whether the per-user
+/// steps run once the app is set up.
 pub(crate) fn plan_and_execute(
     exe: &Path,
     data_dir: &Path,
     skip_requested: bool,
+    launch_event_id: u64,
     host: &impl BundleHost,
 ) -> (Execution, Option<PerUserSteps>) {
     let facts = gather_facts(exe, read_name_migration_record(data_dir), skip_requested);
-    let per_user = per_user_steps(&facts, data_dir);
-    let plan = match plan_bundle_rename(&facts) {
+    let plan = plan_bundle_rename(&facts);
+    let event_mark = event_mark_for(plan.as_ref().ok(), launch_event_id);
+    let per_user = per_user_steps(&facts, data_dir, event_mark);
+    let plan = match plan {
         Ok(plan) => plan,
         Err(reason) => {
             info!(%reason, "the bundle stays where it is");
@@ -613,6 +673,7 @@ pub(crate) fn rename_at_launch(
     if cfg!(debug_assertions) {
         return (lock, None);
     }
+    let launch_event_id = current_fsevent_id();
     let exe = match std::env::current_exe() {
         Ok(exe) => exe,
         Err(error) => {
@@ -622,7 +683,7 @@ pub(crate) fn rename_at_launch(
     };
     let skip = is_rename_skipped(std::env::var_os(SKIP_VAR).as_deref());
     let host = MacHost;
-    let (execution, per_user) = plan_and_execute(&exe, jotra_dir, skip, &host);
+    let (execution, per_user) = plan_and_execute(&exe, jotra_dir, skip, launch_event_id, &host);
     let Execution::Relaunch(bundle) = execution else {
         return (lock, per_user);
     };
@@ -814,15 +875,33 @@ pub(crate) trait DockHost {
         &self,
         tiles: &[(&'static str, Vec<plist::Value>)],
     ) -> Result<(), BundleRenameError>;
-    /// Restarts the Dock, which reads its settings only when it starts.
-    fn restart(&self) -> Result<(), BundleRenameError>;
+    /// The pid of this user's Dock, or `None` when none runs.
+    fn dock_pid(&self) -> Option<libc::pid_t>;
+    /// Ends the Dock at `pid` at once, before it saves the tiles and rows it
+    /// holds; a pid that is no longer this user's Dock is left alone.
+    fn end_dock(&self, pid: libc::pid_t) -> Result<(), BundleRenameError>;
+    /// The pid of the Dock that starts after the one at `previous` ended,
+    /// once it has run for [`DOCK_SETTLE`], or `None` when none starts within
+    /// [`DOCK_START_BOUND`].
+    fn await_new_dock(&self, previous: libc::pid_t) -> Option<libc::pid_t>;
+    /// The id of the last file system event the system has issued.
+    fn current_event_id(&self) -> u64;
     /// This user's `_CS_DARWIN_USER_DIR` folder, or `None` when the system
     /// gives none.
     fn user_folder(&self) -> Option<PathBuf>;
     /// The bookmark data of `bundle` with the default options, or `None` when
     /// the system makes none.
     fn bookmark(&self, bundle: &Path) -> Option<Vec<u8>>;
-    /// Gives the Launchpad row in `database` the new title and bookmark.
+    /// Whether a row of `bundle_id` in the Launchpad file `database` carries
+    /// `old_title`.
+    fn read_launchpad(
+        &self,
+        database: &Path,
+        bundle_id: &str,
+        old_title: &str,
+    ) -> StorageResult<LaunchpadRow>;
+    /// Gives the Launchpad row in `database` the new title and bookmark and
+    /// raises its sources' event mark.
     fn retitle_launchpad(
         &self,
         database: &Path,
@@ -924,23 +1003,40 @@ impl DockHost for MacDock {
         Ok(())
     }
 
-    fn restart(&self) -> Result<(), BundleRenameError> {
-        let output = Command::new(KILLALL)
-            .arg(DOCK_PROCESS)
-            .output()
-            .map_err(|source| io_error("run", Path::new(KILLALL), source))?;
-        if output.status.success() {
+    fn dock_pid(&self) -> Option<libc::pid_t> {
+        dock_pids().into_iter().next()
+    }
+
+    fn end_dock(&self, pid: libc::pid_t) -> Result<(), BundleRenameError> {
+        if !is_own_dock(pid) {
             return Ok(());
         }
-        Err(BundleRenameError::DockRestart {
-            reason: format!(
-                "{} {}",
-                output.status,
-                String::from_utf8_lossy(&output.stderr).trim()
-            )
-            .trim()
-            .to_string(),
-        })
+        if unsafe { libc::kill(pid, libc::SIGKILL) } == 0 {
+            return Ok(());
+        }
+        let source = io::Error::last_os_error();
+        if source.raw_os_error() == Some(libc::ESRCH) {
+            return Ok(());
+        }
+        Err(BundleRenameError::DockEnd { source })
+    }
+
+    fn await_new_dock(&self, previous: libc::pid_t) -> Option<libc::pid_t> {
+        let started = Instant::now();
+        loop {
+            if let Some(pid) = dock_pids().into_iter().find(|pid| *pid != previous) {
+                std::thread::sleep(DOCK_SETTLE);
+                return Some(pid);
+            }
+            if started.elapsed() >= DOCK_START_BOUND {
+                return None;
+            }
+            std::thread::sleep(DOCK_POLL);
+        }
+    }
+
+    fn current_event_id(&self) -> u64 {
+        current_fsevent_id()
     }
 
     fn user_folder(&self) -> Option<PathBuf> {
@@ -989,6 +1085,15 @@ impl DockHost for MacDock {
         Some(data.bytes().to_vec()).filter(|bytes| !bytes.is_empty())
     }
 
+    fn read_launchpad(
+        &self,
+        database: &Path,
+        bundle_id: &str,
+        old_title: &str,
+    ) -> StorageResult<LaunchpadRow> {
+        read_launchpad_row(database, bundle_id, old_title)
+    }
+
     fn retitle_launchpad(
         &self,
         database: &Path,
@@ -996,6 +1101,67 @@ impl DockHost for MacDock {
     ) -> StorageResult<LaunchpadUpdate> {
         retitle_launchpad_app(database, retitle)
     }
+}
+
+/// Every running process's pid.
+fn running_pids() -> Vec<libc::pid_t> {
+    let counted = unsafe { libc::proc_listallpids(std::ptr::null_mut(), 0) };
+    let Ok(counted) = usize::try_from(counted) else {
+        return Vec::new();
+    };
+    let mut pids: Vec<libc::pid_t> = vec![0; counted + PID_HEADROOM];
+    let Ok(bytes) = libc::c_int::try_from(pids.len() * std::mem::size_of::<libc::pid_t>()) else {
+        return Vec::new();
+    };
+    let listed = unsafe { libc::proc_listallpids(pids.as_mut_ptr().cast(), bytes) };
+    let Ok(listed) = usize::try_from(listed) else {
+        return Vec::new();
+    };
+    pids.truncate(listed);
+    pids.retain(|pid| *pid > 0);
+    pids
+}
+
+/// The executable `pid` runs, or `None` when the system does not say.
+fn process_path(pid: libc::pid_t) -> Option<PathBuf> {
+    let mut buffer = vec![0_u8; usize::try_from(libc::PROC_PIDPATHINFO_MAXSIZE).ok()?];
+    let size = u32::try_from(buffer.len()).ok()?;
+    let written = unsafe { libc::proc_pidpath(pid, buffer.as_mut_ptr().cast(), size) };
+    let written = usize::try_from(written)
+        .ok()
+        .filter(|written| *written > 0)?;
+    buffer.truncate(written);
+    Some(PathBuf::from(OsString::from_vec(buffer)))
+}
+
+/// The user `pid` runs as, or `None` when the system does not say.
+fn process_uid(pid: libc::pid_t) -> Option<libc::uid_t> {
+    let mut info: libc::proc_bsdshortinfo = unsafe { std::mem::zeroed() };
+    let size = libc::c_int::try_from(std::mem::size_of::<libc::proc_bsdshortinfo>()).ok()?;
+    let written = unsafe {
+        libc::proc_pidinfo(
+            pid,
+            libc::PROC_PIDT_SHORTBSDINFO,
+            0,
+            std::ptr::addr_of_mut!(info).cast(),
+            size,
+        )
+    };
+    (written == size).then_some(info.pbsi_uid)
+}
+
+/// Whether `pid` is the Dock and runs as this user.
+fn is_own_dock(pid: libc::pid_t) -> bool {
+    process_path(pid).as_deref() == Some(Path::new(DOCK_EXECUTABLE))
+        && process_uid(pid) == Some(unsafe { libc::getuid() })
+}
+
+/// The pids of this user's Docks.
+fn dock_pids() -> Vec<libc::pid_t> {
+    running_pids()
+        .into_iter()
+        .filter(|pid| is_own_dock(*pid))
+        .collect()
 }
 
 fn cf_error_text(error: &core_foundation::error::CFError) -> String {
@@ -1116,14 +1282,13 @@ fn apply_tile_actions(
         .collect()
 }
 
-/// Points the Dock's tiles for `legacy` at `bundle` as [`plan_dock_tiles`]
-/// plans and writes the keys that change, both read before either is written.
-/// Whether anything was written.
-fn retarget_dock_tiles(
+/// The Dock's pinned and recent tiles, both read before either is written,
+/// and the plan that points the ones for `legacy` at `bundle`.
+fn plan_tiles(
     dock: &impl DockHost,
     legacy: &Path,
     bundle: &Path,
-) -> Result<bool, BundleRenameError> {
+) -> Result<(Vec<plist::Value>, Vec<plist::Value>, DockPlan), BundleRenameError> {
     let pinned = dock.read_tiles(DOCK_PINNED_KEY)?.unwrap_or_default();
     let recent = dock.read_tiles(DOCK_RECENT_KEY)?.unwrap_or_default();
     let plan = plan_dock_tiles(&DockFacts {
@@ -1132,7 +1297,7 @@ fn retarget_dock_tiles(
         legacy_bundle: legacy.to_path_buf(),
         bundle: bundle.to_path_buf(),
     });
-    write_planned_tiles(dock, pinned, recent, &plan)
+    Ok((pinned, recent, plan))
 }
 
 /// How many of `tiles` tiles are left once `actions` drop theirs.
@@ -1144,17 +1309,16 @@ fn kept_tile_count(tiles: usize, actions: &[DockTileAction]) -> usize {
     tiles.saturating_sub(dropped)
 }
 
-/// Writes the keys `plan` changes, each only when it holds exactly its tiles
-/// less the ones the plan drops; otherwise writes nothing. Whether anything
-/// was written.
-fn write_planned_tiles(
-    dock: &impl DockHost,
+/// Each key `plan` changes with the tiles it gets, or an error when one would
+/// not hold exactly its tiles less the ones the plan drops. Empty when the
+/// plan changes nothing.
+fn planned_tile_writes(
     pinned: Vec<plist::Value>,
     recent: Vec<plist::Value>,
     plan: &DockPlan,
-) -> Result<bool, BundleRenameError> {
+) -> Result<Vec<(&'static str, Vec<plist::Value>)>, BundleRenameError> {
     if !plan.changes_anything() {
-        return Ok(false);
+        return Ok(Vec::new());
     }
     let (pinned_before, recent_before) = (pinned.len(), recent.len());
     let mut writes = Vec::new();
@@ -1190,8 +1354,13 @@ fn write_planned_tiles(
             });
         }
     }
-    dock.write_tiles(&writes)?;
-    Ok(true)
+    Ok(writes)
+}
+
+/// The Launchpad file and the bookmark its row gets.
+struct LaunchpadTarget {
+    database: PathBuf,
+    bookmark: Vec<u8>,
 }
 
 /// What the Launchpad update came to, for the log.
@@ -1213,50 +1382,151 @@ impl fmt::Display for LaunchpadRun {
     }
 }
 
-fn launchpad_run(dock: &impl DockHost, bundle: &Path) -> LaunchpadRun {
-    let Some(folder) = dock.user_folder() else {
-        return LaunchpadRun::NoUserFolder;
-    };
-    let Some(bookmark) = dock.bookmark(bundle) else {
-        return LaunchpadRun::NoBookmark;
+/// Where the Launchpad's row for `bundle` is and the bookmark it gets, or why
+/// the Launchpad is left alone.
+fn launchpad_target(dock: &impl DockHost, bundle: &Path) -> Result<LaunchpadTarget, LaunchpadRun> {
+    let folder = dock.user_folder().ok_or(LaunchpadRun::NoUserFolder)?;
+    let bookmark = dock.bookmark(bundle).ok_or(LaunchpadRun::NoBookmark)?;
+    Ok(LaunchpadTarget {
+        database: folder.join(LAUNCHPAD_DATABASE),
+        bookmark,
+    })
+}
+
+/// Whether the Launchpad's row for this app still carries the old title.
+fn launchpad_row(dock: &impl DockHost, target: &LaunchpadTarget) -> StorageResult<LaunchpadRow> {
+    dock.read_launchpad(
+        &target.database,
+        BUNDLE_IDENTIFIER,
+        legacy_names::PRODUCT_NAME,
+    )
+}
+
+fn log_launchpad_row(stage: &'static str, row: &StorageResult<LaunchpadRow>) {
+    match row {
+        Ok(row) => info!(operation = LAUNCHPAD_OPERATION, stage, row = %row),
+        Err(error) => warn!(operation = LAUNCHPAD_OPERATION, stage, %error),
+    }
+}
+
+/// Gives the Launchpad's row for the old name the new title and bookmark and
+/// raises its sources' event mark to `mark`'s id, best effort: no outcome
+/// fails the step.
+fn retitle_launchpad_row(dock: &impl DockHost, target: &LaunchpadTarget, mark: EventMark) {
+    let event_mark = match mark {
+        EventMark::LaunchStart(id) => id,
+        EventMark::AtWrite => dock.current_event_id(),
     };
     let retitle = LaunchpadRetitle {
         bundle_id: BUNDLE_IDENTIFIER,
         from_title: legacy_names::PRODUCT_NAME,
         to_title: DOCK_TILE_LABEL,
-        bookmark: &bookmark,
+        bookmark: &target.bookmark,
+        event_mark,
     };
-    match dock.retitle_launchpad(&folder.join(LAUNCHPAD_DATABASE), &retitle) {
+    let run = match dock.retitle_launchpad(&target.database, &retitle) {
         Ok(update) => LaunchpadRun::Ran(update),
         Err(error) => LaunchpadRun::Failed(error),
-    }
-}
-
-/// Gives the Launchpad's row for the old name the new title and `bundle`'s
-/// bookmark, best effort: no outcome fails the step. Whether a row changed.
-fn retitle_launchpad_row(dock: &impl DockHost, bundle: &Path) -> bool {
-    let run = launchpad_run(dock, bundle);
+    };
     match &run {
-        LaunchpadRun::Failed(_) => warn!(operation = LAUNCHPAD_OPERATION, outcome = %run),
-        _ => info!(operation = LAUNCHPAD_OPERATION, outcome = %run),
+        LaunchpadRun::Failed(_) => {
+            warn!(operation = LAUNCHPAD_OPERATION, event_mark, outcome = %run);
+        }
+        _ => info!(operation = LAUNCHPAD_OPERATION, event_mark, outcome = %run),
     }
-    matches!(run, LaunchpadRun::Ran(update) if update.changed_anything())
 }
 
-/// Points the Dock's tiles for the bundle at `legacy`, the old name, at
-/// `bundle`, retitles its Launchpad row, and restarts the Dock once when
-/// either changed anything. A tile write that fails restarts nothing.
+/// What one attempt of the Dock step came to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DockAttempt {
+    /// Neither the tiles nor the Launchpad row needed a change.
+    Unchanged,
+    /// The writes landed with no Dock running.
+    WrittenWithoutDock,
+    /// The writes landed and the Dock at this pid was ended.
+    Ended(libc::pid_t),
+}
+
+/// Takes the running Dock's pid, then reads and plans. When the tiles or the
+/// Launchpad row need a change, writes the row and its mark, then the tiles,
+/// then ends that Dock at once, before it saves its own over them.
+fn attempt_dock_migration(
+    dock: &impl DockHost,
+    legacy: &Path,
+    bundle: &Path,
+    launchpad: Option<&LaunchpadTarget>,
+    mark: EventMark,
+) -> Result<DockAttempt, BundleRenameError> {
+    let pid = dock.dock_pid();
+    let (pinned, recent, plan) = plan_tiles(dock, legacy, bundle)?;
+    let writes = planned_tile_writes(pinned, recent, &plan)?;
+    let row_is_stale = launchpad.is_some_and(|target| match launchpad_row(dock, target) {
+        Ok(row) => row.is_stale(),
+        Err(error) => {
+            log_launchpad_row("before", &Err(error));
+            false
+        }
+    });
+    if writes.is_empty() && !row_is_stale {
+        return Ok(DockAttempt::Unchanged);
+    }
+    if let Some(target) = launchpad {
+        retitle_launchpad_row(dock, target, mark);
+    }
+    if !writes.is_empty() {
+        dock.write_tiles(&writes)?;
+    }
+    let Some(pid) = pid else {
+        return Ok(DockAttempt::WrittenWithoutDock);
+    };
+    dock.end_dock(pid)?;
+    Ok(DockAttempt::Ended(pid))
+}
+
+/// Points the Dock's tiles for `legacy`, the old name, at `bundle` and
+/// retitles its Launchpad row with `event_mark`, then reads the tiles back
+/// from the Dock that starts. Tiles that went back get one more attempt, with
+/// the event id at its write; a second miss fails the step. The Launchpad row
+/// never fails the step or causes another attempt.
 pub(crate) fn migrate_dock(
     dock: &impl DockHost,
     legacy: &Path,
     bundle: &Path,
+    event_mark: EventMark,
 ) -> Result<StepCompletion, BundleRenameError> {
-    let tiles_written = retarget_dock_tiles(dock, legacy, bundle)?;
-    let launchpad_changed = retitle_launchpad_row(dock, bundle);
-    if tiles_written || launchpad_changed {
-        dock.restart()?;
+    let launchpad = match launchpad_target(dock, bundle) {
+        Ok(target) => Some(target),
+        Err(skip) => {
+            info!(operation = LAUNCHPAD_OPERATION, outcome = %skip);
+            None
+        }
+    };
+    let mut mark = event_mark;
+    for _ in 0..DOCK_ATTEMPTS {
+        let ended = match attempt_dock_migration(dock, legacy, bundle, launchpad.as_ref(), mark)? {
+            DockAttempt::Unchanged | DockAttempt::WrittenWithoutDock => {
+                return Ok(StepCompletion::Done);
+            }
+            DockAttempt::Ended(pid) => pid,
+        };
+        match dock.await_new_dock(ended) {
+            Some(started) => info!(operation = DOCK_TILES_OPERATION, ended, started),
+            None => warn!(
+                operation = DOCK_TILES_OPERATION,
+                ended, "no new Dock started"
+            ),
+        }
+        if let Some(target) = &launchpad {
+            log_launchpad_row("after", &launchpad_row(dock, target));
+        }
+        let (_, _, plan) = plan_tiles(dock, legacy, bundle)?;
+        if !plan.changes_anything() {
+            return Ok(StepCompletion::Done);
+        }
+        warn!(operation = DOCK_TILES_OPERATION, "the tiles went back");
+        mark = EventMark::AtWrite;
     }
-    Ok(StepCompletion::Done)
+    Err(BundleRenameError::DockTilesReverted)
 }
 
 /// Whether `link` is a link that resolves to `bundle`.
@@ -1333,7 +1603,7 @@ pub(crate) fn run_per_user_steps(
             &steps.data_dir,
             MigrationStep::Dock,
             &steps.version,
-            || migrate_dock(dock, &legacy, &steps.bundle),
+            || migrate_dock(dock, &legacy, &steps.bundle, steps.event_mark),
         )),
         None => {
             info!(
@@ -1380,7 +1650,7 @@ pub(crate) fn spawn_per_user_steps(handle: &AppHandle, steps: PerUserSteps) {
 
 #[cfg(test)]
 mod tests {
-    use std::cell::RefCell;
+    use std::cell::{Cell, RefCell};
     use std::os::macos::fs::MetadataExt;
     use std::os::unix::fs::PermissionsExt;
     use std::time::{Duration, SystemTime};
@@ -1862,9 +2132,13 @@ mod tests {
         }
         let host = FakeHost::new(&folder.root);
 
-        let (execution, _) = plan_and_execute(&exe, &data, false, &host);
+        let (execution, per_user) = plan_and_execute(&exe, &data, false, LAUNCH_EVENT_ID, &host);
 
         assert_eq!(execution, Execution::Continue);
+        assert_eq!(
+            per_user.map(|steps| steps.event_mark),
+            Some(EventMark::AtWrite)
+        );
         assert!(is_hidden_link(&legacy_bundle(&folder.root)));
         assert_eq!(
             legacy_bundle(&folder.root)
@@ -2165,7 +2439,7 @@ mod tests {
         let exe = make_bundle(&legacy_bundle(&folder.root), BUNDLE_IDENTIFIER, VERSION);
         let host = FakeHost::new(&folder.root);
 
-        let (execution, per_user) = plan_and_execute(&exe, &data, false, &host);
+        let (execution, per_user) = plan_and_execute(&exe, &data, false, LAUNCH_EVENT_ID, &host);
         assert_eq!(execution, Execution::Relaunch(current_bundle(&folder.root)));
         assert_eq!(per_user, None);
         assert_eq!(
@@ -2174,7 +2448,7 @@ mod tests {
         );
 
         let exe = executable_in_bundle(&current_bundle(&folder.root), APP_BINARY);
-        let (execution, per_user) = plan_and_execute(&exe, &data, false, &host);
+        let (execution, per_user) = plan_and_execute(&exe, &data, false, LAUNCH_EVENT_ID, &host);
         assert_eq!(execution, Execution::Continue);
         assert_eq!(host.registered.borrow().len(), 1);
         assert_eq!(
@@ -2183,6 +2457,7 @@ mod tests {
                 bundle: current_bundle(&folder.root),
                 version: VERSION.to_string(),
                 data_dir: data.clone(),
+                event_mark: LAUNCH_MARK,
             })
         );
     }
@@ -2192,7 +2467,8 @@ mod tests {
         let folder = folder();
         let exe = make_bundle(&legacy_bundle(&folder.root), BUNDLE_IDENTIFIER, VERSION);
         let host = FakeHost::new(&folder.root);
-        let (execution, per_user) = plan_and_execute(&exe, &folder.root, true, &host);
+        let (execution, per_user) =
+            plan_and_execute(&exe, &folder.root, true, LAUNCH_EVENT_ID, &host);
         assert_eq!(execution, Execution::Continue);
         assert_eq!(per_user, None);
         assert!(is_real_folder(&legacy_bundle(&folder.root)));
@@ -2771,6 +3047,7 @@ mod tests {
             bundle,
             version: VERSION.to_string(),
             data_dir: data.clone(),
+            event_mark: LAUNCH_MARK,
         };
         let login = FakeLogin::default();
         let dock = FakeDock::default();
@@ -2806,13 +3083,7 @@ mod tests {
             }
         );
         assert_eq!(*login.set_calls.borrow(), vec![true]);
-        assert_eq!(
-            *dock.calls.borrow(),
-            [
-                DockCall::Read(DOCK_PINNED_KEY),
-                DockCall::Read(DOCK_RECENT_KEY)
-            ]
-        );
+        assert_eq!(*dock.calls.borrow(), attempt_reads());
     }
 
     #[test]
@@ -2824,6 +3095,7 @@ mod tests {
             bundle,
             version: VERSION.to_string(),
             data_dir: folder.root.clone(),
+            event_mark: LAUNCH_MARK,
         };
         let runs = run_per_user_steps(
             &steps,
@@ -2840,30 +3112,56 @@ mod tests {
 
     #[derive(Debug, Clone, PartialEq)]
     enum DockCall {
+        Pid,
         Read(&'static str),
         Write(Vec<(&'static str, Vec<plist::Value>)>),
-        Restart,
+        End(libc::pid_t),
+        Await(libc::pid_t),
+        EventId,
         Bookmark(PathBuf),
+        LaunchpadRead {
+            database: PathBuf,
+            bundle_id: String,
+            old_title: String,
+        },
         Launchpad {
             database: PathBuf,
             bundle_id: String,
             from_title: String,
             to_title: String,
             bookmark: Vec<u8>,
+            event_mark: u64,
         },
     }
 
+    const FIRST_DOCK_PID: libc::pid_t = 401;
+    const LAUNCH_EVENT_ID: u64 = 5_000;
+    const CURRENT_EVENT_ID: u64 = 7_000;
+    const LAUNCH_MARK: EventMark = EventMark::LaunchStart(LAUNCH_EVENT_ID);
+
+    /// A Dock that holds the tiles it was given until a write replaces them.
     #[derive(Default)]
     struct FakeDock {
         pinned: Option<Vec<plist::Value>>,
         recent: Option<Vec<plist::Value>>,
         unreadable: Option<&'static str>,
         fail_write: bool,
-        fail_restart: bool,
+        fail_end: bool,
+        /// No Dock runs.
+        no_dock: bool,
+        /// No Dock starts once one ends.
+        no_new_dock: bool,
+        /// How many of the Docks that start put the tiles they were given back.
+        reverts: Cell<usize>,
         user_folder: Option<PathBuf>,
         bookmark: Option<Vec<u8>>,
+        /// What the Launchpad read returns; `None` returns an error.
+        launchpad_row: Option<LaunchpadRow>,
         /// What the Launchpad update returns; `None` returns an error.
         launchpad: Option<LaunchpadUpdate>,
+        written: RefCell<Vec<(&'static str, Vec<plist::Value>)>>,
+        starts: Cell<libc::pid_t>,
+        ended: Cell<bool>,
         calls: RefCell<Vec<DockCall>>,
     }
 
@@ -2871,28 +3169,41 @@ mod tests {
     const NEW_BOOKMARK: &[u8] = b"bookmark of the new bundle";
 
     impl FakeDock {
-        fn with_launchpad(self, update: Option<LaunchpadUpdate>) -> Self {
+        fn with_launchpad(
+            self,
+            row: Option<LaunchpadRow>,
+            update: Option<LaunchpadUpdate>,
+        ) -> Self {
             Self {
                 user_folder: Some(PathBuf::from(LAUNCHPAD_USER_FOLDER)),
                 bookmark: Some(NEW_BOOKMARK.to_vec()),
+                launchpad_row: row,
                 launchpad: update,
                 ..self
             }
         }
 
-        fn restarts(&self) -> usize {
+        fn count(&self, matches: impl Fn(&DockCall) -> bool) -> usize {
             self.calls
                 .borrow()
                 .iter()
-                .filter(|call| **call == DockCall::Restart)
+                .filter(|call| matches(call))
                 .count()
         }
 
-        fn retitled_launchpad(&self) -> bool {
+        fn ends(&self) -> usize {
+            self.count(|call| matches!(call, DockCall::End(_)))
+        }
+
+        fn launchpad_marks(&self) -> Vec<u64> {
             self.calls
                 .borrow()
                 .iter()
-                .any(|call| matches!(call, DockCall::Launchpad { .. }))
+                .filter_map(|call| match call {
+                    DockCall::Launchpad { event_mark, .. } => Some(*event_mark),
+                    _ => None,
+                })
+                .collect()
         }
     }
 
@@ -2904,6 +3215,14 @@ mod tests {
             self.calls.borrow_mut().push(DockCall::Read(key));
             if self.unreadable == Some(key) {
                 return Err(dock_setting(key, DockSettingProblem::Managed));
+            }
+            if let Some((_, tiles)) = self
+                .written
+                .borrow()
+                .iter()
+                .find(|(written, _)| *written == key)
+            {
+                return Ok(Some(tiles.clone()));
             }
             Ok(match key {
                 DOCK_PINNED_KEY => self.pinned.clone(),
@@ -2922,17 +3241,47 @@ mod tests {
             if self.fail_write {
                 return Err(BundleRenameError::DockNotSaved);
             }
+            let mut written = self.written.borrow_mut();
+            for (key, tiles) in tiles {
+                written.retain(|(held, _)| held != key);
+                written.push((key, tiles.clone()));
+            }
             Ok(())
         }
 
-        fn restart(&self) -> Result<(), BundleRenameError> {
-            self.calls.borrow_mut().push(DockCall::Restart);
-            if self.fail_restart {
-                return Err(BundleRenameError::DockRestart {
-                    reason: "exit status: 1".to_string(),
+        fn dock_pid(&self) -> Option<libc::pid_t> {
+            self.calls.borrow_mut().push(DockCall::Pid);
+            (!self.no_dock && !self.ended.get()).then(|| FIRST_DOCK_PID + self.starts.get())
+        }
+
+        fn end_dock(&self, pid: libc::pid_t) -> Result<(), BundleRenameError> {
+            self.calls.borrow_mut().push(DockCall::End(pid));
+            if self.fail_end {
+                return Err(BundleRenameError::DockEnd {
+                    source: io::Error::from_raw_os_error(libc::EPERM),
                 });
             }
+            self.ended.set(true);
             Ok(())
+        }
+
+        fn await_new_dock(&self, previous: libc::pid_t) -> Option<libc::pid_t> {
+            self.calls.borrow_mut().push(DockCall::Await(previous));
+            if self.no_new_dock {
+                return None;
+            }
+            self.ended.set(false);
+            self.starts.set(self.starts.get() + 1);
+            if self.reverts.get() > 0 {
+                self.reverts.set(self.reverts.get() - 1);
+                self.written.borrow_mut().clear();
+            }
+            Some(FIRST_DOCK_PID + self.starts.get())
+        }
+
+        fn current_event_id(&self) -> u64 {
+            self.calls.borrow_mut().push(DockCall::EventId);
+            CURRENT_EVENT_ID
         }
 
         fn user_folder(&self) -> Option<PathBuf> {
@@ -2946,6 +3295,21 @@ mod tests {
             self.bookmark.clone()
         }
 
+        fn read_launchpad(
+            &self,
+            database: &Path,
+            bundle_id: &str,
+            old_title: &str,
+        ) -> StorageResult<LaunchpadRow> {
+            self.calls.borrow_mut().push(DockCall::LaunchpadRead {
+                database: database.to_path_buf(),
+                bundle_id: bundle_id.to_string(),
+                old_title: old_title.to_string(),
+            });
+            self.launchpad_row
+                .ok_or_else(|| StorageError::Io(io::Error::other("the file did not open")))
+        }
+
         fn retitle_launchpad(
             &self,
             database: &Path,
@@ -2957,6 +3321,7 @@ mod tests {
                 from_title: retitle.from_title.to_string(),
                 to_title: retitle.to_title.to_string(),
                 bookmark: retitle.bookmark.to_vec(),
+                event_mark: retitle.event_mark,
             });
             self.launchpad
                 .ok_or_else(|| StorageError::Io(io::Error::other("the file did not open")))
@@ -3052,8 +3417,34 @@ mod tests {
         ]
     }
 
+    /// The calls an attempt makes before it writes anything.
+    fn attempt_reads() -> Vec<DockCall> {
+        let mut calls = vec![DockCall::Pid];
+        calls.extend(dock_reads());
+        calls
+    }
+
+    /// The calls that end the Dock at `pid` and read the tiles back.
+    fn end_and_read_back(pid: libc::pid_t) -> Vec<DockCall> {
+        let mut calls = vec![DockCall::End(pid), DockCall::Await(pid)];
+        calls.extend(dock_reads());
+        calls
+    }
+
+    fn migrate(dock: &FakeDock, apps: &DockApps) -> Result<StepCompletion, BundleRenameError> {
+        migrate_dock(dock, &apps.legacy, &apps.bundle, LAUNCH_MARK)
+    }
+
+    fn position(dock: &FakeDock, matches: impl Fn(&DockCall) -> bool) -> usize {
+        dock.calls
+            .borrow()
+            .iter()
+            .position(matches)
+            .expect("the call")
+    }
+
     #[test]
-    fn a_dock_without_the_old_bundle_is_neither_written_nor_restarted() {
+    fn a_dock_without_the_old_bundle_is_neither_written_nor_ended() {
         let apps = dock_apps();
         for dock in [
             FakeDock {
@@ -3063,16 +3454,13 @@ mod tests {
             },
             FakeDock::default(),
         ] {
-            assert_eq!(
-                migrate_dock(&dock, &apps.legacy, &apps.bundle).expect("step"),
-                StepCompletion::Done
-            );
-            assert_eq!(*dock.calls.borrow(), dock_reads());
+            assert_eq!(migrate(&dock, &apps).expect("step"), StepCompletion::Done);
+            assert_eq!(*dock.calls.borrow(), attempt_reads());
         }
     }
 
     #[test]
-    fn the_dock_is_written_before_it_restarts_and_keeps_every_other_key() {
+    fn the_dock_pid_is_taken_before_the_write_and_that_dock_ends_right_after_it() {
         let apps = dock_apps();
         let dock = FakeDock {
             pinned: Some(vec![apps.notes.clone(), apps.legacy_tile(21)]),
@@ -3084,11 +3472,8 @@ mod tests {
             ..FakeDock::default()
         };
 
-        assert_eq!(
-            migrate_dock(&dock, &apps.legacy, &apps.bundle).expect("step"),
-            StepCompletion::Done
-        );
-        let mut expected = dock_reads();
+        assert_eq!(migrate(&dock, &apps).expect("step"), StepCompletion::Done);
+        let mut expected = attempt_reads();
         expected.push(DockCall::Write(vec![
             (
                 DOCK_PINNED_KEY,
@@ -3096,7 +3481,7 @@ mod tests {
             ),
             (DOCK_RECENT_KEY, vec![apps.mail.clone()]),
         ]));
-        expected.push(DockCall::Restart);
+        expected.extend(end_and_read_back(FIRST_DOCK_PID));
         assert_eq!(*dock.calls.borrow(), expected);
     }
 
@@ -3108,9 +3493,9 @@ mod tests {
             recent: Some(vec![apps.mail.clone()]),
             ..FakeDock::default()
         };
-        migrate_dock(&pinned_only, &apps.legacy, &apps.bundle).expect("step");
+        migrate(&pinned_only, &apps).expect("step");
         assert_eq!(
-            pinned_only.calls.borrow()[2],
+            pinned_only.calls.borrow()[3],
             DockCall::Write(vec![(DOCK_PINNED_KEY, vec![apps.retargeted_tile()])])
         );
 
@@ -3119,9 +3504,9 @@ mod tests {
             recent: Some(vec![apps.legacy_tile(22), apps.mail.clone()]),
             ..FakeDock::default()
         };
-        migrate_dock(&recent_only, &apps.legacy, &apps.bundle).expect("step");
+        migrate(&recent_only, &apps).expect("step");
         assert_eq!(
-            recent_only.calls.borrow()[2],
+            recent_only.calls.borrow()[3],
             DockCall::Write(vec![(DOCK_RECENT_KEY, vec![apps.mail.clone()])])
         );
     }
@@ -3133,12 +3518,12 @@ mod tests {
             pinned: Some(vec![apps.legacy_tile(21)]),
             ..FakeDock::default()
         };
-        migrate_dock(&without_recent, &apps.legacy, &apps.bundle).expect("step");
+        migrate(&without_recent, &apps).expect("step");
         assert_eq!(
-            without_recent.calls.borrow()[2..],
+            without_recent.calls.borrow()[3..5],
             [
                 DockCall::Write(vec![(DOCK_PINNED_KEY, vec![apps.retargeted_tile()])]),
-                DockCall::Restart
+                DockCall::End(FIRST_DOCK_PID)
             ]
         );
 
@@ -3146,18 +3531,18 @@ mod tests {
             recent: Some(vec![apps.legacy_tile(22)]),
             ..FakeDock::default()
         };
-        migrate_dock(&without_pinned, &apps.legacy, &apps.bundle).expect("step");
+        migrate(&without_pinned, &apps).expect("step");
         assert_eq!(
-            without_pinned.calls.borrow()[2..],
+            without_pinned.calls.borrow()[3..5],
             [
                 DockCall::Write(vec![(DOCK_RECENT_KEY, vec![])]),
-                DockCall::Restart
+                DockCall::End(FIRST_DOCK_PID)
             ]
         );
     }
 
     #[test]
-    fn a_failed_dock_write_restarts_nothing_and_fails() {
+    fn a_failed_dock_write_ends_nothing_and_fails() {
         let apps = dock_apps();
         let dock = FakeDock {
             pinned: Some(vec![apps.legacy_tile(21)]),
@@ -3165,27 +3550,31 @@ mod tests {
             ..FakeDock::default()
         };
         assert!(matches!(
-            migrate_dock(&dock, &apps.legacy, &apps.bundle),
+            migrate(&dock, &apps),
             Err(BundleRenameError::DockNotSaved)
         ));
-        let calls = dock.calls.borrow();
-        assert!(matches!(calls.last(), Some(DockCall::Write(_))));
-        assert!(!calls.contains(&DockCall::Restart));
+        assert!(matches!(
+            dock.calls.borrow().last(),
+            Some(DockCall::Write(_))
+        ));
+        assert_eq!(dock.ends(), 0);
     }
 
     #[test]
-    fn a_failed_dock_restart_fails_the_step() {
+    fn a_dock_that_does_not_end_fails_the_step() {
         let apps = dock_apps();
         let dock = FakeDock {
             pinned: Some(vec![apps.legacy_tile(21)]),
-            fail_restart: true,
+            fail_end: true,
             ..FakeDock::default()
         };
-        assert!(matches!(
-            migrate_dock(&dock, &apps.legacy, &apps.bundle),
-            Err(BundleRenameError::DockRestart { .. })
-        ));
-        assert_eq!(dock.calls.borrow().last(), Some(&DockCall::Restart));
+        let error = migrate(&dock, &apps).expect_err("the Dock did not end");
+        assert!(matches!(error, BundleRenameError::DockEnd { .. }));
+        assert!(error.to_string().starts_with("the Dock did not end: "));
+        assert_eq!(
+            dock.calls.borrow().last(),
+            Some(&DockCall::End(FIRST_DOCK_PID))
+        );
     }
 
     #[test]
@@ -3199,7 +3588,7 @@ mod tests {
                 ..FakeDock::default()
             };
             assert!(matches!(
-                migrate_dock(&dock, &apps.legacy, &apps.bundle),
+                migrate(&dock, &apps),
                 Err(BundleRenameError::DockSetting {
                     key: failed,
                     problem: DockSettingProblem::Managed,
@@ -3209,107 +3598,273 @@ mod tests {
                 .calls
                 .borrow()
                 .iter()
-                .all(|call| matches!(call, DockCall::Read(_))));
+                .all(|call| matches!(call, DockCall::Pid | DockCall::Read(_))));
         }
     }
 
-    fn launchpad_calls(apps: &DockApps) -> [DockCall; 2] {
-        [
-            DockCall::Bookmark(apps.bundle.clone()),
-            DockCall::Launchpad {
-                database: Path::new(LAUNCHPAD_USER_FOLDER)
-                    .join("com.apple.dock.launchpad")
-                    .join("db")
-                    .join("db"),
-                bundle_id: BUNDLE_IDENTIFIER.to_string(),
-                from_title: legacy_names::PRODUCT_NAME.to_string(),
-                to_title: DOCK_TILE_LABEL.to_string(),
-                bookmark: NEW_BOOKMARK.to_vec(),
-            },
-        ]
-    }
-
     #[test]
-    fn a_stale_launchpad_row_alone_restarts_the_dock_once() {
+    fn with_no_dock_running_the_tiles_are_written_and_nothing_ends() {
         let apps = dock_apps();
-        let dock = FakeDock::default().with_launchpad(Some(LaunchpadUpdate::Changed(1)));
-        assert_eq!(
-            migrate_dock(&dock, &apps.legacy, &apps.bundle).expect("step"),
-            StepCompletion::Done
-        );
-        let mut expected = dock_reads();
-        expected.extend(launchpad_calls(&apps));
-        expected.push(DockCall::Restart);
+        let dock = FakeDock {
+            pinned: Some(vec![apps.legacy_tile(21)]),
+            no_dock: true,
+            ..FakeDock::default()
+        };
+        assert_eq!(migrate(&dock, &apps).expect("step"), StepCompletion::Done);
+        let mut expected = attempt_reads();
+        expected.push(DockCall::Write(vec![(
+            DOCK_PINNED_KEY,
+            vec![apps.retargeted_tile()],
+        )]));
         assert_eq!(*dock.calls.borrow(), expected);
     }
 
     #[test]
-    fn the_tiles_and_the_launchpad_row_share_one_restart() {
+    fn when_no_new_dock_starts_the_tiles_are_read_back_once() {
+        let apps = dock_apps();
+        let dock = FakeDock {
+            pinned: Some(vec![apps.legacy_tile(21)]),
+            no_new_dock: true,
+            ..FakeDock::default()
+        };
+        assert_eq!(migrate(&dock, &apps).expect("step"), StepCompletion::Done);
+        let mut expected = attempt_reads();
+        expected.push(DockCall::Write(vec![(
+            DOCK_PINNED_KEY,
+            vec![apps.retargeted_tile()],
+        )]));
+        expected.extend(end_and_read_back(FIRST_DOCK_PID));
+        assert_eq!(*dock.calls.borrow(), expected);
+    }
+
+    /// The calls of an attempt that writes `apps`' retargeted pin and ends the
+    /// Dock at `pid`.
+    fn pin_attempt(apps: &DockApps, pid: libc::pid_t) -> Vec<DockCall> {
+        let mut calls = attempt_reads();
+        calls.push(DockCall::Write(vec![(
+            DOCK_PINNED_KEY,
+            vec![apps.retargeted_tile()],
+        )]));
+        calls.extend(end_and_read_back(pid));
+        calls
+    }
+
+    #[test]
+    fn tiles_a_new_dock_puts_back_get_one_more_attempt() {
+        let apps = dock_apps();
+        let dock = FakeDock {
+            pinned: Some(vec![apps.legacy_tile(21)]),
+            reverts: Cell::new(1),
+            ..FakeDock::default()
+        };
+        assert_eq!(migrate(&dock, &apps).expect("step"), StepCompletion::Done);
+        let mut expected = pin_attempt(&apps, FIRST_DOCK_PID);
+        expected.extend(pin_attempt(&apps, FIRST_DOCK_PID + 1));
+        assert_eq!(*dock.calls.borrow(), expected);
+    }
+
+    #[test]
+    fn tiles_put_back_after_the_second_attempt_fail_the_step() {
+        let apps = dock_apps();
+        let dock = FakeDock {
+            pinned: Some(vec![apps.legacy_tile(21)]),
+            reverts: Cell::new(2),
+            ..FakeDock::default()
+        };
+        let error = migrate(&dock, &apps).expect_err("the tiles went back");
+        assert!(matches!(error, BundleRenameError::DockTilesReverted));
+        assert_eq!(
+            error.to_string(),
+            "the Dock tiles went back after the second write"
+        );
+        let mut expected = pin_attempt(&apps, FIRST_DOCK_PID);
+        expected.extend(pin_attempt(&apps, FIRST_DOCK_PID + 1));
+        assert_eq!(*dock.calls.borrow(), expected);
+    }
+
+    fn launchpad_database() -> PathBuf {
+        Path::new(LAUNCHPAD_USER_FOLDER)
+            .join("com.apple.dock.launchpad")
+            .join("db")
+            .join("db")
+    }
+
+    fn launchpad_read() -> DockCall {
+        DockCall::LaunchpadRead {
+            database: launchpad_database(),
+            bundle_id: BUNDLE_IDENTIFIER.to_string(),
+            old_title: legacy_names::PRODUCT_NAME.to_string(),
+        }
+    }
+
+    fn launchpad_write(event_mark: u64) -> DockCall {
+        DockCall::Launchpad {
+            database: launchpad_database(),
+            bundle_id: BUNDLE_IDENTIFIER.to_string(),
+            from_title: legacy_names::PRODUCT_NAME.to_string(),
+            to_title: DOCK_TILE_LABEL.to_string(),
+            bookmark: NEW_BOOKMARK.to_vec(),
+            event_mark,
+        }
+    }
+
+    const ROW_CHANGED: Option<LaunchpadUpdate> = Some(LaunchpadUpdate::Changed {
+        rows: 1,
+        sources: 3,
+    });
+
+    #[test]
+    fn a_stale_launchpad_row_alone_ends_the_dock_once_and_is_not_redone() {
+        let apps = dock_apps();
+        let dock = FakeDock::default().with_launchpad(Some(LaunchpadRow::Stale), ROW_CHANGED);
+        assert_eq!(migrate(&dock, &apps).expect("step"), StepCompletion::Done);
+        let mut expected = vec![DockCall::Bookmark(apps.bundle.clone())];
+        expected.extend(attempt_reads());
+        expected.extend([
+            launchpad_read(),
+            launchpad_write(LAUNCH_EVENT_ID),
+            DockCall::End(FIRST_DOCK_PID),
+            DockCall::Await(FIRST_DOCK_PID),
+            launchpad_read(),
+        ]);
+        expected.extend(dock_reads());
+        assert_eq!(*dock.calls.borrow(), expected);
+    }
+
+    #[test]
+    fn the_launchpad_row_is_written_before_the_tiles_and_both_share_one_end() {
         let apps = dock_apps();
         let dock = FakeDock {
             pinned: Some(vec![apps.legacy_tile(21)]),
             ..FakeDock::default()
         }
-        .with_launchpad(Some(LaunchpadUpdate::Changed(1)));
-        migrate_dock(&dock, &apps.legacy, &apps.bundle).expect("step");
-        let mut expected = dock_reads();
-        expected.push(DockCall::Write(vec![(
-            DOCK_PINNED_KEY,
-            vec![apps.retargeted_tile()],
-        )]));
-        expected.extend(launchpad_calls(&apps));
-        expected.push(DockCall::Restart);
+        .with_launchpad(Some(LaunchpadRow::Stale), ROW_CHANGED);
+        migrate(&dock, &apps).expect("step");
+        let mut expected = vec![DockCall::Bookmark(apps.bundle.clone())];
+        expected.extend(attempt_reads());
+        expected.extend([
+            launchpad_read(),
+            launchpad_write(LAUNCH_EVENT_ID),
+            DockCall::Write(vec![(DOCK_PINNED_KEY, vec![apps.retargeted_tile()])]),
+            DockCall::End(FIRST_DOCK_PID),
+            DockCall::Await(FIRST_DOCK_PID),
+            launchpad_read(),
+        ]);
+        expected.extend(dock_reads());
         assert_eq!(*dock.calls.borrow(), expected);
     }
 
-    fn unchanged_launchpad_outcomes() -> [Option<LaunchpadUpdate>; 5] {
-        [
-            Some(LaunchpadUpdate::Changed(0)),
-            Some(LaunchpadUpdate::NoDatabase),
-            Some(LaunchpadUpdate::UnknownShape),
-            Some(LaunchpadUpdate::Busy),
-            None,
-        ]
-    }
+    const ROWS_WITHOUT_THE_OLD_TITLE: [Option<LaunchpadRow>; 5] = [
+        Some(LaunchpadRow::UpToDate),
+        Some(LaunchpadRow::NoDatabase),
+        Some(LaunchpadRow::UnknownShape),
+        Some(LaunchpadRow::Busy),
+        None,
+    ];
 
     #[test]
-    fn nothing_changed_anywhere_restarts_nothing() {
+    fn nothing_to_change_anywhere_writes_and_ends_nothing() {
         let apps = dock_apps();
-        for update in unchanged_launchpad_outcomes() {
+        for row in ROWS_WITHOUT_THE_OLD_TITLE {
             let dock = FakeDock {
                 pinned: Some(vec![apps.notes.clone(), apps.current_tile(21)]),
                 ..FakeDock::default()
             }
-            .with_launchpad(update);
+            .with_launchpad(row, ROW_CHANGED);
             assert_eq!(
-                migrate_dock(&dock, &apps.legacy, &apps.bundle).expect("step"),
+                migrate(&dock, &apps).expect("step"),
                 StepCompletion::Done,
-                "{update:?}"
+                "{row:?}"
             );
-            let mut expected = dock_reads();
-            expected.extend(launchpad_calls(&apps));
-            assert_eq!(*dock.calls.borrow(), expected, "{update:?}");
+            let mut expected = vec![DockCall::Bookmark(apps.bundle.clone())];
+            expected.extend(attempt_reads());
+            expected.push(launchpad_read());
+            assert_eq!(*dock.calls.borrow(), expected, "{row:?}");
         }
     }
 
     #[test]
-    fn no_launchpad_outcome_fails_the_step() {
+    fn no_launchpad_outcome_fails_the_step_or_redoes_it() {
         let apps = dock_apps();
-        for update in unchanged_launchpad_outcomes() {
-            let dock = FakeDock {
-                pinned: Some(vec![apps.legacy_tile(21)]),
-                ..FakeDock::default()
+        let rows = [
+            Some(LaunchpadRow::Stale),
+            Some(LaunchpadRow::UpToDate),
+            None,
+        ];
+        let updates = [
+            Some(LaunchpadUpdate::Changed {
+                rows: 0,
+                sources: 0,
+            }),
+            Some(LaunchpadUpdate::NoDatabase),
+            Some(LaunchpadUpdate::UnknownShape),
+            Some(LaunchpadUpdate::Busy),
+            None,
+        ];
+        for row in rows {
+            for update in updates {
+                let dock = FakeDock {
+                    pinned: Some(vec![apps.legacy_tile(21)]),
+                    ..FakeDock::default()
+                }
+                .with_launchpad(row, update);
+                assert_eq!(
+                    migrate(&dock, &apps).expect("step"),
+                    StepCompletion::Done,
+                    "{row:?} {update:?}"
+                );
+                assert_eq!(
+                    dock.launchpad_marks(),
+                    [LAUNCH_EVENT_ID],
+                    "{row:?} {update:?}"
+                );
+                assert_eq!(dock.ends(), 1, "{row:?} {update:?}");
             }
-            .with_launchpad(update);
-            assert_eq!(
-                migrate_dock(&dock, &apps.legacy, &apps.bundle).expect("step"),
-                StepCompletion::Done,
-                "{update:?}"
-            );
-            assert!(dock.retitled_launchpad(), "{update:?}");
-            assert_eq!(dock.restarts(), 1, "{update:?}");
-            assert_eq!(dock.calls.borrow().last(), Some(&DockCall::Restart));
         }
+    }
+
+    #[test]
+    fn the_launch_start_mark_takes_no_event_id_of_its_own() {
+        let apps = dock_apps();
+        let dock = FakeDock {
+            pinned: Some(vec![apps.legacy_tile(21)]),
+            ..FakeDock::default()
+        }
+        .with_launchpad(Some(LaunchpadRow::Stale), ROW_CHANGED);
+        migrate(&dock, &apps).expect("step");
+        assert_eq!(dock.launchpad_marks(), [LAUNCH_EVENT_ID]);
+        assert_eq!(dock.count(|call| *call == DockCall::EventId), 0);
+    }
+
+    #[test]
+    fn the_mark_at_the_write_takes_the_event_id_right_before_the_launchpad_write() {
+        let apps = dock_apps();
+        let dock = FakeDock {
+            pinned: Some(vec![apps.legacy_tile(21)]),
+            ..FakeDock::default()
+        }
+        .with_launchpad(Some(LaunchpadRow::Stale), ROW_CHANGED);
+        migrate_dock(&dock, &apps.legacy, &apps.bundle, EventMark::AtWrite).expect("step");
+        assert_eq!(dock.launchpad_marks(), [CURRENT_EVENT_ID]);
+        let written = position(&dock, |call| matches!(call, DockCall::Launchpad { .. }));
+        assert_eq!(dock.calls.borrow()[written - 1], DockCall::EventId);
+        assert_eq!(dock.calls.borrow()[written - 2], launchpad_read());
+        assert_eq!(dock.count(|call| *call == DockCall::EventId), 1);
+    }
+
+    #[test]
+    fn a_second_attempt_takes_the_event_id_at_its_own_write() {
+        let apps = dock_apps();
+        let dock = FakeDock {
+            pinned: Some(vec![apps.legacy_tile(21)]),
+            reverts: Cell::new(1),
+            ..FakeDock::default()
+        }
+        .with_launchpad(Some(LaunchpadRow::Stale), ROW_CHANGED);
+        assert_eq!(migrate(&dock, &apps).expect("step"), StepCompletion::Done);
+        assert_eq!(dock.launchpad_marks(), [LAUNCH_EVENT_ID, CURRENT_EVENT_ID]);
+        assert_eq!(dock.count(|call| *call == DockCall::EventId), 1);
+        assert_eq!(dock.ends(), 2);
     }
 
     #[test]
@@ -3317,33 +3872,43 @@ mod tests {
         let apps = dock_apps();
         let without_bookmark = FakeDock {
             bookmark: None,
-            ..FakeDock::default().with_launchpad(Some(LaunchpadUpdate::Changed(1)))
+            ..FakeDock::default().with_launchpad(Some(LaunchpadRow::Stale), ROW_CHANGED)
         };
-        migrate_dock(&without_bookmark, &apps.legacy, &apps.bundle).expect("step");
-        let mut expected = dock_reads();
-        expected.push(DockCall::Bookmark(apps.bundle.clone()));
+        migrate(&without_bookmark, &apps).expect("step");
+        let mut expected = vec![DockCall::Bookmark(apps.bundle.clone())];
+        expected.extend(attempt_reads());
         assert_eq!(*without_bookmark.calls.borrow(), expected);
 
         let without_folder = FakeDock {
             user_folder: None,
-            ..FakeDock::default().with_launchpad(Some(LaunchpadUpdate::Changed(1)))
+            pinned: Some(vec![apps.legacy_tile(21)]),
+            ..FakeDock::default().with_launchpad(Some(LaunchpadRow::Stale), ROW_CHANGED)
         };
-        migrate_dock(&without_folder, &apps.legacy, &apps.bundle).expect("step");
-        assert_eq!(*without_folder.calls.borrow(), dock_reads());
+        migrate(&without_folder, &apps).expect("step");
+        assert_eq!(
+            *without_folder.calls.borrow(),
+            pin_attempt(&apps, FIRST_DOCK_PID)
+        );
     }
 
     #[test]
-    fn a_failed_tile_write_leaves_the_launchpad_alone() {
+    fn a_failed_tile_write_comes_after_the_launchpad_write_and_ends_nothing() {
         let apps = dock_apps();
         let dock = FakeDock {
             pinned: Some(vec![apps.legacy_tile(21)]),
             fail_write: true,
             ..FakeDock::default()
         }
-        .with_launchpad(Some(LaunchpadUpdate::Changed(1)));
-        assert!(migrate_dock(&dock, &apps.legacy, &apps.bundle).is_err());
-        assert!(!dock.retitled_launchpad());
-        assert_eq!(dock.restarts(), 0);
+        .with_launchpad(Some(LaunchpadRow::Stale), ROW_CHANGED);
+        assert!(matches!(
+            migrate(&dock, &apps),
+            Err(BundleRenameError::DockNotSaved)
+        ));
+        let retitled = position(&dock, |call| matches!(call, DockCall::Launchpad { .. }));
+        let written = position(&dock, |call| matches!(call, DockCall::Write(_)));
+        assert!(retitled < written);
+        assert_eq!(dock.calls.borrow().len(), written + 1);
+        assert_eq!(dock.ends(), 0);
     }
 
     #[test]
@@ -3366,13 +3931,12 @@ mod tests {
                 1,
             ),
         ] {
-            let dock = FakeDock::default();
             let plan = DockPlan {
                 pinned: actions,
                 recent: recent_actions.clone(),
                 bundle_url: url.clone(),
             };
-            let error = write_planned_tiles(&dock, pinned, recent.clone(), &plan)
+            let error = planned_tile_writes(pinned, recent.clone(), &plan)
                 .expect_err("a tile count that does not add up");
             assert!(matches!(
                 error,
@@ -3388,7 +3952,84 @@ mod tests {
                     "the Dock setting {DOCK_PINNED_KEY} would hold {actual} tiles, not {expected}"
                 )
             );
-            assert!(dock.calls.borrow().is_empty());
+        }
+    }
+
+    #[test]
+    fn the_event_mark_follows_the_launchs_own_bundle_work() {
+        let apps = Path::new("/Applications");
+        let start = EventMark::LaunchStart(LAUNCH_EVENT_ID);
+        assert_eq!(event_mark_for(None, LAUNCH_EVENT_ID), start);
+        for plan in [
+            BundlePlan::OpenCanonical(current_bundle(apps)),
+            BundlePlan::OpenSibling(current_bundle(apps)),
+        ] {
+            assert_eq!(
+                event_mark_for(Some(&plan), LAUNCH_EVENT_ID),
+                start,
+                "{plan:?}"
+            );
+        }
+        for plan in [
+            rename_plan(apps, false, Privileges::User),
+            BundlePlan::ReplaceLegacy {
+                legacy: legacy_bundle(apps),
+                bundle: current_bundle(apps),
+            },
+            BundlePlan::RestoreLink {
+                link: legacy_bundle(apps),
+                bundle: current_bundle(apps),
+            },
+        ] {
+            assert_eq!(
+                event_mark_for(Some(&plan), LAUNCH_EVENT_ID),
+                EventMark::AtWrite,
+                "{plan:?}"
+            );
+        }
+    }
+
+    fn own_pid() -> libc::pid_t {
+        libc::pid_t::try_from(std::process::id()).expect("pid")
+    }
+
+    #[test]
+    fn the_file_system_event_id_is_set_and_never_goes_back() {
+        let first = current_fsevent_id();
+        let second = MacDock.current_event_id();
+        assert!(first > 0);
+        assert!(second >= first);
+    }
+
+    #[test]
+    fn this_process_is_listed_with_its_executable_and_user() {
+        let pid = own_pid();
+        assert!(running_pids().contains(&pid));
+        let exe = std::env::current_exe()
+            .expect("exe")
+            .canonicalize()
+            .expect("canonical");
+        assert_eq!(
+            process_path(pid).map(|path| path.canonicalize().expect("canonical")),
+            Some(exe)
+        );
+        assert_eq!(process_uid(pid), Some(unsafe { libc::getuid() }));
+        assert_eq!(process_path(libc::pid_t::MAX), None);
+        assert_eq!(process_uid(libc::pid_t::MAX), None);
+    }
+
+    #[test]
+    fn only_a_dock_of_this_user_is_taken_for_the_dock() {
+        assert!(!is_own_dock(own_pid()));
+        assert!(!is_own_dock(libc::pid_t::MAX));
+        let uid = unsafe { libc::getuid() };
+        for pid in dock_pids() {
+            assert_ne!(pid, own_pid());
+            assert_eq!(
+                process_path(pid).as_deref(),
+                Some(Path::new(DOCK_EXECUTABLE))
+            );
+            assert_eq!(process_uid(pid), Some(uid));
         }
     }
 
@@ -3541,6 +4182,7 @@ mod tests {
             bundle,
             version: VERSION.to_string(),
             data_dir: data,
+            event_mark: LAUNCH_MARK,
         };
         DockStepSetup { folder, steps, bin }
     }
@@ -3586,8 +4228,9 @@ mod tests {
             Some(StepOutcome::Done)
         );
         let calls = dock.calls.borrow().clone();
+        assert_eq!(calls[..3], attempt_reads());
         assert_eq!(
-            calls[2],
+            calls[3],
             DockCall::Write(vec![(
                 DOCK_PINNED_KEY,
                 vec![app_tile(
@@ -3598,7 +4241,7 @@ mod tests {
                 )]
             )])
         );
-        assert_eq!(calls[3..], [DockCall::Restart]);
+        assert_eq!(calls[4..], end_and_read_back(FIRST_DOCK_PID));
 
         assert_eq!(setup.run(&dock), Some(StepRun::AlreadySettled));
         assert_eq!(dock.calls.borrow().len(), calls.len());
@@ -3609,7 +4252,8 @@ mod tests {
         let setup = dock_step_setup();
         let dock = setup.dock_with_the_old_pin();
         assert_eq!(setup.run(&dock), Some(StepRun::Done));
-        assert_eq!(dock.calls.borrow().last(), Some(&DockCall::Restart));
+        assert_eq!(dock.ends(), 1);
+        assert!(dock.calls.borrow().contains(&DockCall::End(FIRST_DOCK_PID)));
     }
 
     #[test]
@@ -3661,6 +4305,6 @@ mod tests {
             entry(&setup.steps.data_dir, MigrationStep::Dock),
             Some(StepOutcome::Failed)
         );
-        assert!(!dock.calls.borrow().contains(&DockCall::Restart));
+        assert_eq!(dock.ends(), 0);
     }
 }
