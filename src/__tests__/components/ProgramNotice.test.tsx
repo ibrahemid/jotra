@@ -89,7 +89,7 @@ afterEach(() => {
 });
 
 describe("ProgramNotice", () => {
-  it("names a program that starts waiting, with the three choices, and leaves focus where it was", async () => {
+  it("names a program that starts waiting, with its choices, and leaves focus where it was", async () => {
     const { container, field } = await mount();
     expect(container.querySelector(".program-notice")).toBeNull();
 
@@ -103,6 +103,7 @@ describe("ProgramNotice", () => {
     expect(buttonsIn(notice)).toEqual([
       "Approve reading",
       "Approve reading and writing",
+      "Let it see the open file",
       "Don't allow",
       "Close",
     ]);

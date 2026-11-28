@@ -1,5 +1,6 @@
 import {
   getDefaultAppStatus as ipcGetDefaultAppStatus,
+  getDefaultAppSupport as ipcGetDefaultAppSupport,
   listDefaultAppTypes as ipcListDefaultAppTypes,
   setDefaultApp as ipcSetDefaultApp,
 } from "../../services/tauri";
@@ -13,6 +14,10 @@ export async function fetchDefaultAppTypes(): Promise<ClaimableType[]> {
 
 export async function fetchDefaultAppStatus(id: string): Promise<DefaultAppStatus> {
   return ipcGetDefaultAppStatus(id);
+}
+
+export async function fetchDefaultAppSupport(): Promise<boolean> {
+  return ipcGetDefaultAppSupport();
 }
 
 export async function claimDefaultApp(id: string): Promise<void> {

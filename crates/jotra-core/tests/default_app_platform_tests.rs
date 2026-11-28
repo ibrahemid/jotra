@@ -2,9 +2,28 @@ use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
 use jotra_core::default_app::{
-    aggregate_status, application_dirs, claimable_types, desktop_entry_status, find_desktop_entry,
-    DefaultAppStatus, DESKTOP_ENTRY_NAMES, WINDOWS_DEFAULT_APPS_URI,
+    aggregate_status, appimage_link_entry, application_dirs, claimable_type, claimable_types,
+    claims_link_type, data_dirs, desktop_entry_status, find_desktop_entry, known_mimes, link_types,
+    mime_database_names, offers_default_apps, DefaultAppStatus, DefaultAppSystem,
+    DESKTOP_ENTRY_NAMES, WINDOWS_DEFAULT_APPS_URI,
 };
+use jotra_core::linux_rename::desktop_entry_value;
+
+#[test]
+fn support_is_read_from_what_is_installed() {
+    assert!(offers_default_apps(DefaultAppSystem::MacOs));
+    assert!(offers_default_apps(DefaultAppSystem::Windows));
+    assert!(!offers_default_apps(DefaultAppSystem::Other));
+    let linux = |desktop_entry, xdg_mime| {
+        offers_default_apps(DefaultAppSystem::Linux {
+            desktop_entry,
+            xdg_mime,
+        })
+    };
+    assert!(linux(true, true));
+    assert!(!linux(false, true), "no desktop entry to name");
+    assert!(!linux(true, false), "no xdg-mime to set it with");
+}
 
 #[test]
 fn every_group_names_the_mime_types_it_claims_on_linux() {
@@ -16,6 +35,68 @@ fn every_group_names_the_mime_types_it_claims_on_linux() {
             group.id
         );
     }
+}
+
+#[test]
+fn jsx_and_swift_are_claimed_where_the_system_knows_their_types() {
+    let source = claimable_type("source-code").expect("source code");
+    assert!(source.mimes.contains(&"text/jsx"));
+    assert!(source.mimes.contains(&"text/x-swift"));
+
+    let types = "text/rust\r\ntext/x-go\ntext/jsx\napplication/typescript\ntext/x-python\n\
+                 text/x-shellscript\ntext/javascript\ntext/x-csrc\n";
+    let aliases = "text/x-c text/x-csrc\napplication/x-javascript text/javascript\n";
+    let known = mime_database_names(types, aliases);
+    assert_eq!(
+        known_mimes(source.mimes, Some(&known)),
+        [
+            "text/rust",
+            "text/x-go",
+            "text/jsx",
+            "application/typescript",
+            "text/x-python",
+            "text/x-shellscript",
+            "text/javascript",
+            "text/x-c",
+        ],
+        "an older database has no Swift type"
+    );
+    assert_eq!(known_mimes(source.mimes, None), source.mimes);
+}
+
+#[test]
+fn an_appimage_entry_hands_the_image_the_links_it_handles() {
+    let entry = appimage_link_entry("/home/a/Apps/Jotra 1.2.AppImage", "Jotra").expect("entry");
+    assert_eq!(
+        desktop_entry_value(&entry, "Exec"),
+        Some("\"/home/a/Apps/Jotra 1.2.AppImage\" %u")
+    );
+    assert_eq!(desktop_entry_value(&entry, "NoDisplay"), Some("true"));
+    let declared = desktop_entry_value(&entry, "MimeType").expect("types");
+    for link in link_types() {
+        assert!(declared.split(';').any(|kind| kind == link), "{link}");
+    }
+    assert_eq!(appimage_link_entry("/home/a/100%.AppImage", "Jotra"), None);
+
+    assert!(claims_link_type("\n"));
+    assert!(
+        !claims_link_type("Jotra.desktop\n"),
+        "the package's entry is kept"
+    );
+    assert!(!claims_link_type("other.desktop\n"));
+}
+
+#[test]
+fn data_folders_follow_the_xdg_order_and_defaults() {
+    assert_eq!(
+        data_dirs(None, Some(" "), Some(Path::new("/home/a"))),
+        vec![
+            PathBuf::from("/home/a/.local/share"),
+            PathBuf::from("/usr/local/share"),
+            PathBuf::from("/usr/share"),
+        ]
+    );
+    assert_eq!(data_dirs(None, Some("/x"), None), vec![PathBuf::from("/x")]);
 }
 
 #[test]

@@ -46,16 +46,21 @@ async function showNext(): Promise<void> {
   if (!next) return;
   showing = true;
   const { held, until } = next;
-  // A question the person already has on screen is theirs to answer first.
-  while (pendingConfirm()) await whenNoQuestion();
-  // The program stops waiting at `until`, and the question goes with it.
-  const left = until - Date.now();
   let apply = false;
-  if (left > 0) {
+  for (;;) {
+    // A question the person already has on screen is theirs to answer first.
+    while (pendingConfirm()) await whenNoQuestion();
+    // The program stops waiting at `until`, and the question goes with it.
+    const left = until - Date.now();
+    if (left <= 0) break;
     const expiry = setTimeout(() => dismissConfirm(held.token), left);
     const outcome = await requestChoice(heldWriteQuestion(held));
     clearTimeout(expiry);
+    // A question the person opened took the screen: the write is asked again
+    // once that one is answered.
+    if (outcome === "dismissed" && pendingConfirm() !== null) continue;
     apply = outcome === "confirm";
+    break;
   }
   try {
     await answerHeldWrite(held.token, apply);
@@ -74,7 +79,8 @@ async function showNext(): Promise<void> {
 
 /**
  * Shows a program's held write, after any already on screen: Apply lets it
- * land, and Discard, Escape or the program giving up writes nothing.
+ * land, and Discard, Escape or the program giving up writes nothing. A
+ * question the person opens meanwhile puts it aside until that is answered.
  */
 export function receiveHeldWrite(held: HeldWrite): void {
   waiting.push({ held, until: Date.now() + held.wait_ms });

@@ -509,8 +509,10 @@ pub fn rename_note_recording(
     // tab, and a later note taking the old name has them delivered to this
     // one instead.
     state.follow_note_path(id, &to);
-
-    store.get(id).map_err(|e| e.to_string())
+    let renamed = store.get(id).map_err(|e| e.to_string());
+    drop(store);
+    crate::instance::tab_moved(state, from, &to);
+    renamed
 }
 
 /// Puts a renamed file back under the name its row still holds.
@@ -1721,6 +1723,7 @@ fn repoint_notes(state: &AppState, from: &Path, to: &Path) -> Result<(), String>
         if let Ok(canonical) = canonicalize_for_authorization(&path) {
             state.authorized_paths.record_blessed_source(canonical);
         }
+        crate::instance::tab_moved(state, Path::new(&row.from), &path);
         // Only a note Jotra has read or written this launch has a record to
         // move. Reading every file in the folder to make one would be the one
         // thing this operation must not do: in a sync folder it pulls down

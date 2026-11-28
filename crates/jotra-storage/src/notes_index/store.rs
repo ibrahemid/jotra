@@ -223,6 +223,13 @@ impl NotesIndexStore {
         self.read(crate::database::migrations::applied_schema_version)
     }
 
+    /// The migration versions this build embeds that the open database has
+    /// not recorded. See
+    /// [`crate::database::migrations::pending_schema_versions`].
+    pub fn pending_schema_versions(&self) -> StorageResult<Vec<i32>> {
+        self.read(crate::database::migrations::pending_schema_versions)
+    }
+
     /// Which folder the index is describing, as a number that changes whenever
     /// it changes.
     ///

@@ -78,6 +78,15 @@ pub enum StorageError {
         conflict_copy: Option<String>,
     },
 
+    /// The file the write was built from was removed before the write landed.
+    /// Nothing was written: the bytes were made from text that is no longer
+    /// anywhere, and writing them would bring back a file someone removed.
+    #[error("the file was removed before the write landed: {path}")]
+    SourceRemoved {
+        /// The note's path.
+        path: String,
+    },
+
     /// The file's bytes are not on this machine, so there is nothing to
     /// compare a save against and nothing to write over (ADR-028 §5).
     ///

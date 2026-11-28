@@ -87,7 +87,7 @@ Chat and Rewrite share one AI connection: Ollama, LM Studio, llama.cpp or Jan on
 - Spell check runs on this machine and is off until you turn it on. Code, URLs and identifiers stay unflagged.
 - A watched folder (Settings, Integrations) opens new files as they arrive. See [adr/018-watch-inbox.md](adr/018-watch-inbox.md).
 - The `jotra` command opens files, folders and piped text from a terminal, and answers questions about the folder. See [cli-verbs.md](cli-verbs.md).
-- On macOS and Windows, `jotra://open?path=Plan.md&line=12` opens a file in Jotra's folder at a line, from a browser or another program, and `jotra://new?name=Plan` opens a new tab. `writ://` links work the same way. A link opens only a file inside the folder and writes nothing. See [adr/052-writ-links.md](adr/052-writ-links.md).
+- `jotra://open?path=Plan.md&line=12` opens a file in Jotra's folder at a line, from a browser or another program, and `jotra://new?name=Plan` opens a new tab. `writ://` links work the same way. A link opens only a file inside the folder and writes nothing. See [adr/052-writ-links.md](adr/052-writ-links.md).
 - A folder written in Obsidian opens as it is: [what carries over](./importing-from-obsidian.md).
 - No account and no telemetry.
 - Each update is verified against Jotra's signing key before it installs, and the automatic check can be turned off under Settings, About. See [adr/007-in-app-updater.md](adr/007-in-app-updater.md).

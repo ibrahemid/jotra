@@ -917,6 +917,39 @@ fn a_save_that_carries_metadata_still_goes_through_the_retrying_rename() {
 }
 
 #[test]
+fn a_private_file_is_its_owners_alone_and_never_replaces_one_that_took_its_name() {
+    let dir = TempDir::new().expect("temp dir");
+    let target = dir.path().join("answer.json");
+
+    jotra_storage::atomic::write_new_private(&target, b"first").expect("a free name is written");
+    assert_eq!(fs::read(&target).expect("read"), b"first");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = fs::metadata(&target)
+            .expect("metadata")
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o777, 0o600);
+    }
+
+    let error = jotra_storage::atomic::write_new_private(&target, b"second")
+        .expect_err("the name is taken");
+    match error {
+        jotra_storage::atomic::AtomicWriteError::Io(error) => {
+            assert_eq!(error.kind(), std::io::ErrorKind::AlreadyExists)
+        }
+        other => panic!("expected a taken name, got {other:?}"),
+    }
+    assert_eq!(fs::read(&target).expect("read"), b"first");
+    let names: Vec<_> = fs::read_dir(dir.path())
+        .expect("list")
+        .map(|entry| entry.expect("entry").file_name())
+        .collect();
+    assert_eq!(names.len(), 1, "no temp file is left behind: {names:?}");
+}
+
+#[test]
 fn a_new_file_never_replaces_one_that_took_its_name() {
     let dir = TempDir::new().expect("temp dir");
     let target = dir.path().join("Launch (recovered).md");

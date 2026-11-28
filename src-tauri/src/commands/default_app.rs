@@ -1,6 +1,9 @@
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 use jotra_core::default_app::aggregate_status;
-use jotra_core::default_app::{claimable_type, claimable_types, ClaimableType, DefaultAppStatus};
+use jotra_core::default_app::{
+    claimable_type, claimable_types, offers_default_apps, ClaimableType, DefaultAppStatus,
+    DefaultAppSystem,
+};
 use tauri::AppHandle;
 
 use crate::commands::offload::{run_detached, ERR_COMMAND_STOPPED};
@@ -36,6 +39,39 @@ impl From<DefaultAppCommandError> for String {
 #[tauri::command]
 pub fn list_default_app_types() -> Vec<ClaimableType> {
     claimable_types().to_vec()
+}
+
+/// IPC: whether this system lets Jotra be made a default app. Answered from
+/// what is installed, so the startup check reads no type's current default.
+#[tauri::command]
+pub async fn get_default_app_support() -> Result<bool, String> {
+    run_detached(ERR_COMMAND_STOPPED, || {
+        Ok(offers_default_apps(this_system()))
+    })
+    .await
+}
+
+#[cfg(target_os = "macos")]
+fn this_system() -> DefaultAppSystem {
+    DefaultAppSystem::MacOs
+}
+
+#[cfg(target_os = "windows")]
+fn this_system() -> DefaultAppSystem {
+    DefaultAppSystem::Windows
+}
+
+#[cfg(target_os = "linux")]
+fn this_system() -> DefaultAppSystem {
+    DefaultAppSystem::Linux {
+        desktop_entry: linux::desktop_entry().is_some(),
+        xdg_mime: linux::xdg_mime_installed(),
+    }
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
+fn this_system() -> DefaultAppSystem {
+    DefaultAppSystem::Other
 }
 
 fn group(id: &str) -> Result<&'static ClaimableType, DefaultAppCommandError> {
@@ -74,8 +110,9 @@ fn query_status(group: &ClaimableType) -> Result<DefaultAppStatus, DefaultAppCom
     let Some(entry) = linux::desktop_entry() else {
         return Ok(DefaultAppStatus::Unsupported);
     };
-    let mut statuses = Vec::with_capacity(group.mimes.len());
-    for mime in group.mimes {
+    let mimes = linux::claimable_mimes(group);
+    let mut statuses = Vec::with_capacity(mimes.len());
+    for mime in mimes {
         match linux::query_default(mime, entry) {
             Ok(status) => statuses.push(status),
             Err(linux::XdgError::Missing) => return Ok(DefaultAppStatus::Unsupported),
@@ -122,7 +159,7 @@ fn claim(_app: &AppHandle, group: &ClaimableType) -> Result<(), DefaultAppComman
 #[cfg(target_os = "linux")]
 fn claim(_app: &AppHandle, group: &ClaimableType) -> Result<(), DefaultAppCommandError> {
     let entry = linux::desktop_entry().ok_or(DefaultAppCommandError::Unsupported)?;
-    linux::set_default(entry, group.mimes).map_err(|error| match error {
+    linux::set_default(entry, &linux::claimable_mimes(group)).map_err(|error| match error {
         linux::XdgError::Missing => DefaultAppCommandError::Unsupported,
         other => DefaultAppCommandError::System(other.to_string()),
     })
@@ -168,7 +205,8 @@ mod linux {
     use std::process::Command;
 
     use jotra_core::default_app::{
-        application_dirs, desktop_entry_status, find_desktop_entry, DefaultAppStatus,
+        application_dirs, data_dirs, desktop_entry_status, find_desktop_entry, known_mimes,
+        mime_database_names, ClaimableType, DefaultAppStatus,
     };
 
     /// Why `xdg-mime` gave no answer.
@@ -189,6 +227,40 @@ mod linux {
         let home = dirs::home_dir();
         let dirs = application_dirs(data_home.as_deref(), data_dirs.as_deref(), home.as_deref());
         find_desktop_entry(&dirs, std::path::Path::is_file)
+    }
+
+    /// The types of `group` the system's MIME database knows, read from
+    /// `mime/types` and `mime/aliases` in each XDG data folder; every type of
+    /// the group when no database is found.
+    pub fn claimable_mimes(group: &ClaimableType) -> Vec<&'static str> {
+        let data_home = std::env::var("XDG_DATA_HOME").ok();
+        let data_folders = std::env::var("XDG_DATA_DIRS").ok();
+        let home = dirs::home_dir();
+        let mut known = std::collections::HashSet::new();
+        let mut found = false;
+        for dir in data_dirs(
+            data_home.as_deref(),
+            data_folders.as_deref(),
+            home.as_deref(),
+        ) {
+            let Ok(types) = std::fs::read_to_string(dir.join("mime/types")) else {
+                continue;
+            };
+            let aliases = std::fs::read_to_string(dir.join("mime/aliases")).unwrap_or_default();
+            known.extend(mime_database_names(&types, &aliases));
+            found = true;
+        }
+        known_mimes(group.mimes, found.then_some(&known))
+    }
+
+    /// Whether `xdg-mime` resolves on the search path.
+    pub fn xdg_mime_installed() -> bool {
+        jotra_storage::mcp_registration::resolve_command(
+            std::path::Path::new("xdg-mime"),
+            std::env::var_os("PATH").as_deref(),
+            false,
+        )
+        .is_some()
     }
 
     fn run(args: &[&str]) -> Result<String, XdgError> {
@@ -420,6 +492,30 @@ mod tests {
                     group.id
                 );
             }
+        }
+    }
+
+    // The bundler's own template starts Jotra with no arguments, so a file or
+    // a link opened from the desktop never reaches it.
+    #[test]
+    fn the_linux_launcher_hands_jotra_the_files_and_links_it_opens() {
+        let raw = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/tauri.conf.json"))
+            .expect("read tauri.conf.json");
+        let conf: serde_json::Value = serde_json::from_str(&raw).expect("parse tauri.conf.json");
+        for package in ["deb", "rpm"] {
+            let template = conf["bundle"]["linux"][package]["desktopTemplate"]
+                .as_str()
+                .unwrap_or_else(|| panic!("{package} names no desktop template"));
+            let text = std::fs::read_to_string(
+                std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(template),
+            )
+            .expect("read the desktop template");
+            let lines: Vec<&str> = text.lines().map(str::trim_end).collect();
+            assert!(lines.contains(&"Exec={{exec}} %U"), "{package}: {text}");
+            assert!(
+                lines.contains(&"MimeType={{mime_type}}"),
+                "{package}: {text}"
+            );
         }
     }
 

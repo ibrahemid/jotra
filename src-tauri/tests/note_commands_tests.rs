@@ -1026,6 +1026,52 @@ fn a_programs_write_reaches_the_tab_with_the_programs_name_and_an_unknown_one_wi
 }
 
 #[test]
+fn a_programs_version_kept_after_the_watchers_window_still_names_the_program() {
+    // A program keeps the version of what it landed before it lets go of the
+    // write lock, so the watcher waits for the lock rather than report the
+    // change with nobody behind it.
+    let dir = TempDir::new().expect("temp dir");
+    let (state, rx) = watching_state(&dir);
+    state.note_history.set_notes_root(state.notes_root());
+
+    let doc = new_note_inner(&state).expect("new note");
+    let path = note_file(&state, &doc.id);
+    std::thread::sleep(APART);
+
+    let written = b"rewritten by a program that keeps its version slowly\n";
+    let held = jotra_storage::write_lock::WriteLock::in_data_folder(&state.jotra_dir)
+        .hold()
+        .expect("the write lock");
+    rewrite_from_outside(&path, written);
+    std::thread::sleep(APART * 2);
+    let key = state
+        .note_history
+        .key_for(&path)
+        .expect("a note in the folder");
+    state
+        .note_history
+        .capture(
+            &key,
+            written,
+            std::time::SystemTime::now(),
+            &WriteOrigin::Mcp {
+                client: "claude-code".to_string(),
+            },
+        )
+        .expect("the program's version");
+    drop(held);
+
+    let seen = external_events(&rx);
+    assert_eq!(seen.len(), 1, "the tab must be told once, saw {seen:?}");
+    assert_eq!(
+        writer_named_by(&seen[0]),
+        Some(Writer::Program {
+            name: "claude-code".to_string()
+        })
+    );
+}
+
+#[test]
 fn a_note_renamed_this_session_hears_about_its_new_file_and_not_its_old_name() {
     // The rename moves the file and re-keys the row. A registry left holding
     // the old path answers for the wrong file twice over: changes to the

@@ -902,3 +902,80 @@ fn a_waiting_command_whose_files_cannot_open_is_answered_at_once() {
     );
     assert!(!marker.exists());
 }
+
+#[test]
+fn a_waiting_command_is_answered_when_the_window_opens_no_tab_for_its_file() {
+    let dir = TempDir::new().unwrap();
+    let state = make_state(&dir);
+    state
+        .frontend_ready
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    let file = state.notes_root().join("export.log");
+    std::fs::write(&file, "line\n").unwrap();
+    let marker = jotra_storage::instance::create_wait_marker(&state.jotra_dir, "t3").unwrap();
+    let request = cli_request(&[&file.to_string_lossy()], &[], Some("t3"));
+
+    let opens = jotra_tauri_lib::instance::route_forwarded(&state, &request).expect("opens");
+    assert!(marker.exists(), "nothing has answered the window yet");
+
+    jotra_tauri_lib::instance::tabs_not_opened(&state, &opens.paths);
+    assert!(!marker.exists(), "a file that got no tab answers the wait");
+}
+
+#[test]
+fn a_file_a_tab_already_shows_keeps_its_wait_when_another_open_of_it_is_declined() {
+    let dir = TempDir::new().unwrap();
+    let state = make_state(&dir);
+    state
+        .frontend_ready
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    let file = state.notes_root().join("Plan.md");
+    std::fs::write(&file, "plan\n").unwrap();
+    let marker = jotra_storage::instance::create_wait_marker(&state.jotra_dir, "t4").unwrap();
+    let request = cli_request(&[&file.to_string_lossy()], &[], Some("t4"));
+    let opens = jotra_tauri_lib::instance::route_forwarded(&state, &request).expect("opens");
+    let id = open_file_from_path(&state, &opens.paths[0])
+        .expect("open")
+        .doc
+        .expect("a tab")
+        .id;
+
+    jotra_tauri_lib::instance::tabs_not_opened(&state, &opens.paths);
+    assert!(
+        marker.exists(),
+        "the tab showing the file still holds the wait"
+    );
+
+    close_buffer_inner(&state, &id).expect("close");
+    assert!(!marker.exists());
+}
+
+#[test]
+fn a_waiting_command_is_answered_when_its_renamed_tab_closes() {
+    let dir = TempDir::new().unwrap();
+    let state = make_state(&dir);
+    state
+        .frontend_ready
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    let file = state.notes_root().join("Draft.md");
+    std::fs::write(&file, "draft\n").unwrap();
+    let marker = jotra_storage::instance::create_wait_marker(&state.jotra_dir, "t5").unwrap();
+    let request = cli_request(&[&file.to_string_lossy()], &[], Some("t5"));
+    let opens = jotra_tauri_lib::instance::route_forwarded(&state, &request).expect("opens");
+    let id = open_file_from_path(&state, &opens.paths[0])
+        .expect("open")
+        .doc
+        .expect("a tab")
+        .id;
+
+    let renamed =
+        jotra_tauri_lib::commands::notes::rename_note_inner(&state, &id, "Final").expect("rename");
+    assert!(renamed
+        .source_path
+        .as_deref()
+        .is_some_and(|path| path.ends_with("Final.md")));
+    assert!(marker.exists(), "the renamed tab is still open");
+
+    close_buffer_inner(&state, &id).expect("close");
+    assert!(!marker.exists(), "closing the renamed tab answers the wait");
+}

@@ -40,7 +40,7 @@ install: switch on Connections, Tags and Graph under Settings, Apps.
 
 | Written in Obsidian | In Jotra |
 |---|---|
-| `.obsidian/` settings: appearance, hotkeys, core plugin options | Set them again in Jotra's settings. The folder is skipped whole and Jotra writes nothing there on its own, so Obsidian keeps working from it. |
+| `.obsidian/` settings: appearance, hotkeys, core plugin options | Set them again in Jotra's settings. The folder is skipped whole and Jotra writes nothing there, on its own or for a connected program, so Obsidian keeps working from it. |
 | Community plugins in `.obsidian/plugins/` | None of them run. A file a plugin wrote shows the text the file holds, so a Dataview query or a Templater tag shows as the characters it is. |
 | `> [!note]` callouts | Styled as a blockquote. |
 | `![[Note]]` and `![[image.png]]` embeds | Not shown in the page. The text stays as written. |

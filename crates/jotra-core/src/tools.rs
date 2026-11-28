@@ -31,6 +31,11 @@ pub const READ_TOOLS: &[&str] = &[
     "reveal",
 ];
 
+/// The read tools that show a file in Jotra, starting it when it is not
+/// running and bringing it forward. Approved with reading, they still change
+/// what is on screen, so the server does not list them as read-only.
+pub const SHOW_TOOLS: &[&str] = &["open_in_jotra", "reveal"];
+
 /// The tools that change a note, in the order `tools/list` reports them.
 ///
 /// `today` is here because it makes the day's file when there is none.
