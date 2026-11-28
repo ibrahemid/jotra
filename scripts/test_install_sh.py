@@ -67,10 +67,14 @@ name="${url##*/}"
 cp "$FIXTURES/$name" "$out"
 """
 
-FAKE_APPIMAGE = """#!/bin/sh
+def fake_appimage(command: str) -> str:
+    return f"""#!/bin/sh
 mkdir -p squashfs-root/usr/bin
-printf '#!/bin/sh\\necho jotra\\n' > squashfs-root/usr/bin/jotra
+printf '#!/bin/sh\\necho jotra\\n' > squashfs-root/usr/bin/{command}
 """
+
+
+FAKE_APPIMAGE = fake_appimage("jotra")
 
 OLD_OPENSSL = """#!/bin/sh
 [ "$1" = version ] && echo "OpenSSL 1.1.1w  11 Sep 2023" && exit 0
@@ -205,17 +209,24 @@ class InstallScriptFixture(unittest.TestCase):
         appimage: bytes,
         sums_signer: TestKey | None = None,
         asset_signer: TestKey | None = None,
-        listed_name: str = ASSET,
+        listed_name: str | None = None,
+        asset: str = ASSET,
+        also_published: dict[str, bytes] | None = None,
     ) -> None:
-        """Writes a release: the AppImage, its .sig, the sums and their signature."""
-        (self.fixtures / ASSET).write_bytes(appimage)
-        sums = f"{hashlib.sha256(appimage).hexdigest()}  {listed_name}\n".encode()
+        """Writes a release: each AppImage, its .sig, the sums and their signature."""
+        for stale in self.fixtures.glob("*.AppImage*"):
+            stale.unlink()
+        sums = b""
+        for name, body in {asset: appimage, **(also_published or {})}.items():
+            (self.fixtures / name).write_bytes(body)
+            listed = listed_name if name == asset and listed_name is not None else name
+            sums += f"{hashlib.sha256(body).hexdigest()}  {listed}\n".encode()
+            asset_sig = (asset_signer or self.signer).minisig(body, f"timestamp:1\tfile:{name}\tversion:{VERSION}")
+            (self.fixtures / f"{name}.sig").write_text(base64.b64encode(asset_sig.encode()).decode())
         (self.fixtures / "SHA256SUMS.txt").write_bytes(sums)
         (self.fixtures / "SHA256SUMS.txt.minisig").write_text(
             (sums_signer or self.signer).minisig(sums, f"timestamp:1\tfile:SHA256SUMS.txt\tversion:{VERSION}")
         )
-        asset_sig = (asset_signer or self.signer).minisig(appimage, f"timestamp:1\tfile:{ASSET}\tversion:{VERSION}")
-        (self.fixtures / f"{ASSET}.sig").write_text(base64.b64encode(asset_sig.encode()).decode())
 
     def use(self, tool: str, path: str) -> None:
         (self.tools / tool).symlink_to(path)
@@ -257,9 +268,11 @@ class InstallScriptFixture(unittest.TestCase):
         gui: pathlib.Path,
         cli: pathlib.Path,
         command_name: str | None = None,
+        exports_old_gui_variable: bool = False,
     ) -> None:
         wrapper = self.home / ".local/bin" / command
         self.assertTrue(os.access(wrapper, os.X_OK))
+        old_gui_line = 'WRIT_GUI_BIN="${JOTRA_GUI_BIN}"; export WRIT_GUI_BIN\n' if exports_old_gui_variable else ""
         name_line = (
             "" if command_name is None else f'JOTRA_COMMAND_NAME="{command_name}"; export JOTRA_COMMAND_NAME\n'
         )
@@ -269,14 +282,20 @@ class InstallScriptFixture(unittest.TestCase):
             'JOTRA_GUI_BIN="${JOTRA_GUI_BIN:-${WRIT_GUI_BIN:-}}"\n'
             f'[ -n "${{JOTRA_GUI_BIN}}" ] || JOTRA_GUI_BIN="{gui}"\n'
             "export JOTRA_GUI_BIN\n"
-            f'{name_line}exec "{cli}" "$@"\n',
+            f'{old_gui_line}{name_line}exec "{cli}" "$@"\n',
         )
         ran = subprocess.run([str(wrapper)], env=self.env, capture_output=True, text=True)
         self.assertEqual(ran.returncode, 0, ran.stderr)
         self.assertEqual(ran.stdout, "jotra\n")
 
-    def assert_gui_variable_precedence(self, command: str, gui: pathlib.Path, cli: pathlib.Path) -> None:
-        cli.write_text('#!/bin/sh\nprintf "%s\\n" "$JOTRA_GUI_BIN"\n')
+    def assert_gui_variable_precedence(
+        self,
+        command: str,
+        gui: pathlib.Path,
+        cli: pathlib.Path,
+        cli_reads: str = "JOTRA_GUI_BIN",
+    ) -> None:
+        cli.write_text(f'#!/bin/sh\nprintf "%s\\n" "${cli_reads}"\n')
         wrapper = self.home / ".local/bin" / command
         cases = (
             ({}, str(gui)),
@@ -332,6 +351,21 @@ class InstallScriptTests(InstallScriptFixture):
         self.assert_installed(result)
         self.assertIn("SHA256SUMS.txt.minisig", self.downloads())
         self.assertIn(f"{ASSET}.sig", self.downloads())
+
+    def test_names_the_appimage_from_the_signed_sums_before_downloading_it(self) -> None:
+        self.use("openssl", OPENSSL)  # type: ignore[arg-type]
+        self.stub("fusermount", FUSERMOUNT)
+        result = self.run_install()
+
+        self.assert_installed(result)
+        self.assertEqual(self.downloads(), ["SHA256SUMS.txt", "SHA256SUMS.txt.minisig", ASSET, f"{ASSET}.sig"])
+        self.assertIn(f"downloading {ASSET} (v{VERSION})", result.stdout)
+
+    def test_downloads_no_appimage_when_the_sums_signature_fails(self) -> None:
+        self.use("openssl", OPENSSL)  # type: ignore[arg-type]
+        self.publish(FAKE_APPIMAGE.encode(), sums_signer=self.other_signer)
+        self.assert_refused(self.run_install(), "the signature on SHA256SUMS.txt does not match")
+        self.assertEqual(self.downloads(), ["SHA256SUMS.txt", "SHA256SUMS.txt.minisig"])
 
     @unittest.skipIf(MINISIGN is None, "minisign is not installed")
     def test_installs_a_release_minisign_verifies(self) -> None:

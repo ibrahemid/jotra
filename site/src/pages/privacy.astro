@@ -1,43 +1,49 @@
 ---
 import Prose from '../layouts/Prose.astro';
+import release from '../data/release.json';
+import { getReleaseNames } from '../lib/release-names';
+
+const names = getReleaseNames(release);
 ---
-<Prose title="Privacy" description="Your files stay in a folder on your disk. No account, no telemetry. Chat, Rewrite, Connected programs and Dictation are apps that are off until you switch them on. Jotra contacts GitHub to check for updates and to download one you install, and the server of each web image it loads." path="/privacy/" lead="Where your files live, and what leaves the machine. Reviewed 2026-11-18.">
+<Prose title="Privacy" description="Your files stay in a folder on your disk. No account, no telemetry. Chat, Rewrite, Connected programs and Dictation are apps that are off until you switch them on. Unless you switch one of them on, Jotra contacts only GitHub, to check for updates and to download one you install, and the server of each web image you load." path="/privacy/" lead="Where your files live, and what leaves the machine. Reviewed 2026-11-18.">
   <h2>Your files</h2>
   <p>
     Jotra opens a text file up to 524&nbsp;MB anywhere on your disk and edits it where it is. It also keeps a folder of its own,
-    <code>~/Jotra</code>, or <code>~/Writ</code> on a computer that ran Writ, unless you moved it; <code>Settings &rarr; General &rarr; Folder</code> shows the path. New
-    files and anything you pipe into the <code>jotra</code> command land there, and search covers its text files up to
+    <code>{names.notesFolder}</code>{names.isCurrentName && <Fragment>, or <code>~/Writ</code> on a computer that ran Writ,</Fragment>} unless you moved it; <code>Settings &rarr; General &rarr; Folder</code> shows the path. New
+    files and anything you pipe into the <code>{names.command}</code> command land there, and search covers its text files up to
     5&nbsp;MB each, leaving out folders such as <code>.git</code>, <code>.obsidian</code> and <code>.trash</code>.
   </p>
 
   <h2>Jotra's data folder</h2>
   <p>
-    Jotra keeps its own records in <code>~/.jotra</code>, or <code>~/.writ</code> on a computer that ran Writ, which
+    Jotra keeps its own records in <code>{names.dataFolder}</code>{names.isCurrentName && <Fragment>, or <code>~/.writ</code> on a computer that ran Writ</Fragment>}, which
     <code>Settings &rarr; Advanced</code> also shows. Among
     them:
   </p>
   <ul>
     <li>
-      <code>jotra.db</code> (<code>writ.db</code> in <code>~/.writ</code>) holds the search index, which stores the text of each file search covers so search can
-      find it, along with the links, tags and properties read from those files, the paths and order of your tabs and
-      of the files you closed, and each file's preview layout. It also holds text you typed that had not reached its
+      <code>{names.indexFile}</code>{names.isCurrentName && <Fragment> (<code>writ.db</code> in <code>~/.writ</code>)</Fragment>} holds the search index, which stores the text of each file search covers so search can
+      find it, along with the links, headings, tags and properties read from those files, the paths and order of your tabs and
+      of the files you closed, each file's preview layout, and how often and when you last ran each palette command. It also holds text you typed that had not reached its
       file, such as after a refused save or when Jotra quit, until a later save or the next launch puts it on disk.
     </li>
     <li><code>config.toml</code> holds your settings. It holds no API key.</li>
     <li>
       <code>history/</code> and <code>history.db</code> hold earlier versions of the files in the folder, so a bad
-      edit or a program's write can be undone. Jotra keeps a version when a file is saved, except for your own saves
-      within 10 seconds of the last version kept, for up to 30 days or 200 versions per file, and no more than
-      250&nbsp;MB in all. A file's newest version is kept past 30 days. A file over 2&nbsp;MB is not versioned.
+      edit or a program's write can be undone. Jotra keeps a version when a file is saved; your own saves within 10
+      seconds of the last version kept replace that version's text. It keeps versions for up to 30 days or 200 per
+      file, and no more than 250&nbsp;MB in all. A file's newest version is kept past 30 days. A file over 2&nbsp;MB is not versioned.
     </li>
     <li>
       <code>chats/</code> holds one file per conversation: your messages, the replies, the edits a reply proposed,
-      and the paths and sizes of attached files. It keeps no copy of an attached file and no key. A proposed edit is
+      and the paths, sizes and hashes of attached files, with the provider and model; <code>chats/index.json</code>
+      lists each conversation's title and dates. It keeps no copy of an attached file and no key. A proposed edit is
       kept as the whole text the reply proposed for that file, until you apply or discard it.
     </li>
     <li><code>activity.jsonl</code> lists what connected programs and chat did with your files, without their text.</li>
     <li><code>logs/</code> records what the app did, and can name the files it worked on. Logs rotate daily, and the
-    newest 14 are kept. Crash files, up to eight a run, stay until you delete them.</li>
+    newest 14 are kept. Crash files, up to eight a run, stay until you delete them. A failure at startup writes its
+    report to the system temp folder when <code>logs/</code> cannot be written.</li>
   </ul>
   <p>
     None of this is written into your folder, so a sync client never carries it.
@@ -47,7 +53,8 @@ import Prose from '../layouts/Prose.astro';
   <p>
     Until you switch on Chat, Rewrite or Dictation, or load a web image, Jotra itself contacts only GitHub, for updates:
     it fetches a release manifest
-    and compares versions on your machine. It does this on its own shortly after launch, at most once a day,
+    and compares versions on your machine. It does this on its own a few seconds after launch and again while Jotra
+    stays open, at most once a day,
     and whenever you ask in <code>Settings &rarr; About</code>. Turn the automatic check off with
     <code>Check for updates automatically</code>. Installing an update downloads the release from GitHub and checks it
     against a signing key built into the app. Both requests go to github.com, which redirects them to
@@ -61,7 +68,7 @@ import Prose from '../layouts/Prose.astro';
     telemetry.
   </p>
   <p>
-    A Markdown file in Inline mode shows an image from a web address as its host and a Load image button. Jotra requests
+    A Markdown file in the Inline layout shows an image from a web address as its host and a Load image button. Jotra requests
     the image only when you click it, or for every one once <code>Load web images</code> is on in
     <code>Settings &rarr; Editor</code>. With that setting on, an image still waits for your click when its host is a
     name reserved for this computer or a name ending in <code>.local</code> or <code>.internal</code>, or when its
@@ -71,7 +78,8 @@ import Prose from '../layouts/Prose.astro';
     referrer. Jotra does not follow a redirect to a local address at a host other than the one shown, even after
     a click. When Jotra connects directly, it checks every address the redirect's host name resolves to. When a system
     proxy makes the connection, the proxy looks up that name, so Jotra checks only the name and any address written in
-    the redirect. Web images are fetched over https. An address written with http is requested over https, and Jotra
+    the redirect. An image that loads without a click connects directly, bypassing any system proxy; one you click
+    goes through it. Web images are fetched over https. An address written with http is requested over https, and Jotra
     does not follow a redirect to http on a public host or fall back to http. When you click, an image on this
     computer or a device on your own network can load over http if its host is one of those local names or an address
     in one of those ranges. Jotra keeps the image in memory and does not write it to disk.
@@ -80,9 +88,10 @@ import Prose from '../layouts/Prose.astro';
   <h2>The AI connection</h2>
   <p>
     Chat and Rewrite are apps you switch on in <code>Settings &rarr; Apps</code>. While either is on, the same
-    section holds the connection they share: provider, address, API key and model. Ollama, LM Studio, llama.cpp and
-    Jan run on your machine and need no key, so a request to any of them stays there. On macOS 26, on a Mac that
-    can run it, Rewrite can also use Apple's on-device model, and Jotra makes no network request for it.
+    section holds the connection they share: provider, API key and model, plus a Base URL when the provider is
+    Custom. Ollama, LM Studio, llama.cpp and
+    Jan run on your machine and need no key, so a request to any of them stays there. On macOS 26 or later, on a Mac
+    that can run it, Rewrite can also use Apple's on-device model, and Jotra makes no network request for it.
   </p>
   <p>
     Point the connection at a hosted provider and Jotra asks once, naming the host, before it sends that host
@@ -95,7 +104,8 @@ import Prose from '../layouts/Prose.astro';
     network or Tailscale. Jotra asks before it sends anything to a private address, and sends no key over plain http.
   </p>
   <p>
-    To show whether the provider is reachable, Jotra requests its model list. That request carries your API key and
+    To show whether the provider is reachable, Jotra requests its model list. It does so when Settings or the chat
+    pane opens and when you change the provider or address. That request carries your API key and
     no text, and goes to a hosted provider only after you allowed it. Settings and the chat pane also ask Ollama,
     LM Studio, llama.cpp and Jan on this machine (ports 11434, 1234, 8080 and 1337) whether they are running; that
     request carries nothing.
@@ -114,14 +124,15 @@ import Prose from '../layouts/Prose.astro';
 
   <h2>Chat</h2>
   <p>
-    A chat request carries a fixed instruction, the files attached to the conversation, the conversation so far and
-    the model id. The pane attaches the file in front of you and shows it as a chip you can remove; you add others
-    with <code>@</code> or by attaching a folder. Any file open in the editor can be attached, including one outside
+    A chat request carries a fixed instruction that names the first attached file, the attached files, as much of the
+    conversation as fits, and the model id. The pane attaches the file in front of you and shows it as a chip you can remove; you add others
+    with <code>@</code> or by attaching a folder. Any saved text file open in the editor can be attached, including one outside
     your folder, which is sent under its parent folder and file name, never its full path. Nothing that is not
     attached is read for a request.
   </p>
   <p>
-    Chat writes a file only when you choose Apply on a proposed edit, and no setting applies one for you. If the file
+    Chat writes a file only when you choose Apply on a proposed edit, or Undo after one, and no setting applies one
+    for you. If the file
     changed after the edit was proposed, Jotra refuses to apply it. The proposed text stays in the conversation. If
     Apply finds a file in your folder changed since the edit was proposed, the proposed text is also saved beside it
     as a dated copy.
@@ -132,7 +143,8 @@ import Prose from '../layouts/Prose.astro';
     Dictation is an app you switch on in <code>Settings &rarr; Apps</code>. Jotra opens the microphone only while you
     dictate, and the status bar shows it while it is open. Hiding Jotra, or hiding, minimizing or closing its window,
     turns it off, and so does a minute without speech. On Linux under Wayland a minimized window is not detected, so
-    the microphone stays open until the dictation shortcut, Escape or a minute without speech turns it off. Audio
+    the microphone stays open until the dictation shortcut, Escape, the status bar mark, switching tabs or a minute
+    without speech turns it off. Audio
     stays in memory: Jotra never writes it to disk or to a log, and drops it once it is transcribed.
   </p>
   <p>
@@ -146,8 +158,9 @@ import Prose from '../layouts/Prose.astro';
     this machine or a private IP address.
   </p>
   <p>
-    With <code>Clean up with the AI connection</code> on, the text of each phrase also goes to the AI connection's
-    host, under that connection's consent and key, before it is inserted. Dictation's key is stored like the AI
+    With <code>Clean up with the AI connection</code> on, the text of each phrase also goes to the AI connection, its
+    host or Apple's on-device model when the connection uses it, under that connection's consent and key, before it
+    is inserted. Dictation's key is stored like the AI
     connection's, in the system keychain under <code>com.writ.ai</code>, or in memory only where the keychain is
     unavailable. While Chat or Rewrite is on and Dictation uses the same provider and address (scheme, host and port)
     as the AI connection, it uses that connection's key; otherwise it keeps its own, and a custom server's key is kept
@@ -157,9 +170,9 @@ import Prose from '../layouts/Prose.astro';
 
   <h2>Connected programs</h2>
   <p>
-    Jotra ships an MCP server, <code>jotra mcp</code>, so a program you choose can work with the files in your folder.
+    Jotra ships an MCP server, <code>{names.command} mcp</code>, so a program you choose can work with the files in your folder.
     Connected programs is an app you switch on in <code>Settings &rarr; Apps</code>, which also shows the command to
-    give the program. Connect on a program's card runs that program's own <code>mcp add</code>, opens the install link
+    give the program. Add on a program's card runs that program's own <code>mcp add</code>, opens the install link
     the program handles, or hands it an extension bundle it installs itself; Jotra never edits another program's
     configuration. The program starts the server itself and talks to it over that process's input and output.
     Jotra opens no port for it, and the server makes no network request. Where that program sends what it reads is up to
@@ -179,15 +192,16 @@ import Prose from '../layouts/Prose.astro';
     version the program read: it is refused if the file changed since, and the program's text is saved beside the
     file. A file the program has not read is not replaced unless it asks to overwrite it, and the text a write
     replaces is kept as a version in Jotra's data folder. A file outside your folder is out of reach of these tools,
-    unless the program starts the server with <code>JOTRA_NOTES_DIR</code> naming another folder. A write to a file
+    unless the program starts the server with <code>{names.notesDirVariable}</code> naming another folder. A write to a file
     outside your folder keeps no version.
   </p>
   <p>
     With Open file turned on for it, a program can ask which file is in front in Jotra and read the text you selected
-    there, including text not saved yet. A selection longer than about 2 million characters is cut there, and the
-    answer says it was cut. A file outside your folder is named to it by its file name alone. Jotra asks
+    there, including text not saved yet. Selected text past 2&nbsp;MB in all, or past 100 selections, is left out, and
+    the answer says it was cut. A file outside your folder is named to it by its file name alone. Jotra asks
     the window only when the program calls, hands the answer over in a file in its data folder that the server
-    deletes once read, and lists each call in the activity list with the file's name and not the text.
+    deletes once read, and lists each call in the activity list with the file's name and not the text. An answer the
+    server stopped waiting for, which can hold unsaved text, is deleted at Jotra's next start.
   </p>
 
   <h2>The activity list</h2>
@@ -195,7 +209,8 @@ import Prose from '../layouts/Prose.astro';
     Every call from a program, whether it was allowed, refused or left waiting, and every chat edit you applied or
     discarded, is appended to <code>activity.jsonl</code>. A record names the program, the chat or Jotra, the tool, the file,
     the decision and, for a write, a byte count, never the text. A chat edit to a file outside your folder, applied
-    or discarded, is recorded under that file's full path. Reads of one file that one program repeats within a minute
+    or discarded, is recorded under that file's full path, or its file name alone when it is discarded after its tab
+    closed. Reads of one file that one program repeats within a minute
     are counted on a single record. The file stays on your disk and is capped at 5&nbsp;MB with one
     older generation kept. While Connected programs is on, open it from
     <code>Settings &rarr; Apps &rarr; Connected programs &rarr; Program activity</code>.
@@ -220,15 +235,16 @@ import Prose from '../layouts/Prose.astro';
   <p>
     Back up your folder and any file you keep elsewhere; Jotra's data folder is not a backup of them. Jotra can rebuild
     the index from your folder. Nothing else in the data folder can be rebuilt:
-    settings, earlier versions, conversations, the activity list, your tab list, and text in the index
-    that had not reached its file.
+    settings, earlier versions, conversations, the activity list, your tab list, preview layouts, palette counts, and
+    text in <code>{names.indexFile}</code> that had not reached its file.
   </p>
   <p>
-    Delete Jotra's data folder to reset the settings and records kept there. The sidebar's open folders and the
-    pane layout are kept apart, in the web view's storage (<code>~/Library/WebKit/com.writ.editor</code> on macOS).
+    Delete Jotra's data folder to reset the settings and records kept there. Which sidebar folders are expanded, the
+    pane layout and a copy of the theme are kept apart, in the web view's storage (<code>~/Library/WebKit/com.writ.editor</code> on macOS).
     Your folder and every file you opened elsewhere
-    stay untouched. An API key is not in that directory: clear it from your keychain, or from
-    <code>Settings &rarr; Apps</code> while Chat or Rewrite is on.
+    stay untouched. An API key is not in that directory: clear it from your keychain, or in
+    <code>Settings &rarr; Apps</code> with Clear, one provider at a time: the AI connection's key while Chat or Rewrite
+    is on, Dictation's own key while Dictation is on.
   </p>
 
   <h2>Source of truth</h2>

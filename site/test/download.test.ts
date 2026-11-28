@@ -2,12 +2,14 @@ import { describe, it, expect } from 'vitest';
 import { existsSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import release from '../src/data/release.json';
+import { getOfflineCondition, getReleaseCommands, getReleaseNames } from '../src/lib/release-names';
 
 const DIST = join(fileURLToPath(new URL('..', import.meta.url)), 'dist');
 const PAGES = [join(DIST, 'index.html'), join(DIST, 'download', 'index.html')];
 
 const EXPECTED: { os: string; name: string; file: RegExp; command: string | null }[] = [
-  { os: 'mac', name: 'macOS', file: /\.pkg$/, command: 'brew trust ibrahemid/writ && brew install --cask ibrahemid/writ/jotra' },
+  { os: 'mac', name: 'macOS', file: /\.pkg$/, command: getReleaseCommands(getReleaseNames(release)).brewInstall },
   { os: 'win', name: 'Windows', file: /\.msi$/, command: 'winget install -e --id ibrahemid.Writ' },
   { os: 'linux', name: 'Linux', file: /\.AppImage$/, command: null },
 ];
@@ -101,6 +103,15 @@ describe('download groups in the built pages', () => {
       expect(between, page).toHaveLength(1);
       expect(decode(between[0]?.[2] ?? '')).toBe('Verify a download (SHA256 checksums)');
       expect(html.match(/class="dl-privacy"/g), page).toHaveLength(1);
+    }
+  });
+
+  it('say what reaches the network for the release the page offers', () => {
+    const expected = `${getOfflineCondition(getReleaseNames(release))}, Jotra contacts only GitHub, to check for updates and to download one you install, and the automatic check can be turned off (privacy).`;
+    for (const page of PAGES) {
+      const html = readFileSync(page, 'utf8');
+      const privacy = /<p\b[^>]*class="dl-privacy"[^>]*>([\s\S]*?)<\/p>/.exec(html)?.[1] ?? '';
+      expect(decode(privacy), page).toBe(expected);
     }
   });
 });
