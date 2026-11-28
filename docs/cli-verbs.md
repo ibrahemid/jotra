@@ -28,7 +28,7 @@ so a configured folder that is not there is still the folder named, and the
 verb that needs it says it could not be read.
 
 The index is opened read-only. The command runs no migration, writes no row and
-creates no database. Reading a WAL database does make SQLite create the `-shm`
+creates no index database. Reading a WAL database does make SQLite create the `-shm`
 and `-wal` companions when they are absent; no frame is written into either.
 
 Link resolution is `jotra_core::notes::links` reached through `jotra-storage`, the
@@ -120,7 +120,7 @@ index does not hold yet, an absent index, an index written under a different
 schema version than this build reads, a file outside the notes folder, a file
 over 2 MB for `cat` and `append`, a failed create, rename, trash or append, an
 open Jotra did not take, and an open stdin that sends nothing for 5 seconds
-without `-`. Code 2 prints what was wrong and the usage on stderr. `append` and
+without `-`. Code 2 prints what was wrong on stderr, with the usage or a Try: line. `append` and
 `today --append` with nothing piped exit 2, as does `-` with nothing piped. The
 file-opening path uses the same codes: two folders at once, a file and a folder
 together, `--wait` on a folder, `--no-open` with a path, and `jotra -` with
@@ -256,7 +256,7 @@ ordered by file count descending, then by tag. `notes` counts files, not
 mentions: a file tagged twice with one tag counts once.
 
 `notes_folder` is the folder this invocation resolved, from `JOTRA_NOTES_DIR`,
-then the config, then the default. The tags come from the index, which
+then `WRIT_NOTES_DIR`, then the config, then the default. The tags come from the index, which
 describes the folder the app last read. They are the same folder unless
 `JOTRA_NOTES_DIR` points somewhere the app has never indexed, so read the field
 as where this command was pointed rather than as where a tag was found.
@@ -366,8 +366,8 @@ same minute is `jotra-260921-0748-2` (`dedupe_file_name`). A name ending in
 `.md`, `.markdown`, `.txt` or `.text` sets the extension, so `jotra new
 Groceries.md` makes a Markdown file whatever the config says
 (`jotra_core::notes::explicit_extension`); otherwise the extension is the
-configured one, `[files] default_extension`, `txt` or `md`. The file is created
-empty. `new` needs no index.
+configured one, `[files] default_extension`, `txt` or `md`. Without piped text
+the file is created empty. `new` needs no index.
 
 `rename` and `trash` go through `jotra_storage::note_ops`, the same functions the
 app's menu items call. Neither passes a stamp: the stamp exists to keep the app

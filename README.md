@@ -21,7 +21,7 @@ Jotra was called Writ through version 1.0.1.
 
 ```sh
 brew trust ibrahemid/writ                                            # macOS 12 or later
-brew install --cask ibrahemid/writ/jotra
+brew install --cask ibrahemid/writ/writ
 winget install -e --id ibrahemid.Writ                                # Windows
 curl -fsSL https://github.com/ibrahemid/jotra/raw/main/install.sh | sh # Linux
 ```

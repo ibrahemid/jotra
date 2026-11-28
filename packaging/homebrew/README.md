@@ -4,11 +4,10 @@ This directory holds the Homebrew Cask formula for Jotra. Jotra ships through a 
 
 ## Self-hosted tap layout
 
-The tap lives at a dedicated repository: `github.com/ibrahemid/homebrew-writ`.
+The tap lives at a dedicated repository: `github.com/ibrahemid/homebrew-writ`. A release's tap step leaves it holding:
 
 ```
 homebrew-writ/
-  README.md
   cask_renames.json
   Casks/
     jotra.rb
@@ -18,15 +17,17 @@ homebrew-writ/
 
 ## Verifying the tap
 
-The tap is published and serves the current release. To check it end to end:
+To check the tap end to end:
 
 ```sh
 brew tap ibrahemid/writ
-brew install --cask jotra
-open -a Jotra
-brew uninstall --cask jotra
+brew install --cask ibrahemid/writ/writ
+brew info --cask ibrahemid/writ/writ
+brew uninstall --cask ibrahemid/writ/writ
 brew untap ibrahemid/writ
 ```
+
+`brew info` prints the version the tap installed. The `ibrahemid/writ/writ` token installs the cask the tap holds: `Casks/writ.rb` until a release's tap step removes it, and `Casks/jotra.rb` through `cask_renames.json` after that.
 
 ## Updating the tap on a new release
 
@@ -34,7 +35,7 @@ The post-release workflow rewrites `packaging/homebrew/Casks/jotra.rb` in this r
 
 1. `cp packaging/homebrew/Casks/jotra.rb ../homebrew-writ/Casks/jotra.rb`
 2. `cp packaging/homebrew/cask_renames.json ../homebrew-writ/cask_renames.json`
-3. `cd ../homebrew-writ && git add Casks/jotra.rb cask_renames.json && git commit -m "jotra $VERSION" && git push`
+3. `cd ../homebrew-writ && git rm --ignore-unmatch Casks/writ.rb && git add Casks/jotra.rb cask_renames.json && git commit -m "jotra $VERSION" && git push`
 
 A follow-up enhancement will push directly from the workflow using a deploy key.
 
@@ -42,7 +43,7 @@ A follow-up enhancement will push directly from the workflow using a deploy key.
 
 ```sh
 brew tap ibrahemid/writ
-brew install --cask jotra
+brew install --cask ibrahemid/writ/writ
 ```
 
 ## Submitting to homebrew/homebrew-cask (later)
@@ -52,13 +53,12 @@ Eligibility requires:
 - The artifact must be downloadable from a public URL with no authentication.
 - The binary must be signed and notarized for macOS.
 
-When ready, follow the [Homebrew Cask Cookbook](https://docs.brew.sh/Cask-Cookbook) and open a PR against `homebrew/homebrew-cask` copying `jotra.rb` to `Casks/w/jotra.rb`.
+When ready, follow the [Homebrew Cask Cookbook](https://docs.brew.sh/Cask-Cookbook) and open a PR against `homebrew/homebrew-cask` copying `jotra.rb` to `Casks/j/jotra.rb`.
 
 ## The SHA field
 
 The cask installs one artifact for both architectures, the universal
-`Jotra_<version>_universal.pkg`, so it carries a single `sha256`. Before a
-release fills it in that field holds the placeholder `__SHA256_UNIVERSAL__`.
+`Jotra_<version>_universal.pkg`, so it carries a single `sha256`.
 
 `.github/workflows/packages.yml` rewrites the version and that field on
 `release: published`, delegating to `scripts/packaging_bump_homebrew.py`, which

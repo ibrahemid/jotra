@@ -6,9 +6,9 @@ This directory holds the winget manifests for Jotra. End users install Jotra on 
 winget install --id ibrahemid.Writ -e
 ```
 
-## Status
+## Submission
 
-Versions 0.1.0 and 0.2.0 are merged into `microsoft/winget-pkgs`, so the command above installs Jotra on any Windows machine. Every new version is another manual PR upstream; nothing in this repo submits it. A merged version takes 1-3 days to replicate to the public source.
+Each version reaches `microsoft/winget-pkgs` through a manual PR; nothing in this repo submits it. A merged version takes 1-3 days to replicate to the public source.
 
 ## Layout
 
@@ -23,9 +23,9 @@ packaging/winget/manifests/i/ibrahemid/Writ/<version>/
 
 Schema version: 1.6.0.
 
-## Placeholders
+## SHA256
 
-Before a release fills it in, `InstallerSha256` holds the placeholder `__SHA256_MSI__`. The post-release workflow replaces it with the SHA256 of the released `Jotra_<version>_x64_en-US.msi`.
+The post-release workflow writes the SHA256 of the released `Jotra_<version>_x64_en-US.msi` into `InstallerSha256` of the new version folder.
 
 ## ProductCode and UpgradeCode
 

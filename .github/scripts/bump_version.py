@@ -9,9 +9,10 @@ script exits non-zero without writing any partial state.
 
 site/src/data/release.json names the release the repo is on, which the release
 workflow asserts against the tag before it builds anything. The bump moves its
-version, tag and download URLs and clears everything that describes artifacts
-that do not exist yet; the site deploy regenerates the whole file from the
-published release.
+version and tag, points each download URL at the installer of that name in
+release_assets.py, and clears everything that describes artifacts that do not
+exist yet; the site deploy regenerates the whole file from the published
+release.
 """
 from __future__ import annotations
 
@@ -20,6 +21,10 @@ import pathlib
 import re
 import sys
 from collections.abc import Callable
+
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
+
+import release_assets  # noqa: E402
 
 
 class BumpError(RuntimeError):
@@ -60,6 +65,22 @@ def bump_package_json(path: pathlib.Path, new_version: str) -> None:
     path.write_text(json.dumps(data, indent=indent) + "\n")
 
 
+def get_installer_url(url: str, old_version: str, new_version: str) -> str:
+    base, _, name = url.rpartition("/")
+    marker = f"_{old_version}_"
+    if not base or marker not in name:
+        raise BumpError(f"{url} does not name an installer of version {old_version}")
+    suffix = name.split(marker, 1)[1]
+    try:
+        names = [installer.name for installer in release_assets.installers(new_version)]
+    except release_assets.ReleaseAssetError as err:
+        raise BumpError(str(err)) from err
+    matches = [candidate for candidate in names if candidate.endswith(f"_{new_version}_{suffix}")]
+    if len(matches) != 1:
+        raise BumpError(f"{url} matches no single installer of version {new_version} in release_assets.py")
+    return f"{base.replace(old_version, new_version)}/{matches[0]}"
+
+
 def bump_release_json(path: pathlib.Path, new_version: str) -> None:
     data = json.loads(path.read_text())
     old_version = data.get("version")
@@ -80,7 +101,7 @@ def bump_release_json(path: pathlib.Path, new_version: str) -> None:
             elif key.startswith("size_"):
                 platform[key] = 0
             elif isinstance(value, str):
-                platform[key] = value.replace(old_version, new_version)
+                platform[key] = get_installer_url(value, old_version, new_version)
     path.write_text(json.dumps(data, indent=2) + "\n")
 
 
