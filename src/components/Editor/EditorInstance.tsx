@@ -1634,6 +1634,7 @@ export default function EditorInstance(props: Props) {
   createEffect(on(editorZoom.fontSize, () => view?.requestMeasure(), { defer: true }));
 
   onCleanup(() => {
+    loadTicket += 1;
     containerRef.removeEventListener("wheel", onWheelZoom);
     if (positionTimer !== undefined) clearTimeout(positionTimer);
     if (view && viewBufferId) rememberPosition(viewBufferId, true);

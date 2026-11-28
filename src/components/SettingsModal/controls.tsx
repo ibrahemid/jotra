@@ -21,11 +21,16 @@ export function parseFloatSafe(raw: string, fallback: number): number {
 
 type JotraConfigValue = ReturnType<typeof configStore.config>;
 
-export async function patchConfig(patch: (prev: JotraConfigValue) => JotraConfigValue) {
+/** Writes `patch` over the settings. Answers whether the write landed. */
+export async function patchConfig(
+  patch: (prev: JotraConfigValue) => JotraConfigValue,
+): Promise<boolean> {
   try {
     await configStore.save(patch(configStore.config()));
+    return true;
   } catch {
     showToast("Could not save your settings", "error");
+    return false;
   }
 }
 

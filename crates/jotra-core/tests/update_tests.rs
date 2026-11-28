@@ -261,3 +261,33 @@ fn managed_phase_serializes_with_its_own_status() {
     assert_eq!(json["status"], "managed");
     assert_eq!(json["version"], "0.9.0");
 }
+
+#[test]
+fn a_silent_check_starts_only_when_no_phase_is_showing() {
+    assert_eq!(
+        UpdatePhase::Idle.start_silent_check(),
+        Some(UpdatePhase::Checking)
+    );
+    let showing_or_in_flight = [
+        UpdatePhase::Checking,
+        UpdatePhase::UpToDate,
+        UpdatePhase::Available {
+            version: "0.9.0".to_string(),
+        },
+        UpdatePhase::Managed {
+            version: "0.9.0".to_string(),
+        },
+        UpdatePhase::Downloading {
+            downloaded: 10,
+            total: Some(20),
+        },
+        UpdatePhase::Installing,
+        UpdatePhase::Ready,
+        UpdatePhase::Failed {
+            message: "Could not reach the update server.".to_string(),
+        },
+    ];
+    for phase in showing_or_in_flight {
+        assert_eq!(phase.start_silent_check(), None);
+    }
+}

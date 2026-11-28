@@ -29,10 +29,24 @@ export function offerText(title: string): string {
   return `Rename this file to "${title}"?`;
 }
 
+// Why the settings could not be written, by the code the write failed with
+// (src-tauri/src/commands/buffer.rs).
+const SETUP_REASONS: Record<string, string> = {
+  ERR_PERMISSION_DENIED: "Jotra cannot write to its settings folder.",
+  ERR_FOLDER_NOT_WRITABLE: "Jotra cannot write to its settings folder.",
+  ERR_READ_ONLY_DESTINATION: "Jotra cannot write to its settings folder.",
+  ERR_DISK_FULL: "The disk is full.",
+  ERR_WRITE_TIMED_OUT: "The disk stopped responding.",
+};
+
+const LEADING_CODE = /^(ERR_[A-Z_]+)(?::|$)/;
+
 /** The line under Continue when a first launch could not finish. The reason
- * is the one Rust wrote for a person, when it wrote one. */
+ * is the one its code names, or the one Rust wrote for a person. */
 function setupFailureText(error: unknown): string {
-  const reason = userErrorText(error);
+  const raw = (error instanceof Error ? error.message : String(error ?? "")).trim();
+  const code = LEADING_CODE.exec(raw)?.[1];
+  const reason = code === undefined ? userErrorText(error) : (SETUP_REASONS[code] ?? null);
   const said = reason === null ? "" : ` ${reason}`;
   return `Could not finish the setup.${said} Press Continue to try again.`;
 }

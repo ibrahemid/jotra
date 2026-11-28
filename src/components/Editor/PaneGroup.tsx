@@ -6,9 +6,11 @@ import TabBar from "./TabBar";
 import PreviewSplit from "../Preview/PreviewSplit";
 import { bufferRegistry } from "../../stores/global/buffer-registry";
 import { useWindow } from "../WindowProvider/WindowProvider";
-import type { PaneId } from "../../lib/pane-layout";
+import { MAX_PANE_RATIO, MIN_PANE_RATIO, type PaneId } from "../../lib/pane-layout";
 import type { BufferDocument } from "../../types/buffer";
 import "./PaneGroup.css";
+
+const PANE_BOUNDS = { min: MIN_PANE_RATIO, max: MAX_PANE_RATIO };
 
 interface PaneProps {
   pane: PaneId;
@@ -106,6 +108,7 @@ export default function PaneGroup(props: Props) {
           onResize={(ratio) => win.panes.setRatio(ratio, false)}
           onCommit={() => win.panes.setRatio(win.panes.ratio(), true)}
           label="Resize panes"
+          bounds={PANE_BOUNDS}
         />
         <EditorPane pane="right" buffer={bufferOf("right")} strip />
       </Show>

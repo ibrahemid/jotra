@@ -5,7 +5,7 @@ use jotra_storage::inbox_store;
 use tauri::{AppHandle, Runtime, State};
 use tauri_plugin_dialog::DialogExt;
 
-use crate::commands::config::persist_config;
+use crate::commands::config::mutate_config;
 use crate::commands::offload::{run_blocking, ERR_COMMAND_STOPPED};
 use crate::state::AppState;
 use crate::watcher::handler::start_inbox_watcher;
@@ -17,11 +17,10 @@ pub fn set_inbox_path_from_path(state: &AppState, raw: &Path) -> Result<String, 
         return Err(format!("not a directory: {}", canonical.display()));
     }
 
-    {
-        let mut config = state.config.lock().map_err(|e| e.to_string())?;
+    mutate_config(state, |config| {
         config.inbox.path = Some(canonical.to_string_lossy().into_owned());
-        persist_config(state, &config)?;
-    }
+        true
+    })?;
 
     {
         let mut root = state.inbox_root.lock().map_err(|e| e.to_string())?;
@@ -43,11 +42,10 @@ pub fn set_inbox_path_from_path(state: &AppState, raw: &Path) -> Result<String, 
 }
 
 pub fn clear_inbox_inner(state: &AppState) -> Result<(), String> {
-    {
-        let mut config = state.config.lock().map_err(|e| e.to_string())?;
+    mutate_config(state, |config| {
         config.inbox.path = None;
-        persist_config(state, &config)?;
-    }
+        true
+    })?;
 
     {
         let mut root = state.inbox_root.lock().map_err(|e| e.to_string())?;

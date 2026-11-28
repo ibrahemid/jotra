@@ -28,7 +28,7 @@ use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 
 use chrono::{DateTime, Utc};
-use jotra_core::config::{FileExtension, FilesConfig};
+use jotra_core::config::{FileExtension, FilesConfig, NotesConfig};
 use jotra_core::legacy_names;
 use jotra_core::notes::{
     minted_stem, resolve_notes_root_from, sanitize_title, NotesRootError, NotesRootSources,
@@ -362,14 +362,15 @@ pub const NOTES_FOLDER: &str = "Jotra";
 
 /// Reads `[notes] root` out of `<jotra_dir>/config.toml`.
 ///
-/// Returns `None` when the file is absent, unreadable, not valid TOML, or the
-/// key is unset or blank. Deliberately tolerant: piping text into Jotra must
-/// not fail because the app has never run or because somebody hand-edited the
-/// config into something the CLI cannot parse.
+/// Returns `None` when the file is absent or unreadable, or the key is unset
+/// or blank. Deliberately tolerant: piping text into Jotra must not fail
+/// because the app has never run, and a hand edit that left the file not
+/// TOML still names the folder the app uses
+/// ([`NotesConfig::root_from_config_text`]).
 pub fn read_notes_root_from_config(jotra_dir: &Path) -> Option<PathBuf> {
     let text = std::fs::read_to_string(jotra_dir.join("config.toml")).ok()?;
-    let document: toml::Table = toml::from_str(&text).ok()?;
-    let root = document.get("notes")?.get("root")?.as_str()?.trim();
+    let root = NotesConfig::root_from_config_text(&text)?;
+    let root = root.trim();
     if root.is_empty() {
         None
     } else {
@@ -749,6 +750,19 @@ mod tests {
         let path = write_piped_note(&notes, dir.path(), "my notes", FileExtension::Txt, "x\n")
             .expect("written");
         assert_eq!(path, configured.join("my notes.txt"));
+    }
+
+    #[test]
+    fn a_config_that_is_not_toml_still_names_the_notes_folder() {
+        let dir = TempDir::new().unwrap();
+        let configured = dir.path().join("Elsewhere");
+        std::fs::write(
+            dir.path().join("config.toml"),
+            format!("[editor\n\n[notes]\nroot = '{}'\n", configured.display()),
+        )
+        .unwrap();
+
+        assert_eq!(read_notes_root_from_config(dir.path()), Some(configured));
     }
 
     #[test]

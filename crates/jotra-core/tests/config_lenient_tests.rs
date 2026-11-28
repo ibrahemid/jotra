@@ -1,4 +1,4 @@
-use jotra_core::config::{ConfigDiagnostic, FileExtension, JotraConfig, Polarity};
+use jotra_core::config::{ConfigDiagnostic, FileExtension, JotraConfig, NotesConfig, Polarity};
 
 #[test]
 fn a_file_that_reads_in_full_reads_as_the_strict_parse_with_nothing_to_say() {
@@ -80,6 +80,54 @@ fn a_file_that_is_not_toml_runs_on_the_defaults_and_names_the_line() {
     assert_eq!(read.diagnostics.len(), 1);
     assert_eq!(read.diagnostics[0].key, "");
     assert_eq!(read.diagnostics[0].line, 3);
+}
+
+#[test]
+fn a_file_that_is_not_toml_keeps_the_notes_folder_it_names() {
+    let text = "[editor]\nfont_size = 18\n[appearance\npolarity = \"dark\"\n\n\
+                [notes] # mine\nroot = 'C:\\Users\\me\\Notes' # here\n";
+    let read = JotraConfig::parse_lenient(text);
+
+    assert_eq!(read.diagnostics.len(), 1);
+    assert_eq!(read.diagnostics[0].line, 3);
+    assert_eq!(
+        read.config.notes.root.as_deref(),
+        Some("C:\\Users\\me\\Notes")
+    );
+    let mut rest = read.config.clone();
+    rest.notes.root = None;
+    assert_eq!(
+        rest,
+        JotraConfig::default(),
+        "every other value is a default"
+    );
+}
+
+#[test]
+fn the_notes_folder_is_read_from_the_line_that_holds_it() {
+    let read = |text: &str| NotesConfig::root_from_config_text(text);
+
+    assert_eq!(read("[notes]\nroot = \"/n\"\n").as_deref(), Some("/n"));
+    // The syntax error is in the folder's own table.
+    assert_eq!(
+        read("[notes]\nbroken =\nroot = \"/n\"\n").as_deref(),
+        Some("/n")
+    );
+    // Dotted and inline forms, before any table.
+    assert_eq!(read("notes.root = \"/d\"\n[x\n").as_deref(), Some("/d"));
+    assert_eq!(
+        read("notes = { root = \"/i\" }\n[x\n").as_deref(),
+        Some("/i")
+    );
+    // A root under another table, or under a header that does not read, is
+    // not the folder.
+    assert_eq!(read("[editor]\nroot = \"/e\"\n[x\n"), None);
+    assert_eq!(read("[notes\nroot = \"/e\"\n"), None);
+    assert_eq!(read("[x\n"), None);
+    assert_eq!(
+        read("[x\r\n[notes]\r\nroot = \"/crlf\"\r\n").as_deref(),
+        Some("/crlf")
+    );
 }
 
 #[test]

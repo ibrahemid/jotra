@@ -1669,6 +1669,17 @@ export async function closeCapture(returnFocus: boolean): Promise<void> {
   return invoke("capture_close", { returnFocus });
 }
 
+/** The capture note's unsent text, kept across a quit. */
+export async function captureDraft(): Promise<string> {
+  return invoke("capture_draft");
+}
+
+/** Hands the capture note's text to the app, which writes it to disk when the
+ * note hides and when the app quits. */
+export async function keepCaptureDraft(text: string): Promise<void> {
+  return invoke("capture_keep_draft", { text });
+}
+
 // --- Open at login ---
 
 export interface LoginItemStatus {

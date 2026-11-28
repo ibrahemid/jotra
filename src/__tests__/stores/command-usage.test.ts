@@ -57,6 +57,22 @@ describe("commandUsageStore", () => {
     ]);
   });
 
+  it("keeps the runs of a failed write for the next one", async () => {
+    mockedRecord.mockRejectedValueOnce(new Error("disk full"));
+    commandUsageStore.record("tab.new", 10);
+    await commandUsageStore.flush();
+
+    commandUsageStore.record("tab.new", 20);
+    commandUsageStore.record("palette.open", 5);
+    await commandUsageStore.flush();
+
+    expect(mockedRecord).toHaveBeenCalledTimes(2);
+    expect(mockedRecord.mock.calls[1][0]).toEqual([
+      { id: "tab.new", count: 2, last_used_ms: 20 },
+      { id: "palette.open", count: 1, last_used_ms: 5 },
+    ]);
+  });
+
   it("loads what jotra.db holds and keeps runs recorded during the read", async () => {
     let answer: (value: Record<string, { count: number; last_used_ms: number }>) => void = () => {};
     mockedGet.mockReturnValueOnce(new Promise((resolve) => (answer = resolve)));

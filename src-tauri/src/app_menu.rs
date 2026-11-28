@@ -18,7 +18,7 @@
 use tauri::AppHandle;
 
 #[cfg(target_os = "macos")]
-pub(crate) use imp::QUIT_MENU_ID;
+pub(crate) use imp::{QUIT_MENU_ID, ZOOM_MENU_ID};
 
 /// Registers the click handler and draws the bar for the config Jotra started
 /// with. The handler is registered here once: a rebuild replaces the menu, not
@@ -38,6 +38,10 @@ pub fn install(app: &AppHandle) {
         // The items act on the main window, and their chords still reach the
         // menu bar while the capture note has the keyboard.
         if crate::capture::is_in_front(app_handle) {
+            return;
+        }
+        if id == ZOOM_MENU_ID {
+            crate::commands::window::zoom_main_window(app_handle);
             return;
         }
         if let Some(action) = crate::menu::menu_action_for_id(id) {
@@ -80,6 +84,9 @@ mod imp {
     /// The Quit item's id. Not in the shared command list: quitting is the
     /// exit path's own business, not an action forwarded to the frontend.
     pub(crate) const QUIT_MENU_ID: &str = "app.quit";
+
+    /// Window > Zoom's id: the window's maximize toggle, made in Rust.
+    pub(crate) const ZOOM_MENU_ID: &str = "window.zoom";
 
     type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 
@@ -209,9 +216,10 @@ mod imp {
         // OS performs, not Jotra commands, and there is nothing for the
         // Windows and Linux menu to carry in their place — those titlebars
         // have their own window buttons.
+        let zoom = MenuItemBuilder::with_id(ZOOM_MENU_ID, "Zoom").build(app)?;
         let window_menu = SubmenuBuilder::new(app, "Window")
             .minimize()
-            .maximize()
+            .item(&zoom)
             .separator()
             .bring_all_to_front()
             .build()?;

@@ -5,8 +5,7 @@ import type { SpellingEntry } from "../../editor/spelling";
 const h = vi.hoisted(() => ({
   entries: [] as SpellingEntry[],
   reveal: vi.fn(),
-  applyEntries: vi.fn(() => 0),
-  showToast: vi.fn(),
+  applyEntries: vi.fn((_chosen: SpellingEntry[]) => 0),
 }));
 
 vi.mock("../../stores/global/spelling", () => ({
@@ -18,7 +17,6 @@ vi.mock("../../stores/global/spelling", () => ({
   },
   entryKey: (entry: SpellingEntry) => `${entry.from}:${entry.to}:${entry.word}`,
 }));
-vi.mock("../../stores/global/notifications", () => ({ showToast: h.showToast }));
 
 import SpellingPreview, {
   openSpellingPreview,
@@ -59,7 +57,7 @@ describe("SpellingPreview rows", () => {
     expect(h.reveal).toHaveBeenCalledWith(h.entries[1]);
   });
 
-  it("says how many words a fix changed", () => {
+  it("hands the checked words to the store and closes", () => {
     h.entries = [entry("teh", "the", 0), entry("recieve", "receive", 10)];
     h.applyEntries.mockReturnValue(2);
     render(() => <SpellingPreview />);
@@ -69,17 +67,7 @@ describe("SpellingPreview rows", () => {
     fireEvent.click(apply);
 
     expect(h.applyEntries).toHaveBeenCalledTimes(1);
-    expect(h.showToast).toHaveBeenCalledWith("Fixed 2 words", "info");
-  });
-
-  it("says nothing when no word changed", () => {
-    h.entries = [entry("teh", "the", 0)];
-    h.applyEntries.mockReturnValue(0);
-    render(() => <SpellingPreview />);
-    openSpellingPreview();
-
-    const apply = [...document.querySelectorAll("button")].find((el) => el.textContent === "Apply")!;
-    fireEvent.click(apply);
-    expect(h.showToast).not.toHaveBeenCalled();
+    expect(h.applyEntries.mock.calls[0]).toEqual([h.entries]);
+    expect(document.querySelector(".spelling-preview")).toBeNull();
   });
 });

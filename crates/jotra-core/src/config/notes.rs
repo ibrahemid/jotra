@@ -43,6 +43,41 @@ pub enum NotesRootEditError {
 }
 
 impl NotesConfig {
+    /// `notes.root` as a whole `config.toml` text writes it, also when the
+    /// text is not TOML.
+    ///
+    /// A file that does not parse is read line by line, each line under the
+    /// last table header that reads on its own, so a syntax error elsewhere in
+    /// the file does not lose the folder the notes are in. `None` when no line
+    /// names one.
+    pub fn root_from_config_text(text: &str) -> Option<String> {
+        if let Ok(document) = text.parse::<toml::Table>() {
+            return root_in(&document);
+        }
+        let mut header = Some(String::new());
+        for line in text.lines() {
+            if line.trim_start().starts_with('[') {
+                header = line
+                    .parse::<toml::Table>()
+                    .is_ok()
+                    .then(|| line.to_string());
+                continue;
+            }
+            let Some(header) = &header else {
+                continue;
+            };
+            if let Some(root) = format!("{header}\n{line}")
+                .parse::<toml::Table>()
+                .ok()
+                .as_ref()
+                .and_then(root_in)
+            {
+                return Some(root);
+            }
+        }
+        None
+    }
+
     /// `text` with `notes.root` set to `root` and every other byte as it was,
     /// values Jotra could not read and comments included.
     ///
@@ -82,4 +117,12 @@ impl NotesConfig {
         }
         Ok(document.to_string())
     }
+}
+
+fn root_in(document: &toml::Table) -> Option<String> {
+    document
+        .get("notes")?
+        .get("root")?
+        .as_str()
+        .map(str::to_string)
 }

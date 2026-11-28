@@ -13,7 +13,7 @@ use jotra_ai::connection::{
 use jotra_core::ai::models::{seed_model, ModelCatalog};
 use jotra_core::ai::on_device;
 use jotra_core::ai::providers::{self, ProviderInfo};
-use jotra_core::config::AiConfig;
+use jotra_core::config::{AiConfig, JotraConfig};
 use jotra_core::polish::{self, PolishError};
 use tauri::{AppHandle, Manager, State};
 use tokio_util::sync::CancellationToken;
@@ -119,24 +119,8 @@ pub fn ai_consent_host(app: AppHandle) -> Result<AiEndpointState, String> {
         return Err("This endpoint is on your machine; nothing is sent.".to_string());
     }
 
-    // Record under the lock and re-read there, so a settings write landing
-    // between the read above and this point is not silently overwritten with a
-    // stale clone. On a failed disk write the in-memory list is put back, so
-    // memory and disk never disagree about what was consented to.
     if !is_consented(&config.ai, &target.host) {
-        let updated = {
-            let mut guard = recover_poison(state.config.lock(), "commands::ai::ai_consent_host");
-            guard.ai.consented_hosts.push(target.host.clone());
-            guard.ai.consented_hosts.sort();
-            guard.ai.consented_hosts.dedup();
-            guard.clone()
-        };
-        if let Err(reason) = super::config::persist_config(&state, &updated) {
-            let mut guard = recover_poison(state.config.lock(), "commands::ai::ai_consent_host");
-            guard.ai.consented_hosts.retain(|h| h != &target.host);
-            return Err(reason);
-        }
-        config = updated;
+        config = consent_host_inner(&state, &target.host)?;
         announce_ai_config(&app);
     }
 
@@ -144,6 +128,24 @@ pub fn ai_consent_host(app: AppHandle) -> Result<AiEndpointState, String> {
     // an optional one on a private network.
     let key_state = key_state_for(&app, &config.ai.provider);
     Ok(endpoint_state_from(&config.ai, key_state))
+}
+
+/// Records consent to send to `host` and answers the config it is now part of.
+///
+/// The change is made and written under the config lock
+/// ([`super::config::mutate_config`]), so a settings write landing meanwhile
+/// is neither overwritten nor lost, and a failed write leaves the list as it
+/// was.
+pub fn consent_host_inner(state: &AppState, host: &str) -> Result<JotraConfig, String> {
+    super::config::mutate_config(state, |config| {
+        if is_consented(&config.ai, host) {
+            return false;
+        }
+        config.ai.consented_hosts.push(host.to_string());
+        config.ai.consented_hosts.sort();
+        true
+    })?;
+    Ok(recover_poison(state.config.lock(), "commands::ai::consent_host_inner").clone())
 }
 
 /// The model a provider starts from: the row's own default when the list it
@@ -176,22 +178,23 @@ fn seed_from_catalog(app: &AppHandle, catalog: &ModelCatalog) {
         return;
     }
     let state = app.state::<AppState>();
-    let (updated, previous) = {
-        let mut guard = recover_poison(state.config.lock(), "commands::ai::seed_from_catalog");
-        if guard.ai.provider != catalog.provider || !guard.ai.model.trim().is_empty() {
-            return;
-        }
-        let previous = guard.ai.model.clone();
-        guard.ai.model = seed;
-        (guard.clone(), previous)
-    };
-    if let Err(reason) = super::config::persist_config(&state, &updated) {
-        let mut guard = recover_poison(state.config.lock(), "commands::ai::seed_from_catalog");
-        guard.ai.model = previous;
-        tracing::warn!(error = %reason, "the first model could not be saved");
-        return;
+    match seed_model_inner(&state, &catalog.provider, &seed) {
+        Ok(true) => announce_ai_config(app),
+        Ok(false) => {}
+        Err(reason) => tracing::warn!(error = %reason, "the first model could not be saved"),
     }
-    announce_ai_config(app);
+}
+
+/// Writes `seed` as the model when `provider` is still the connection and it
+/// has no model yet. Answers whether it wrote one.
+pub fn seed_model_inner(state: &AppState, provider: &str, seed: &str) -> Result<bool, String> {
+    super::config::mutate_config(state, |config| {
+        if config.ai.provider != provider || !config.ai.model.trim().is_empty() {
+            return false;
+        }
+        config.ai.model = seed.to_string();
+        true
+    })
 }
 
 /// Tells the frontend the `[ai]` section changed.
@@ -223,21 +226,25 @@ pub fn ai_set_provider(app: AppHandle, provider: String) -> Result<AiConfig, Str
     }
     let state = app.state::<AppState>();
     let seed = seed_model_for(&app, &provider);
+    set_provider_inner(&state, &provider, &seed)
+}
 
-    // Read, change and clone under one lock, so a settings write landing
-    // between a read and a write is not overwritten with a stale copy.
-    let (updated, previous) = {
-        let mut guard = recover_poison(state.config.lock(), "commands::ai::ai_set_provider");
-        let previous = guard.ai.clone();
-        guard.ai = previous.with_provider(&provider, &seed);
-        (guard.clone(), previous)
-    };
-    if let Err(reason) = super::config::persist_config(&state, &updated) {
-        let mut guard = recover_poison(state.config.lock(), "commands::ai::ai_set_provider");
-        guard.ai = previous;
-        return Err(reason);
-    }
-    Ok(updated.ai)
+/// [`ai_set_provider`] once the provider is known and its seed model read,
+/// changed and written under the config lock.
+pub fn set_provider_inner(
+    state: &AppState,
+    provider: &str,
+    seed: &str,
+) -> Result<AiConfig, String> {
+    super::config::mutate_config(state, |config| {
+        config.ai = config.ai.with_provider(provider, seed);
+        true
+    })?;
+    Ok(
+        recover_poison(state.config.lock(), "commands::ai::set_provider_inner")
+            .ai
+            .clone(),
+    )
 }
 
 /// Emits one event of a rewrite's stream, whichever way it was reached.

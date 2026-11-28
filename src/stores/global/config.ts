@@ -351,12 +351,13 @@ function createConfigStore() {
   // re-armed by the next success.
   let loadFailureReported = false;
   let persistFailureReported = false;
-  let unreadNotice: number | null = null;
+  let unreadNotice: { id: number; text: string } | null = null;
 
   const config = (): JotraConfig => state;
 
   /** Shows the notice naming the values config.toml holds that the launch
-   * could not use, and takes it down once a reload reads the file in full. */
+   * could not use, names them again after a reload that still cannot read
+   * them all, and takes it down once a reload reads the file in full. */
   async function noticeUnreadValues(): Promise<void> {
     let unread: ConfigDiagnostic[];
     try {
@@ -366,12 +367,13 @@ function createConfigStore() {
       return;
     }
     const text = unreadValuesNotice(unread);
-    if (text === null) {
-      if (unreadNotice !== null) dismissToast(unreadNotice);
+    if (unreadNotice !== null && unreadNotice.text !== text) {
+      dismissToast(unreadNotice.id);
       unreadNotice = null;
-      return;
     }
-    if (unreadNotice === null) unreadNotice = showToast(text, "warning", 0);
+    if (text !== null && unreadNotice === null) {
+      unreadNotice = { id: showToast(text, "warning", 0), text };
+    }
   }
 
   function replaceWith(next: JotraConfig) {
@@ -499,8 +501,8 @@ function createConfigStore() {
     schedulePersist();
   }
 
-  function writeCurrent() {
-    void api.updateConfig(plainCopy(state)).then(
+  function writeCurrent(): Promise<void> {
+    return api.updateConfig(plainCopy(state)).then(
       () => {
         persistFailureReported = false;
       },
@@ -517,7 +519,7 @@ function createConfigStore() {
     if (flushTimer) clearTimeout(flushTimer);
     flushTimer = setTimeout(() => {
       flushTimer = null;
-      writeCurrent();
+      void writeCurrent();
     }, PERSIST_DEBOUNCE_MS);
   }
 
@@ -527,7 +529,15 @@ function createConfigStore() {
       clearTimeout(flushTimer);
       flushTimer = null;
     }
-    writeCurrent();
+    void writeCurrent();
+  }
+
+  /** Writes a change still waiting on the debounce, for quit and close. */
+  async function flushPending(): Promise<void> {
+    if (!flushTimer) return;
+    clearTimeout(flushTimer);
+    flushTimer = null;
+    await writeCurrent();
   }
 
   // Rust has already written this one; the copy here catches up so the next
@@ -638,6 +648,7 @@ function createConfigStore() {
     load,
     noticeUnreadValues,
     save,
+    flushPending,
     applyAi,
     setEditorFontSize,
     setSidebarWidth,

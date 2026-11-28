@@ -21,6 +21,8 @@
 //! - [`notes_index`]: the path-keyed index over the notes folder, and the
 //!   walk that reconciles it with what is on disk.
 //! - [`paths`]: the one spelling of a path the stores hand over.
+//! - [`login_item_record`]: what Jotra last left the OS login item at.
+//! - [`capture_draft`]: the quick capture note's unsent text.
 //! - [`maintenance`]: WAL checkpointing and freelist reclamation.
 //! - [`note_ops`]: creating, renaming, trashing and copying note files.
 //! - [`name_migration`]: the record of the rename's one-time steps.
@@ -49,6 +51,8 @@ pub mod activity_log;
 pub mod atomic;
 /// High-level buffer CRUD built on top of [`database`].
 pub mod buffer_store;
+/// The quick capture note's unsent text (ADR-055).
+pub mod capture_draft;
 /// Conversation files under the data directory (ADR-040 section 8).
 pub mod chat_store;
 /// How often each palette command ran (ADR-048).
@@ -77,6 +81,8 @@ pub mod inbox_store;
 pub mod instance;
 /// Per-buffer preview layout persistence (ADR-009).
 pub mod layout_state;
+/// What Jotra last left the OS login item at.
+pub mod login_item_record;
 /// WAL checkpointing and freelist reclamation.
 pub mod maintenance;
 /// The desktop extension bundle Claude Desktop installs Jotra from.
