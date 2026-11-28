@@ -68,6 +68,20 @@ describe('docs and guide sentences checked against the app', () => {
     expect(read('docs', 'FEATURES.md')).toContain(sentence);
   });
 
+  it('names Quick capture in docs/FEATURES.md with its default chord on each system', () => {
+    const label = read('src', 'components', 'ShortcutEditor', 'any-app-chord.ts').match(/CAPTURE_ROW_LABEL = "([^"]+)"/)?.[1];
+    expect(label).toBe('Quick capture');
+    const chord = read('crates', 'jotra-core', 'src', 'config', 'mod.rs').match(
+      /fn default_hotkey_capture\(\) -> String \{\s*"([^"]+)"/,
+    )?.[1];
+    expect(chord).toBe('CmdOrCtrl+Shift+Alt+Space');
+    const mac = String(chord).replace('CmdOrCtrl', 'Cmd').replace('Alt', 'Option');
+    const others = String(chord).replace('CmdOrCtrl', 'Ctrl');
+    expect(read('docs', 'FEATURES.md')).toContain(
+      `- ${label}, \`${mac}\` (\`${others}\` on Windows and Linux), opens a small window over any app. Escape adds what you typed to the end of Today's File;`,
+    );
+  });
+
   it('lists Compare and Undo of Revert To in docs/FEATURES.md by the labels the panel shows', () => {
     const panel = read('src', 'components', 'NoteHistory', 'NoteHistoryPanel.tsx');
     expect(panel).toMatch(/data-action="compare-version"[\s\S]*?>\s*Compare with current text\s*</);

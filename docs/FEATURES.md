@@ -65,7 +65,7 @@ What Jotra does, at the level of detail that answers "does it do X".
 ## Window
 
 - `Cmd+Shift+Space` (`Ctrl+Shift+Space` on Windows and Linux) shows and hides the window from any app. Settings, General records a new one, and Settings, Shortcuts lists it first with every other shortcut.
-- `Cmd+Shift+Option+Space` (`Ctrl+Shift+Alt+Space` on Windows and Linux) opens a small window over any app. Escape adds what you typed to the end of Today's File; on macOS and Windows the app you were in gets the keyboard back.
+- Quick capture, `Cmd+Shift+Option+Space` (`Ctrl+Shift+Alt+Space` on Windows and Linux), opens a small window over any app. Escape adds what you typed to the end of Today's File; on macOS and Windows the app you were in gets the keyboard back.
 - Tabs switch with `Cmd+[` and `Cmd+]`, and `Cmd+Shift+T` reopens the last closed one.
 - Light and dark follow the system, with six accent colours, preset themes and custom colours.
 - The editor font size (`Cmd+=`, `Cmd+-`, `Cmd+0`) and the interface text size (Settings, Appearance) change separately.

@@ -90,6 +90,7 @@ def write_release_inputs(directory: pathlib.Path, version: str = VERSION) -> Non
         (directory / name).write_bytes(f"bytes of {name}".encode())
     for name in release_assets.asset_set(version, "sboms"):
         (directory / name).write_text(json.dumps({"bomFormat": "CycloneDX", "name": name}))
+    (directory / release_assets.source_offer(version)).write_text("## Linux system libraries in the AppImage\n")
     (directory / release_assets.RELEASE_META).write_text('{"schema":1}\n')
 
 

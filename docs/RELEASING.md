@@ -282,8 +282,11 @@ job restores or saves an Actions cache: every release build starts cold.
      `Jotra.app`, ad-hoc signed, inside `Jotra_<version>_universal.dmg`.
    - `windows-latest`  x64, producing `Jotra_<version>_x64_en-US.msi`, plus the
      two executables `sign-windows` signs.
-   - `ubuntu-22.04`  x64, producing `Jotra_<version>_amd64.deb` and
-     `Jotra_<version>_amd64.AppImage`.
+   - `ubuntu-22.04`  x64, producing `Jotra_<version>_amd64.deb`,
+     `Jotra_<version>_amd64.AppImage` and
+     `Jotra_<version>_amd64.AppImage.source-offer.md`, the table of system
+     libraries and the offer of their source that the AppImage's notices
+     carry, read back from the AppImage.
 
    Every leg builds with `--locked`, so the release compiles the lockfile CI
    tested, and with `createUpdaterArtifacts` off: no updater signature is made
@@ -306,7 +309,8 @@ job restores or saves an Actions cache: every release build starts cold.
    input file missing or extra. It signs each updater payload as
    `<payload>.sig`, in the format `tauri signer sign` writes with the version
    in the trusted comment, writes `SHA256SUMS.txt` over the installers, their
-   `.sig` files and the SBOMs, signs it as `SHA256SUMS.txt.minisig`, and
+   `.sig` files, the SBOMs and the source offer, signs it as
+   `SHA256SUMS.txt.minisig`, and
    writes `latest.json` (the Tauri updater manifest). It then verifies all of
    it against the key of the latest published release (1.5).
 8. `attest-sboms` attests each SBOM against the installers it describes.
@@ -382,7 +386,7 @@ the outcomes it observed, uploaded as a release asset:
 when `pkg.stapled` and `dmg.stapled` are both true. A missing or unparseable
 asset reads as false, so the site cannot claim notarization a release did not
 produce. It is deliberately absent from `SHA256SUMS.txt`, which lists the
-installers, their `.sig` files and the SBOMs: this is a derived status file the
+installers, their `.sig` files, the SBOMs and the source offer: this is a derived status file the
 site reads, not an integrity-bearing download.
 
 ### 2.5 Smoke test before publishing
