@@ -6,6 +6,7 @@ BIN_DIR="${HOME}/.local/bin"
 LIB_DIR="${HOME}/.local/share/jotra"
 LEGACY_LIB_DIR="${HOME}/.local/share/writ"
 LEGACY_APP_NAME="Writ.AppImage"
+LEGACY_ASSET_PREFIX="Writ"
 LEGACY_COMMAND="writ"
 LEGACY_GUI_VARIABLE="WRIT_GUI_BIN"
 LEGACY_SKIP_SIGNATURE_NAME="WRIT_INSTALL_SKIP_SIGNATURE"
@@ -55,6 +56,10 @@ verify_sha256() {
   fi
   printf '%s\n' "$vs_line" >"${vs_dir}/${vs_asset}.sha256"
   (cd "$vs_dir" && sha256_check_file "${vs_asset}.sha256" >/dev/null 2>&1) || return 1
+}
+
+is_listed() {
+  awk -v name="$1" '$2 == name { found = 1 } END { exit !found }' "$2"
 }
 
 # Tauri publishes the minisign file base64-encoded; older assets may be raw.
@@ -233,15 +238,13 @@ main() {
   VERSION="${TAG#v}"
 
   ASSET="Jotra_${VERSION}_amd64.AppImage"
+  PAYLOAD_COMMAND="jotra"
+  LEGACY_ASSET="${LEGACY_ASSET_PREFIX}_${VERSION}_amd64.AppImage"
   BASE_URL="https://github.com/${REPO}/releases/download/${TAG}"
 
   TMP="$(mktemp -d 2>/dev/null || mktemp -d -t jotra)"
   trap 'rm -rf "${TMP}"' EXIT INT TERM
-  DOWNLOAD="${TMP}/${ASSET}"
 
-  echo "jotra install: downloading ${ASSET} (${TAG})"
-  curl -fL --progress-bar -o "${DOWNLOAD}" "${BASE_URL}/${ASSET}" ||
-    fail "could not download ${ASSET}. Check your connection and retry."
   curl -fsSL -o "${TMP}/SHA256SUMS.txt" "${BASE_URL}/SHA256SUMS.txt" ||
     fail "could not download SHA256SUMS.txt. Check your connection and retry."
 
@@ -251,6 +254,16 @@ main() {
     verify_signature "${VERIFIER}" "${TMP}/SHA256SUMS.txt" "${TMP}/SHA256SUMS.txt.minisig" "${TMP}/verify-sums" ||
       fail "the signature on SHA256SUMS.txt does not match Jotra's release key. Nothing was installed."
   fi
+
+  if ! is_listed "${ASSET}" "${TMP}/SHA256SUMS.txt" && is_listed "${LEGACY_ASSET}" "${TMP}/SHA256SUMS.txt"; then
+    ASSET="${LEGACY_ASSET}"
+    PAYLOAD_COMMAND="${LEGACY_COMMAND}"
+  fi
+  DOWNLOAD="${TMP}/${ASSET}"
+
+  echo "jotra install: downloading ${ASSET} (${TAG})"
+  curl -fL --progress-bar -o "${DOWNLOAD}" "${BASE_URL}/${ASSET}" ||
+    fail "could not download ${ASSET}. Check your connection and retry."
 
   SHA_RC=0
   verify_sha256 "${TMP}" "${ASSET}" "${TMP}/SHA256SUMS.txt" || SHA_RC=$?
@@ -269,12 +282,13 @@ main() {
   fi
 
   chmod 0755 "${DOWNLOAD}"
-  (cd "${TMP}" && "./${ASSET}" --appimage-extract usr/bin/jotra >/dev/null 2>&1) || true
-  if [ ! -f "${TMP}/squashfs-root/usr/bin/jotra" ]; then
+  PAYLOAD_CLI="squashfs-root/usr/bin/${PAYLOAD_COMMAND}"
+  (cd "${TMP}" && "./${ASSET}" --appimage-extract "usr/bin/${PAYLOAD_COMMAND}" >/dev/null 2>&1) || true
+  if [ ! -f "${TMP}/${PAYLOAD_CLI}" ]; then
     (cd "${TMP}" && "./${ASSET}" --appimage-extract >/dev/null 2>&1) || true
   fi
-  [ -f "${TMP}/squashfs-root/usr/bin/jotra" ] ||
-    fail "could not unpack the jotra command from ${ASSET}. Nothing was installed."
+  [ -f "${TMP}/${PAYLOAD_CLI}" ] ||
+    fail "could not unpack the ${PAYLOAD_COMMAND} command from ${ASSET}. Nothing was installed."
 
   if [ -f "${LEGACY_LIB_DIR}/${LEGACY_APP_NAME}" ]; then
     LAYOUT_DIR="${LEGACY_LIB_DIR}"
@@ -292,7 +306,7 @@ main() {
   mkdir -p "${LAYOUT_DIR}" "${BIN_DIR}"
 
   install_bin "${DOWNLOAD}" "${APP_PATH}"
-  install_bin "${TMP}/squashfs-root/usr/bin/jotra" "${CLI_PATH}"
+  install_bin "${TMP}/${PAYLOAD_CLI}" "${CLI_PATH}"
 
   if ! have fusermount; then
     echo "jotra install: fusermount not found, so Jotra will run from an unpacked copy. Install the 'fuse' package and re-run this installer to change that." >&2
@@ -304,22 +318,27 @@ EOF
     install_bin "${TMP}/gui-launcher" "${GUI_PATH}"
   fi
 
-  cat >"${TMP}/command-wrapper" <<EOF
+  cat >"${TMP}/wrapper-head" <<EOF
 #!/bin/sh
 JOTRA_GUI_BIN="\${JOTRA_GUI_BIN:-\${${LEGACY_GUI_VARIABLE}:-}}"
 [ -n "\${JOTRA_GUI_BIN}" ] || JOTRA_GUI_BIN="${GUI_PATH}"
 export JOTRA_GUI_BIN
-exec "${CLI_PATH}" "\$@"
 EOF
+  if [ "${PAYLOAD_COMMAND}" = "${LEGACY_COMMAND}" ]; then
+    cat >>"${TMP}/wrapper-head" <<EOF
+${LEGACY_GUI_VARIABLE}="\${JOTRA_GUI_BIN}"; export ${LEGACY_GUI_VARIABLE}
+EOF
+  fi
+  {
+    cat "${TMP}/wrapper-head"
+    printf 'exec "%s" "$@"\n' "${CLI_PATH}"
+  } >"${TMP}/command-wrapper"
   install_bin "${TMP}/command-wrapper" "${BIN_DIR}/jotra"
-  cat >"${TMP}/legacy-command-wrapper" <<EOF
-#!/bin/sh
-JOTRA_GUI_BIN="\${JOTRA_GUI_BIN:-\${${LEGACY_GUI_VARIABLE}:-}}"
-[ -n "\${JOTRA_GUI_BIN}" ] || JOTRA_GUI_BIN="${GUI_PATH}"
-export JOTRA_GUI_BIN
-JOTRA_COMMAND_NAME="${LEGACY_COMMAND}"; export JOTRA_COMMAND_NAME
-exec "${CLI_PATH}" "\$@"
-EOF
+  {
+    cat "${TMP}/wrapper-head"
+    printf 'JOTRA_COMMAND_NAME="%s"; export JOTRA_COMMAND_NAME\n' "${LEGACY_COMMAND}"
+    printf 'exec "%s" "$@"\n' "${CLI_PATH}"
+  } >"${TMP}/legacy-command-wrapper"
   install_bin "${TMP}/legacy-command-wrapper" "${BIN_DIR}/${LEGACY_COMMAND}"
 
   echo "jotra install: installed ${VERSION}"

@@ -56,7 +56,7 @@ describe('docs and guide sentences checked against the app', () => {
     const guide = page('guides', 'agent-output.astro');
     expect(guide).not.toContain('keeps the text every write replaces');
     expect(guide).toContain(
-      'A program that starts the server with <code>JOTRA_NOTES_DIR</code> naming another folder writes there with no version kept.',
+      'A program that starts the server with <code>{names.notesDirVariable}</code> naming another folder writes there with no version kept.',
     );
   });
 

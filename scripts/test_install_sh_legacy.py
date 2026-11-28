@@ -22,6 +22,8 @@ def legacy_command_name(command: str) -> str | None:
 
 
 OLD_WRAPPER = '#!/bin/sh\nWRIT_GUI_BIN="{gui}"; export WRIT_GUI_BIN\nexec "{cli}" "$@"\n'
+OLD_ASSET = f"Writ_{FIXTURE.VERSION}_amd64.AppImage"
+OLD_APPIMAGE = FIXTURE.fake_appimage("writ").encode()
 
 
 @unittest.skipIf(FIXTURE.OPENSSL is None, "signing the fixtures needs OpenSSL 3.0 or later")
@@ -110,6 +112,86 @@ class LegacyInstallScriptTests(FIXTURE.InstallScriptFixture):
         (self.fixtures / FIXTURE.ASSET).write_bytes(FIXTURE.FAKE_APPIMAGE.encode() + b"# tampered\n")
 
         self.assert_refused(self.run_install(WRIT_INSTALL_SKIP_SIGNATURE="1"), "checksum mismatch")
+
+    def test_installs_a_release_published_under_the_old_name(self) -> None:
+        self.use("openssl", FIXTURE.OPENSSL)
+        self.stub("fusermount", FIXTURE.FUSERMOUNT)
+        self.publish(OLD_APPIMAGE, asset=OLD_ASSET)
+
+        result = self.run_install()
+
+        self.assert_installed(result)
+        self.assertIn(f"downloading {OLD_ASSET} (v{FIXTURE.VERSION})", result.stdout)
+        self.assertEqual(
+            self.downloads(), ["SHA256SUMS.txt", "SHA256SUMS.txt.minisig", OLD_ASSET, f"{OLD_ASSET}.sig"]
+        )
+        layout = self.home / ".local/share/jotra"
+        self.assertEqual((layout / "Jotra.AppImage").read_bytes(), OLD_APPIMAGE)
+        self.assert_wrapper("jotra", layout / "Jotra.AppImage", layout / "jotra-cli", exports_old_gui_variable=True)
+        self.assert_wrapper(
+            "writ", layout / "Jotra.AppImage", layout / "jotra-cli", command_name="writ", exports_old_gui_variable=True
+        )
+
+    def test_a_release_under_the_old_name_hands_its_command_the_gui_path_it_reads(self) -> None:
+        self.use("openssl", FIXTURE.OPENSSL)
+        self.stub("fusermount", FIXTURE.FUSERMOUNT)
+        self.publish(OLD_APPIMAGE, asset=OLD_ASSET)
+
+        self.assert_installed(self.run_install())
+
+        layout = self.home / ".local/share/jotra"
+        for command in ("writ", "jotra"):
+            self.assert_gui_variable_precedence(
+                command, layout / "Jotra.AppImage", layout / "jotra-cli", cli_reads="WRIT_GUI_BIN"
+            )
+
+    def test_an_old_layout_takes_a_release_published_under_the_old_name(self) -> None:
+        self.use("openssl", FIXTURE.OPENSSL)
+        self.stub("fusermount", FIXTURE.FUSERMOUNT)
+        layout = self.make_old_layout()
+        self.publish(OLD_APPIMAGE, asset=OLD_ASSET)
+
+        result = self.run_install()
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual((layout / "Writ.AppImage").read_bytes(), OLD_APPIMAGE)
+        self.assertEqual((layout / "writ-cli").read_text(), "#!/bin/sh\necho jotra\n")
+        self.assertFalse((self.home / ".local/share/jotra").exists())
+        for command in ("writ", "jotra"):
+            self.assert_wrapper(
+                command,
+                layout / "Writ.AppImage",
+                layout / "writ-cli",
+                legacy_command_name(command),
+                exports_old_gui_variable=True,
+            )
+
+    def test_the_new_name_wins_when_the_sums_list_both(self) -> None:
+        self.use("openssl", FIXTURE.OPENSSL)
+        self.stub("fusermount", FIXTURE.FUSERMOUNT)
+        self.publish(FIXTURE.FAKE_APPIMAGE.encode(), also_published={OLD_ASSET: OLD_APPIMAGE})
+
+        self.assert_installed(self.run_install())
+
+        self.assertEqual(
+            self.downloads(), ["SHA256SUMS.txt", "SHA256SUMS.txt.minisig", FIXTURE.ASSET, f"{FIXTURE.ASSET}.sig"]
+        )
+        layout = self.home / ".local/share/jotra"
+        self.assertEqual((layout / "Jotra.AppImage").read_bytes(), FIXTURE.FAKE_APPIMAGE.encode())
+        self.assert_wrapper("jotra", layout / "Jotra.AppImage", layout / "jotra-cli")
+
+    def test_refuses_a_release_under_the_old_name_signed_by_another_key(self) -> None:
+        self.use("openssl", FIXTURE.OPENSSL)
+        self.publish(OLD_APPIMAGE, asset=OLD_ASSET, asset_signer=self.other_signer)
+
+        self.assert_refused(self.run_install(), f"signature check failed for {OLD_ASSET}")
+
+    def test_refuses_a_release_under_the_old_name_whose_checksum_does_not_match(self) -> None:
+        self.use("openssl", FIXTURE.OPENSSL)
+        self.publish(OLD_APPIMAGE, asset=OLD_ASSET)
+        (self.fixtures / OLD_ASSET).write_bytes(OLD_APPIMAGE + b"# tampered\n")
+
+        self.assert_refused(self.run_install(), f"checksum mismatch for {OLD_ASSET}")
 
 
 if __name__ == "__main__":
