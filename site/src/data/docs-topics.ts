@@ -22,6 +22,16 @@ export class DocsTopicError extends Error {
   }
 }
 
+/** The title of the /docs/ index, which each topic page links back to. */
+export const DOCS_INDEX_TITLE = 'How Jotra works';
+
+export const DOCS_INDEX_PATH = '/docs/';
+
+/** Whether a page at `path` is a page under /docs/ other than the index itself. */
+export function isDocsTopicPath(path: string): boolean {
+  return path.startsWith(DOCS_INDEX_PATH) && path !== DOCS_INDEX_PATH;
+}
+
 /** The topics in the order the /docs/ index lists them. */
 export const DOCS_TOPICS: readonly DocsTopic[] = [
   { id: 'install', slug: 'install', title: 'Install', description: 'The download page and the package managers that carry Jotra.' },

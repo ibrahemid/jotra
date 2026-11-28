@@ -16,7 +16,7 @@ const base = import.meta.env.BASE_URL.replace(/\/$/, '');
   <p><Chord of={'CmdOrCtrl+Shift+\\'} /> opens a panel beside the file: the files that link to it, each with the sentence the link sits in, its outline and the properties from its frontmatter.</p>
 
   <h2 id="graph">Graph</h2>
-  <p>Open Graph draws the Markdown files in Jotra's folder and the links between them, with a search box, a color and a count per top-level folder, names on the open file and the most linked ones, and a switch that hides files with no links. Past 2,000 files it draws the largest group of files that link to each other, and a Markdown file over 5 MB is not drawn. With Connections on, the panel also shows the files near the open one.</p>
+  <p>Open Graph draws the Markdown files in Jotra's folder and the links between them, with a search box, a color and a count per top-level folder, names on the open file and the most linked ones, and a switch that hides files with no links. Past 2,000 files it draws the largest group of files that link to each other, cut to the 2,000 with the most links when that group is larger, and a Markdown file over 5 MB is not drawn. With Connections on, the panel also shows the files near the open one.</p>
 
   <h2 id="tags">Tags</h2>
   <p>A sidebar list of the <code>#tags</code> written in the text or the frontmatter. Choosing one filters the tree of Jotra's folder.</p>
@@ -26,7 +26,7 @@ const base = import.meta.env.BASE_URL.replace(/\/$/, '');
   <Loop name="chat" poster="chat" alt="The chat pane beside a file: a file attached with @, a question, a reply, and a proposed edit shown as a diff and applied" />
 
   <h2 id="rewrite">Rewrite</h2>
-  <p>Select text, right-click, Rewrite: proofread, rephrase, polish, or your own instruction. The result shows as a diff you apply or discard. Only the selection is sent.</p>
+  <p>Select text, right-click, Rewrite: proofread, rephrase, polish, or your own instruction. The result shows as a diff you apply or discard. The selection is sent; with nothing selected, Jotra asks before sending the whole file.</p>
 
   <h2 id="programs">Connected programs</h2>
   <p>An MCP server for a client such as Claude Code or Cursor. The first call from a program waits until you approve it, and reading and writing are approved separately. Program activity lists every call without the file's text. A program that starts the server with <code>JOTRA_NOTES_DIR</code> set works in that folder instead of Jotra's. The <a href={`${base}/guides/agent-output/`}>guide</a> walks through the setup.</p>

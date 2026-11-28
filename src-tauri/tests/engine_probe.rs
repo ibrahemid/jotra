@@ -88,6 +88,7 @@ mod app_csp;
 use std::borrow::Cow;
 use std::collections::BTreeMap;
 use std::net::{SocketAddr, TcpListener, ToSocketAddrs, UdpSocket};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -1122,7 +1123,7 @@ fn run() -> Result<String, String> {
     let refused = Arc::new(Mutex::new(Vec::<(String, String)>::new()));
     let moment = Arc::new(Mutex::new("scripts off".to_string()));
 
-    let mut event_loop = EventLoopBuilder::new().build();
+    let mut event_loop = EventLoopBuilder::<()>::with_user_event().build();
     #[cfg(target_os = "macos")]
     {
         // A probe window must never take focus from whoever is at the machine.
@@ -1236,6 +1237,17 @@ fn run() -> Result<String, String> {
         deadline: Instant::now() + LOAD_TIMEOUT,
     };
     let mut run_failures: Vec<String> = Vec::new();
+    // tao's GTK loop arms no timer for `WaitUntil`, so a thread wakes it every POLL.
+    let ticking = Arc::new(AtomicBool::new(true));
+    let ticker = {
+        let proxy = event_loop.create_proxy();
+        let ticking = Arc::clone(&ticking);
+        std::thread::spawn(move || {
+            while ticking.load(Ordering::Relaxed) && proxy.send_event(()).is_ok() {
+                std::thread::sleep(POLL);
+            }
+        })
+    };
     event_loop.run_return(|_event, _, control_flow| {
         let now = Instant::now();
         let current_load = match stage {
@@ -1381,6 +1393,10 @@ fn run() -> Result<String, String> {
         }
         *control_flow = ControlFlow::WaitUntil(now + POLL);
     });
+    ticking.store(false, Ordering::Relaxed);
+    ticker
+        .join()
+        .map_err(|_| "the event loop ticker panicked")?;
 
     let reports = reports.lock().expect("reports");
     let refused = refused.lock().expect("refused");

@@ -3,7 +3,14 @@ import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 import { MCP_TOOLS, PROVIDERS } from "../backend/ai";
 import { MAX_ATTACHED_NOTES, MISSING_CONVERSATION } from "../backend/commands/ai-chat";
-import { NAME_IS_EMPTY } from "../backend/commands/buffers";
+import {
+  ERR_NOT_A_NOTE,
+  NAME_IS_EMPTY,
+  NOTHING_TO_PUT_BACK,
+  NOT_YOURS_TO_DELETE,
+  TRASH_UNDO_MAX_BYTES,
+} from "../backend/commands/buffers";
+import { DEFAULT_CAPTURE_CHORD } from "../backend/commands/config";
 import {
   BINARY_CHECK_BYTES,
   ERR_OPEN_TOO_LARGE,
@@ -99,8 +106,18 @@ describe("the demo's copies of Rust tables", () => {
   it("refuses in the sentences the Rust commands use", () => {
     const notes = rust("crates/jotra-core/src/notes/mod.rs");
     const chat = rust("crates/jotra-ai/src/chat.rs");
+    const noteCommands = rust("src-tauri/src/commands/notes.rs");
     expect(stringConstant(notes, "NAME_IS_EMPTY")).toBe(NAME_IS_EMPTY);
     expect(stringConstant(chat, "MISSING_CONVERSATION")).toBe(MISSING_CONVERSATION);
     expect(numberConstant(chat, "MAX_ATTACHED_NOTES")).toBe(MAX_ATTACHED_NOTES);
+    expect(stringConstant(noteCommands, "ERR_NOT_A_NOTE")).toBe(ERR_NOT_A_NOTE);
+    expect(stringConstant(noteCommands, "NOT_YOURS_TO_DELETE")).toBe(NOT_YOURS_TO_DELETE);
+    expect(stringConstant(noteCommands, "NOTHING_TO_PUT_BACK")).toBe(NOTHING_TO_PUT_BACK);
+    expect(productConstant(noteCommands, "TRASH_UNDO_MAX_BYTES")).toBe(TRASH_UNDO_MAX_BYTES);
+  });
+
+  it("registers the quick capture chord jotra_core::config sets", () => {
+    const config = rust("crates/jotra-core/src/config/mod.rs");
+    expect(config.match(/fn default_hotkey_capture\(\) -> String \{\s*"([^"]+)"/)?.[1]).toBe(DEFAULT_CAPTURE_CHORD);
   });
 });

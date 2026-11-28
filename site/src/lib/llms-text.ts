@@ -1,5 +1,6 @@
 import { ELEMENT_NODE, TEXT_NODE, parse, type ElementNode, type Node } from 'ultrahtml';
 import { matches, querySelector, querySelectorAll } from 'ultrahtml/selector';
+import { decodeHTMLStrict } from 'entities/decode';
 
 export class LlmsTxtError extends Error {
   constructor(message: string) {
@@ -17,6 +18,7 @@ export const LLMS_DROP_SELECTORS = [
   'style',
   'button',
   'nav.toc',
+  'nav.up',
   '[hidden]',
   '[role="status"]',
 ] as const;
@@ -41,34 +43,13 @@ export interface LlmsSite {
   optional: LlmsLink[];
 }
 
-const NAMED_ENTITIES: Record<string, string> = {
-  amp: '&',
-  lt: '<',
-  gt: '>',
-  quot: '"',
-  apos: "'",
-  nbsp: ' ',
-  thinsp: ' ',
-  rarr: '→',
-  larr: '←',
-  hellip: '…',
-  middot: '·',
-  times: '×',
-  copy: '©',
-  lsquo: '‘',
-  rsquo: '’',
-  ldquo: '“',
-  rdquo: '”',
-  ndash: '–',
-};
-
 const MAX_CODE_POINT = 0x10ffff;
 
 export function decodeEntities(text: string): string {
   return text.replace(/&(?:#(\d+)|#x([0-9a-f]+)|([a-z][a-z0-9]*));/gi, (whole, dec?: string, hex?: string, name?: string) => {
     if (name !== undefined) {
-      const named = NAMED_ENTITIES[name];
-      if (named === undefined) throw new LlmsTxtError(`unknown character reference ${whole}`);
+      const named = decodeHTMLStrict(whole);
+      if (named === whole) throw new LlmsTxtError(`unknown character reference ${whole}`);
       return named;
     }
     const code = dec !== undefined ? Number.parseInt(dec, 10) : Number.parseInt(hex ?? '', 16);
@@ -82,6 +63,11 @@ const isElement = (node: Node): node is ElementNode => node.type === ELEMENT_NOD
 const isDropped = (el: ElementNode): boolean => LLMS_DROP_SELECTORS.some((selector) => matches(el, selector));
 
 const collapse = (text: string): string => text.replace(/\s+/g, ' ');
+
+/** What goes between two keycaps side by side: `+` after a word key such as Ctrl, nothing after a glyph such as ⌘. */
+export function keycapJoint(left: string): string {
+  return /^[A-Za-z][A-Za-z0-9]+$/.test(left.trim()) ? '+' : '';
+}
 
 function rawText(node: Node): string {
   if (node.type === TEXT_NODE) return decodeEntities(node.value);
@@ -117,7 +103,7 @@ class Converter {
   inline(node: Node): string {
     if (node.type === TEXT_NODE) return collapse(decodeEntities(node.value));
     if (!isElement(node) || isDropped(node)) return '';
-    const inner = (): string => node.children.map((child) => this.inline(child)).join('');
+    const inner = (): string => this.inlineRun(node.children);
     switch (node.name) {
       case 'br':
         return '\n';
@@ -156,13 +142,26 @@ class Converter {
     return `${lead}[${label}](${new URL(href, this.pageUrl).href})${tail}`;
   }
 
+  private inlineRun(nodes: readonly Node[]): string {
+    let text = '';
+    let keycap: string | undefined;
+    for (const node of nodes) {
+      const part = this.inline(node);
+      const isKeycap = isElement(node) && node.name === 'kbd';
+      if (isKeycap && keycap !== undefined) text += keycapJoint(keycap);
+      text += part;
+      keycap = isKeycap ? part : undefined;
+    }
+    return text;
+  }
+
   blocks(el: ElementNode): string[] {
     const out: string[] = [];
-    let run = '';
+    let run: Node[] = [];
     const flush = (): void => {
-      const text = run.replace(/ *\n */g, '\n').replace(/ {2,}/g, ' ').trim();
+      const text = this.inlineRun(run).replace(/ *\n */g, '\n').replace(/ {2,}/g, ' ').trim();
       if (text) out.push(text);
-      run = '';
+      run = [];
     };
     for (const child of el.children) {
       if (isElement(child) && BLOCKS.has(child.name)) {
@@ -170,7 +169,7 @@ class Converter {
         flush();
         out.push(...this.block(child));
       } else {
-        run += this.inline(child);
+        run.push(child);
       }
     }
     flush();

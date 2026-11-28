@@ -9,11 +9,14 @@ and licence, the offer of the corresponding source, each package's Debian
 copyright file, and every licence text those files point to under
 /usr/share/common-licenses. The release then bundles the AppImage again so it
 ships the section. `check` reads the notices file inside an AppImage and fails
-unless its table lists exactly the libraries that AppImage carries.
+unless its table lists exactly the libraries that AppImage carries. `offer`
+writes the section's table and source offer, as the AppImage carries them, to a
+file the release publishes beside the AppImage.
 
 Usage (on the Ubuntu runner that built the AppImage):
     scripts/gen-linux-library-notices.py append --appimage A.AppImage --notices THIRD-PARTY-NOTICES.md
     scripts/gen-linux-library-notices.py check --appimage A.AppImage
+    scripts/gen-linux-library-notices.py offer --appimage A.AppImage --out A.AppImage.source-offer.md
 """
 
 from __future__ import annotations
@@ -31,6 +34,7 @@ import tempfile
 from typing import Protocol
 
 SECTION_HEADING = "## Linux system libraries in the AppImage"
+COPYRIGHTS_HEADING = "### Debian copyright files"
 NOTICES_NAME = "THIRD-PARTY-NOTICES.md"
 DOC_ROOT = pathlib.Path("/usr/share/doc")
 COMMON_LICENCES = pathlib.Path("/usr/share/common-licenses")
@@ -215,7 +219,7 @@ def render_section(
         "The Linux AppImage carries these shared libraries from Ubuntu 22.04, the system it "
         "is built on. Each row names the Ubuntu package the file comes from, its source "
         "package and version, and the licence the package's Debian copyright file gives its "
-        "files as a whole. The copyright files below give the licence of every part.",
+        "files as a whole.",
         "",
         "| Library | Package | Source package | Licence |",
         "| --- | --- | --- | --- |",
@@ -239,7 +243,7 @@ def render_section(
     lines += [f"- {name} {version}: https://launchpad.net/ubuntu/+source/{name}/{version}" for name, version in sources]
     lines.append("")
 
-    lines += ["### Debian copyright files", ""]
+    lines += [COPYRIGHTS_HEADING, "", "These give the licence of every part of each package.", ""]
     for package in sorted(copyrights):
         lines += [f"#### {package}", ""] + fenced(copyrights[package])
 
@@ -291,6 +295,16 @@ def notices_in_appimage(appimage: pathlib.Path, listing: str) -> str:
         return (pathlib.Path(tmp) / "root" / paths[0]).read_text()
 
 
+def source_offer(notices_text: str) -> str:
+    if SECTION_HEADING not in notices_text:
+        raise NoticeError(f"the notices have no {SECTION_HEADING!r} section")
+    section = SECTION_HEADING + notices_text.split(SECTION_HEADING, 1)[1]
+    offer, found, _ = section.partition("\n" + COPYRIGHTS_HEADING + "\n")
+    if not found or "\n### Source code\n" not in offer:
+        raise NoticeError("the Linux system library section has no source offer")
+    return offer.rstrip("\n") + "\n"
+
+
 def mismatch(shipped: list[str], credited: list[str]) -> list[str]:
     found = [f"not credited: {path}" for path in sorted(set(shipped) - set(credited))]
     found += [f"credited but not shipped: {path}" for path in sorted(set(credited) - set(shipped))]
@@ -305,6 +319,9 @@ def main(argv: list[str] | None = None) -> int:
     append.add_argument("--notices", type=pathlib.Path, required=True)
     check = commands.add_parser("check", help="check the notices inside an AppImage")
     check.add_argument("--appimage", type=pathlib.Path, required=True)
+    offer = commands.add_parser("offer", help="write the source offer the AppImage's notices carry")
+    offer.add_argument("--appimage", type=pathlib.Path, required=True)
+    offer.add_argument("--out", type=pathlib.Path, required=True)
     args = parser.parse_args(argv)
 
     try:
@@ -318,6 +335,10 @@ def main(argv: list[str] | None = None) -> int:
             section = render_section(map_libraries(shipped, Dpkg()), DOC_ROOT, COMMON_LICENCES)
             append_section(args.notices, section)
             print(f"linux library notices: credited {len(shipped)} libraries in {args.notices}")
+            return 0
+        if args.command == "offer":
+            args.out.write_text(source_offer(notices_in_appimage(args.appimage, listing)))
+            print(f"linux library notices: wrote the source offer in {args.appimage} to {args.out}")
             return 0
         problems = mismatch(shipped, credited_libraries(notices_in_appimage(args.appimage, listing)))
     except NoticeError as error:

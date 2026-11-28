@@ -6,12 +6,15 @@ Run from the repository root:
 
 from __future__ import annotations
 
+import contextlib
 import importlib.util
+import io
 import pathlib
 import struct
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 SCRIPT_PATH = pathlib.Path(__file__).with_name("gen-linux-library-notices.py")
 SPEC = importlib.util.spec_from_file_location("gen_linux_library_notices", SCRIPT_PATH)
@@ -191,6 +194,34 @@ class LinuxLibraryNoticesTests(unittest.TestCase):
         self.assertIn(MODULE.SECTION_HEADING, notices.read_text())
         with self.assertRaisesRegex(MODULE.NoticeError, "already has"):
             MODULE.append_section(notices, self.section())
+
+    def test_the_source_offer_is_the_table_and_offer_the_notices_carry(self) -> None:
+        section = self.section()
+        offer = MODULE.source_offer("# Notices\n\n" + section)
+        self.assertTrue(section.startswith(offer.rstrip("\n") + "\n\n" + MODULE.COPYRIGHTS_HEADING + "\n"))
+        self.assertIn("| `usr/lib/libz.so.1` | zlib1g |", offer)
+        self.assertIn("For three years from the date this AppImage was published", offer)
+        self.assertIn("https://launchpad.net/ubuntu/+source/zlib/1:1.2.11.dfsg-2ubuntu9.2", offer)
+        self.assertNotIn("#### zlib1g", offer)
+        self.assertNotIn("GNU LESSER GENERAL PUBLIC LICENSE", offer)
+        self.assertNotIn("below", offer)
+        with self.assertRaisesRegex(MODULE.NoticeError, "no '## Linux system libraries in the AppImage' section"):
+            MODULE.source_offer("# Notices\n")
+        with self.assertRaisesRegex(MODULE.NoticeError, "no source offer"):
+            MODULE.source_offer(section.replace("### Source code", "### Sources"))
+
+    def test_offer_writes_the_source_offer_inside_the_appimage(self) -> None:
+        notices = "# Notices\n\n" + self.section()
+        out = self.root / "A.AppImage.source-offer.md"
+        with (
+            mock.patch.object(MODULE, "appimage_listing", return_value=LISTING),
+            mock.patch.object(MODULE, "notices_in_appimage", return_value=notices) as read,
+            contextlib.redirect_stdout(io.StringIO()),
+        ):
+            code = MODULE.main(["offer", "--appimage", str(self.root / "A.AppImage"), "--out", str(out)])
+        self.assertEqual(code, 0)
+        read.assert_called_once_with(self.root / "A.AppImage", LISTING)
+        self.assertEqual(out.read_text(), MODULE.source_offer(notices))
 
     def test_check_compares_what_ships_with_what_is_credited(self) -> None:
         shipped = MODULE.shared_libraries(LISTING)

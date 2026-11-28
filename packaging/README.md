@@ -50,6 +50,7 @@ The post-release workflow expects these artifact names on GitHub Releases. They 
 | macOS Universal DMG | `Jotra_<version>_universal.dmg` |
 | Windows x64 MSI | `Jotra_<version>_x64_en-US.msi` (and `.sig`) |
 | Linux AppImage | `Jotra_<version>_amd64.AppImage` (and `.sig`) |
+| Source offer for the AppImage's system libraries | `Jotra_<version>_amd64.AppImage.source-offer.md` |
 | Linux deb | `Jotra_<version>_amd64.deb` (and `.sig`) |
 | macOS updater bundle | `Jotra_<version>_universal.app.tar.gz` (and `.sig`) |
 | Checksums | `SHA256SUMS.txt` |

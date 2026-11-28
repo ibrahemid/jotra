@@ -4,7 +4,7 @@ import { dirname, extname, join, relative, resolve, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { ELEMENT_NODE, TEXT_NODE, parse, type ElementNode, type Node } from 'ultrahtml';
 import { matches, querySelector } from 'ultrahtml/selector';
-import { LLMS_DROP_SELECTORS } from '../src/lib/llms-text';
+import { LLMS_DROP_SELECTORS, keycapJoint } from '../src/lib/llms-text';
 
 const ROOT = fileURLToPath(new URL('..', import.meta.url));
 const DIST = join(ROOT, 'dist');
@@ -68,14 +68,20 @@ const isElement = (node: Node): node is ElementNode => node.type === ELEMENT_NOD
 const dropped = (el: ElementNode): boolean => LLMS_DROP_SELECTORS.some((selector) => matches(el, selector));
 
 function ownText(el: ElementNode): string {
-  return el.children
-    .map((child) => {
-      if (child.type === TEXT_NODE) return decode(child.value);
-      if (!isElement(child) || dropped(child) || NESTED.has(child.name)) return '';
-      if (child.name === 'br') return ' ';
-      return ownText(child);
-    })
-    .join('');
+  let text = '';
+  let keycap: string | undefined;
+  for (const child of el.children) {
+    let part = '';
+    if (child.type === TEXT_NODE) part = decode(child.value);
+    else if (!isElement(child) || dropped(child) || NESTED.has(child.name)) part = '';
+    else if (child.name === 'br') part = ' ';
+    else part = ownText(child);
+    const isKeycap = isElement(child) && child.name === 'kbd';
+    if (isKeycap && keycap !== undefined) text += keycapJoint(keycap);
+    text += part;
+    keycap = isKeycap ? part : undefined;
+  }
+  return text;
 }
 
 function checkedTexts(node: Node, out: string[] = []): string[] {
@@ -91,7 +97,23 @@ function checkedTexts(node: Node, out: string[] = []): string[] {
 const norm = (text: string): string =>
   text.replace(/`/g, '').replace(/\*\*/g, '').replace(/\\\|/g, '|').replace(/\s+/g, ' ').trim();
 
+const INLINE_CODE = /(`+)(?:(?!\1)[^\n])*?[^`\n]\1(?!`)/g;
+
 const stripLinks = (markdown: string): string => markdown.replace(/\[([^[\]\n]*)\]\([^)\s]*\)/g, '$1');
+
+/** Lines that carry an HTML tag outside a fenced block and outside inline code. */
+function markupOutsideCode(text: string): string[] {
+  let fence = '';
+  const outside: string[] = [];
+  for (const line of text.split('\n')) {
+    const open = /^(`{3,})/.exec(line)?.[1];
+    if (fence) {
+      if (line.trim() === fence) fence = '';
+    } else if (open) fence = open;
+    else outside.push(line);
+  }
+  return outside.filter((line) => /<\/?[a-z][^>]*>/.test(line.replace(INLINE_CODE, '')));
+}
 
 let txt = '';
 let full = '';
@@ -156,18 +178,14 @@ describe('llms.txt and llms-full.txt', () => {
     const internal = /\(app capture|site\/docs\/captures\.md|\bshot \d\b|still-[a-z-]+\)/i;
     for (const [name, text] of [['llms.txt', txt], ['llms-full.txt', full]] as const) {
       expect(text, name).not.toMatch(internal);
-      let fence = '';
-      const outside: string[] = [];
-      for (const line of text.split('\n')) {
-        const open = /^(`{3,})/.exec(line)?.[1];
-        if (fence) {
-          if (line.trim() === fence) fence = '';
-        } else if (open) fence = open;
-        else outside.push(line);
-      }
-      const tags = outside.filter((line) => /<\/?[a-z][^>]*>/.test(line));
-      expect(tags, `${name}: markup outside code blocks`).toEqual([]);
+      expect(markupOutsideCode(text), `${name}: markup outside code blocks`).toEqual([]);
       for (const leak of ['/Users/', 'localhost', '127.0.0.1']) expect(text.includes(leak), `${name}: ${leak}`).toBe(false);
     }
+  });
+
+  it('read a tag inside inline code or a fenced block as text, and one in prose as markup', () => {
+    expect(markupOutsideCode('Each file arrives as `<file path="plan.md">`, and ``a `<b>` tag`` too.')).toEqual([]);
+    expect(markupOutsideCode('```html\n<p>kept</p>\n```')).toEqual([]);
+    expect(markupOutsideCode('A <b>bold</b> word and `<code>`.')).toEqual(['A <b>bold</b> word and `<code>`.']);
   });
 });

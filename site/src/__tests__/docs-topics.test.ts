@@ -1,7 +1,7 @@
 import { describe, it, expect } from 'vitest';
 import { existsSync, readdirSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
-import { DOCS_TOPICS, DocsTopicError, getDocsPage, getDocsTopicHref, type DocsTopic } from '../data/docs-topics';
+import { DOCS_TOPICS, DocsTopicError, getDocsPage, getDocsTopicHref, isDocsTopicPath, type DocsTopic } from '../data/docs-topics';
 
 const SRC = join(process.cwd(), 'src');
 const DOCS_PAGES = join(SRC, 'pages', 'docs');
@@ -116,6 +116,15 @@ describe('getDocsPage', () => {
   it('refuses an id no topic has, and a topic a guide covers', () => {
     expect(() => getDocsPage('nope')).toThrow(DocsTopicError);
     expect(() => getDocsPage('obsidian')).toThrow(DocsTopicError);
+  });
+});
+
+describe('isDocsTopicPath', () => {
+  it('holds for every topic page and for no other path', () => {
+    for (const topic of DOCS_TOPICS) {
+      if (topic.slug !== null) expect(isDocsTopicPath(getDocsPage(topic.id).path), topic.id).toBe(true);
+    }
+    for (const path of ['/docs/', '/', '/changelog/', '/guides/obsidian/', '/docsx/']) expect(isDocsTopicPath(path), path).toBe(false);
   });
 });
 

@@ -490,6 +490,18 @@ class ReleaseWorkflowTests(unittest.TestCase):
             step_script(step),
         )
 
+    def test_the_linux_build_stages_the_source_offer_the_staged_appimage_carries(self) -> None:
+        build = job_steps(self.jobs["build"])
+        [credit] = [step for step in build if "gen-linux-library-notices.py check" in step]
+        [staged] = [step for step in build if step.splitlines()[0].strip() == "- name: Stage the build for signing"]
+        self.assertLess(build.index(credit), build.index(staged))
+        offer = release_assets.source_offer("0.0.0").replace("0.0.0", "${VERSION}")
+        self.assertIn(
+            'python3 scripts/gen-linux-library-notices.py offer --appimage "dist/build-linux/Jotra_${VERSION}_amd64.AppImage" '
+            f'\\ --out "dist/build-linux/{offer}"',
+            " ".join(step_script(staged).split()),
+        )
+
     def test_the_new_deb_installs_over_the_previous_release_before_publish(self) -> None:
         job = self.jobs["deb-upgrade"]
         self.assertEqual(job_needs(job), ["plan", "build"])

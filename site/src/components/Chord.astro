@@ -19,4 +19,4 @@ const { of: chord, other = false } = Astro.props;
 const keys = keybindingSegments(chord, { isMac: !other });
 if (keys.length === 0) throw new EmptyChordError();
 ---
-{keys.map((k) => <kbd class="kc">{k}</kbd>)}
+<span class="chord">{keys.map((k) => <kbd class="kc">{k}</kbd>)}</span>

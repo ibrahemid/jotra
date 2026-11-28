@@ -1,6 +1,7 @@
 ---
 import Site from '../layouts/Site.astro';
 import DownloadRows from '../components/DownloadRows.astro';
+import Chord from '../components/Chord.astro';
 import release from '../data/release.json';
 
 const repo = 'https://github.com/ibrahemid/jotra';
@@ -44,12 +45,12 @@ const sums: [string, string][] = [
       <ol>
         <li>Open the <code>.pkg</code> and follow the installer.</li>
         <li>Launch Jotra from Applications, choose the format for new files and the apps to switch on, then Continue. Jotra keeps running after you switch away.</li>
-        <li>Press <kbd class="kc">⌘</kbd><kbd class="kc">⇧</kbd><kbd class="kc">Space</kbd> from any app to bring it up, and again to put it away.</li>
+        <li>Press <Chord of="CmdOrCtrl+Shift+Space" /> from any app to bring it up, and again to put it away.</li>
       </ol>
       <h2>Updates</h2>
       <p>Jotra checks GitHub Releases shortly after launch, at most once a day, and offers the new version; nothing installs without a click. Each update is verified against Jotra's signing key before it installs, and the automatic check can be turned off in Settings.</p>
       <h2>Uninstall</h2>
-      <p>On macOS, delete the app. On Windows, uninstall it from Windows Settings, Apps. On Linux, remove the package, or delete the AppImage. Your files stay where they are, including Jotra's folder, and Jotra's own data stays in <code>~/.jotra</code> (<code>~/.writ</code> on a computer that ran Writ) until you delete that folder too.</p>
+      <p>On macOS, delete the app. On Windows, uninstall it from Windows Settings, Apps. On Linux, remove the package, or delete the AppImage; after install.sh, delete <code>~/.local/share/jotra</code> (<code>~/.local/share/writ</code> on a computer that ran Writ), <code>~/.local/bin/jotra</code> and <code>~/.local/bin/writ</code>. Your files stay where they are, including Jotra's folder, and Jotra's own data stays in <code>~/.jotra</code> (<code>~/.writ</code> on a computer that ran Writ) until you delete that folder too.</p>
     </article>
   </main>
 </Site>

@@ -5,6 +5,7 @@ import {
   decodeEntities,
   htmlToMarkdown,
   isStub,
+  keycapJoint,
   linkedPaths,
   orderSection,
   pageMeta,
@@ -38,6 +39,20 @@ describe('htmlToMarkdown', () => {
 
   it('writes a run of keycaps as the glyphs the page shows', () => {
     expect(md('<p>Press <kbd class="kc">⌘</kbd><kbd class="kc">⇧</kbd><kbd class="kc">V</kbd> to switch.</p>')).toBe('Press ⌘⇧V to switch.');
+    expect(md('<p><span class="chord"><kbd class="kc">⌘</kbd><kbd class="kc">⇧</kbd><kbd class="kc">Space</kbd></span></p>')).toBe('⌘⇧Space');
+  });
+
+  it('joins word keycaps with a plus', () => {
+    expect(
+      md('<p>Fold with <span class="chord"><kbd class="kc">Ctrl</kbd><kbd class="kc">Shift</kbd><kbd class="kc">[</kbd></span> on Windows.</p>'),
+    ).toBe('Fold with Ctrl+Shift+[ on Windows.');
+    expect(md('<table><tbody><tr><td>Find</td><td><kbd class="kc">Ctrl</kbd><kbd class="kc">F</kbd></td></tr></tbody></table>')).toBe(
+      '| | |\n| --- | --- |\n| Find | Ctrl+F |',
+    );
+    expect(md('<p><kbd class="kc">Ctrl</kbd> then <kbd class="kc">F</kbd></p>')).toBe('Ctrl then F');
+    expect(keycapJoint('Shift')).toBe('+');
+    expect(keycapJoint('⌥')).toBe('');
+    expect(keycapJoint('[')).toBe('');
   });
 
   it('makes a relative link absolute against the page', () => {
@@ -100,6 +115,7 @@ describe('htmlToMarkdown', () => {
       '<style>.x{}</style>',
       '<button type="button">Copy</button>',
       '<nav class="toc"><a href="#install">Install</a></nav>',
+      '<nav class="up"><a href="/docs/">How Jotra works</a></nav>',
       '<p hidden>hidden text</p>',
       '<span role="status">Copied</span>',
     ];
@@ -124,8 +140,14 @@ describe('decodeEntities', () => {
     expect(decodeEntities('&amp;lt;')).toBe('&lt;');
   });
 
+  it('decodes every named reference HTML defines', () => {
+    expect(decodeEntities('&eacute;t&eacute; &hearts; &Uuml;ber &notin; &AMP;')).toBe('été ♥ Über ∉ &');
+  });
+
   it('refuses a reference it cannot decode', () => {
     expect(() => decodeEntities('&bogus;')).toThrow(LlmsTxtError);
+    expect(() => decodeEntities('&ampx;')).toThrow(LlmsTxtError);
+    expect(() => decodeEntities('&#1114112;')).toThrow(LlmsTxtError);
   });
 });
 

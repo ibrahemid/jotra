@@ -381,6 +381,14 @@ class RepositoryAllowlistTests(unittest.TestCase):
                 self.assertEqual(get_matched(text, allowlist=allowlist, path=path), [])
         self.assertEqual(get_matched('prefix="writ-windows-signing-test-"', allowlist=allowlist, path=path), ["writ"])
 
+    def test_the_install_sh_paths_of_earlier_installs_are_kept_on_the_download_page(self) -> None:
+        allowlist = (SCRIPT_PATH.parent / "old-name-allowlist.txt").read_text(encoding="utf-8")
+        path = "site/src/pages/download.astro"
+        for text in ("<code>~/.local/share/writ</code>", "<code>~/.local/bin/writ</code>", "<code>~/.writ</code>"):
+            with self.subTest(text=text):
+                self.assertEqual(get_matched(text, allowlist=allowlist, path=path), [])
+        self.assertEqual(get_matched("<code>~/.local/lib/writ</code>", allowlist=allowlist, path=path), ["writ"])
+
 
 if __name__ == "__main__":
     unittest.main()

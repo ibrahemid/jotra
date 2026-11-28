@@ -598,15 +598,57 @@ def group_package_licences(
     return order(groups), order(declarations), sorted(without_text)
 
 
+BANNER_VERSIONS = (
+    re.compile(r"@license [^\s|]+ v?(\d+\.\d+\.\d+)\b"),
+    re.compile(r"--repo [^\s#]+#v?(\d+\.\d+\.\d+)\b"),
+)
+
+
+def bundled_versions(bundle: str) -> dict[str, str]:
+    """The version each package's licence banner names in an esbuild bundle.
+
+    esbuild gathers the banners under `Bundled license information:`, one
+    `<package>/<file>:` line per source file. A package whose banners name
+    no version is left out.
+    """
+    versions: dict[str, str] = {}
+    for block in re.findall(r"Bundled license information:\n(.*?)\*/", bundle, flags=re.DOTALL):
+        for path, banner in re.findall(
+            r"^((?:@[\w.-]+/)?[\w.-]+)/\S*:\n(.*?)(?=^\S|\Z)", block, flags=re.MULTILINE | re.DOTALL
+        ):
+            for pattern in BANNER_VERSIONS:
+                match = pattern.search(banner)
+                if match is None:
+                    continue
+                if versions.get(path, match.group(1)) != match.group(1):
+                    raise GenerationError(
+                        f"{MERMAID_BUNDLE} names {path} at {versions[path]} and {match.group(1)}"
+                    )
+                versions[path] = match.group(1)
+                break
+    return versions
+
+
 def collect_mermaid_libraries() -> tuple[list[dict[str, object]], list[dict[str, object]], list[str], int]:
-    """The packages inside Mermaid's single-file build, grouped like npm's."""
+    """The packages inside Mermaid's single-file build, grouped like npm's.
+
+    A package whose banner in the bundle names its version is listed at that
+    version; the rest at the version pnpm resolves.
+    """
     mermaid = ROOT / "node_modules" / MERMAID_PACKAGE
     if not (mermaid / "package.json").is_file():
         raise GenerationError(
             f"node_modules/{MERMAID_PACKAGE} is missing.\n"
             "Install it with: pnpm install --frozen-lockfile"
         )
-    packages = runtime_closure(mermaid)
+    bundle = ROOT / MERMAID_BUNDLE
+    if not bundle.is_file():
+        raise GenerationError(f"{MERMAID_BUNDLE} is missing.")
+    built = bundled_versions(bundle.read_text(encoding="utf-8", errors="replace"))
+    packages = [
+        (name, built.get(name, version), directory, declared)
+        for name, version, directory, declared in runtime_closure(mermaid)
+    ]
     groups, declarations, without_text = group_package_licences(packages, accepted_licences())
     return groups, declarations, without_text, len(packages)
 
@@ -857,10 +899,11 @@ def render(
         add("")
         add(
             f"`{MERMAID_BUNDLE}` is a single file that carries the packages Mermaid "
-            "depends on at run time. They are listed at the versions pnpm resolves for "
-            "the `mermaid` devDependency in package.json; the bundle was built against "
-            "releases within the same version ranges. Each block is one distinct "
-            "licence text and the packages it covers."
+            "depends on at run time. A package whose licence banner in the bundle names "
+            "its version is listed at that version. The others are listed at the "
+            "versions pnpm resolves for the `mermaid` devDependency in package.json; the "
+            "bundle was built against releases within the same version ranges. Each "
+            "block is one distinct licence text and the packages it covers."
         )
         add("")
         for group in mermaid_groups + mermaid_declarations:

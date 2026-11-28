@@ -62,6 +62,7 @@ a {
 .btn,
 .footer a,
 .toc a,
+.up a,
 .dl-sha,
 .prose h2 a {
   text-decoration: none;
@@ -70,6 +71,7 @@ a {
 .nav-links a:hover,
 .footer a:hover,
 .toc a:hover,
+.up a:hover,
 .dl-sha:hover,
 .prose h2 a:hover {
   text-decoration: underline;
@@ -789,6 +791,11 @@ button {
   text-wrap: balance;
 }
 
+.prose .up {
+  margin-bottom: var(--jotra-space-3);
+  font-size: var(--jotra-site-text-sm);
+}
+
 .prose .lead {
   margin-top: var(--jotra-space-5);
   font-size: var(--jotra-site-text-lg);
@@ -901,6 +908,10 @@ button {
   margin-left: var(--jotra-space-1);
 }
 
+.chord {
+  white-space: nowrap;
+}
+
 .rel {
   margin-top: var(--jotra-site-space-8);
 }
@@ -925,6 +936,10 @@ button {
   display: grid;
   grid-template-columns: 5em minmax(0, 1fr);
   gap: var(--jotra-space-3);
+}
+
+.rel-note {
+  overflow-wrap: anywhere;
 }
 
 .rel-kind {

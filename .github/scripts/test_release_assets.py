@@ -110,6 +110,16 @@ class AssetNameTests(unittest.TestCase):
             {"SHA256SUMS.txt", "SHA256SUMS.txt.minisig", "latest.json", "release-meta.json"},
         )
 
+    def test_the_appimage_source_offer_is_signed_checksummed_and_published_beside_the_appimage(self) -> None:
+        offer = "Jotra_0.6.0_amd64.AppImage.source-offer.md"
+        self.assertEqual(release_assets.source_offer(VERSION), offer)
+        for name in ("signing-inputs", "checksummed", "published"):
+            with self.subTest(set=name):
+                self.assertIn(offer, release_assets.asset_set(VERSION, name))
+        for name in ("installers", "updater-payloads", "sboms"):
+            with self.subTest(set=name):
+                self.assertNotIn(offer, release_assets.asset_set(VERSION, name))
+
     def test_no_sbom_name_matches_an_installer_pattern_the_site_reads(self) -> None:
         site_patterns = (r"universal\.dmg$", r"universal\.pkg$", r"\.msi$", r"\.deb$", r"\.AppImage$")
         for name in release_assets.asset_set(VERSION, "published"):

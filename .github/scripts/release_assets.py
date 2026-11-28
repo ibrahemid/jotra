@@ -97,6 +97,10 @@ def updater_signatures(version: str) -> list[str]:
     return [f"{name}.sig" for name in updater_payloads(version)]
 
 
+def source_offer(version: str) -> str:
+    return f"Jotra_{require_version(version)}_amd64.AppImage.source-offer.md"
+
+
 def sboms(version: str) -> list[Sbom]:
     v = require_version(version)
     rust = [
@@ -121,15 +125,15 @@ def asset_set(version: str, name: str) -> list[str]:
     elif name == "sboms":
         names = sbom_names
     elif name == "signing-inputs":
-        names = installer_names + sbom_names + [RELEASE_META]
+        names = installer_names + sbom_names + [source_offer(version), RELEASE_META]
     elif name == "checksummed":
-        names = installer_names + updater_signatures(version) + sbom_names
+        names = installer_names + updater_signatures(version) + sbom_names + [source_offer(version)]
     elif name == "published":
         names = (
             installer_names
             + updater_signatures(version)
             + sbom_names
-            + [SUMS, SUMS_SIGNATURE, UPDATER_MANIFEST, RELEASE_META]
+            + [source_offer(version), SUMS, SUMS_SIGNATURE, UPDATER_MANIFEST, RELEASE_META]
         )
     else:
         raise ReleaseAssetError(f"unknown asset set {name!r}; expected one of {', '.join(SETS)}")
