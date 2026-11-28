@@ -151,7 +151,7 @@ describe('isStub', () => {
 describe('linkedPaths and orderSection', () => {
   it('reads the matching links of main#content in page order, once each, on this site only', () => {
     const html = page(
-      '<ul><li id="files"><a href="/docs/files/" data-topic>Files</a></li><li id="obsidian"><a href="/guides/obsidian-vault-files/" data-topic>Obsidian</a></li><li><a href="/docs/files/" data-topic>Again</a></li><li><a href="https://github.com/ibrahemid/writ" data-topic>Code</a></li><li><a href="/docs/cli/">Not a topic</a></li></ul>',
+      '<ul><li id="files"><a href="/docs/files/" data-topic>Files</a></li><li id="obsidian"><a href="/guides/obsidian-vault-files/" data-topic>Obsidian</a></li><li><a href="/docs/files/" data-topic>Again</a></li><li><a href="https://github.com/ibrahemid/jotra" data-topic>Code</a></li><li><a href="/docs/cli/">Not a topic</a></li></ul>',
     );
     expect(linkedPaths(html, PAGE, 'a[data-topic]')).toEqual(['/docs/files/', '/guides/obsidian-vault-files/']);
   });
@@ -177,7 +177,7 @@ describe('renderLlmsTxt and renderLlmsFull', () => {
   const site: LlmsSite = {
     name: 'Jotra',
     summary: 'A text app.',
-    repository: 'https://github.com/ibrahemid/writ',
+    repository: 'https://github.com/ibrahemid/jotra',
     docs: [link('/docs/', 'How Jotra works')],
     guides: [link('/guides/', 'Guides')],
     reference: [link('/privacy/', 'Privacy'), link('/download/', 'Download')],
@@ -191,7 +191,7 @@ describe('renderLlmsTxt and renderLlmsFull', () => {
         '',
         '> A text app.',
         '',
-        'Source, issues and releases: https://github.com/ibrahemid/writ',
+        'Source, issues and releases: https://github.com/ibrahemid/jotra',
         '',
         '## Docs',
         '',
