@@ -29,6 +29,7 @@ use jotra_storage::layout_state::LayoutStateStore;
 use jotra_storage::note_history::NoteHistoryStore;
 use jotra_storage::notes_index::NotesIndexStore;
 use jotra_storage::paths::file_name_only;
+use jotra_storage::tab_rows::TabRowStore;
 use jotra_storage::write_lock::WriteLock;
 
 use crate::fts_scheduler::FtsScheduler;
@@ -199,6 +200,9 @@ pub struct AppState {
     /// Per-buffer preview layout persistence. Holds its own SQLite
     /// connection (WAL permits concurrent connections to the same file).
     pub layout_state: LayoutStateStore,
+    /// A tab row's encoding and scripts opt-in, on a connection of its own, so
+    /// a watcher thread reporting a change never waits on the store's lock.
+    pub tab_rows: TabRowStore,
     /// The path-keyed index over the notes folder (ADR-028 section 7). Holds
     /// its own connection so the startup reconcile never queues behind a save
     /// and a keystroke never queues behind the reconcile.
@@ -305,6 +309,7 @@ impl AppState {
         // Second connection for layout-state persistence; migrations have
         // already created the table on the primary connection above.
         let layout_state = LayoutStateStore::new(open_database(&db_path)?);
+        let tab_rows = TabRowStore::new(open_database(&db_path)?);
         // Third connection, for the notes index, on the same grounds.
         let notes_index = Arc::new(NotesIndexStore::open(&db_path)?);
 
@@ -577,6 +582,7 @@ impl AppState {
             preview_registry: Arc::new(RwLock::new(preview_registry)),
             preview_render_cache: Arc::new(RenderCache::new()),
             layout_state,
+            tab_rows,
             notes_index,
             note_history,
             notes_index_cancel: Arc::new(AtomicBool::new(false)),

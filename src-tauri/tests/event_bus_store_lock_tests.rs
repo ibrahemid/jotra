@@ -102,6 +102,9 @@ fn make_state(dir: &TempDir) -> AppState {
         preview_registry: Arc::new(RwLock::new(ContentRendererRegistry::new())),
         preview_render_cache: Arc::new(RenderCache::new()),
         layout_state: LayoutStateStore::new(open_database(&db_path).expect("layout db")),
+        tab_rows: jotra_storage::tab_rows::TabRowStore::new(
+            open_database(&db_path).expect("tab rows db"),
+        ),
         command_usage: jotra_storage::command_usage::CommandUsageStore::new(
             open_database(&db_path).expect("usage db"),
         ),
@@ -274,7 +277,14 @@ fn every_event(state: &AppState, id: &str, path: &str) -> Vec<JotraEvent> {
             path: path.to_string(),
             removed: true,
         },
-        JotraEvent::WorkspaceSwept { root: root.clone() },
+        JotraEvent::WorkspaceSwept {
+            root: root.clone(),
+            paths: Some(vec![path.to_string()]),
+        },
+        JotraEvent::WorkspaceSwept {
+            root: root.clone(),
+            paths: None,
+        },
         JotraEvent::NotesSwept { root },
         JotraEvent::NotesIndexed {
             paths: vec![path.to_string()],

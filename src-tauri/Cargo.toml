@@ -90,7 +90,17 @@ rustix = { version = "1", default-features = false, features = ["std", "fs"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 core-foundation = "0.10"
-fsevent-sys = "4"
+# The FSEvents bindings notify already resolves.
+objc2-core-foundation = { version = "0.3", default-features = false, features = [
+    "std",
+    "CFArray",
+    "CFString",
+] }
+objc2-core-services = { version = "0.3", default-features = false, features = [
+    "std",
+    "dispatch2",
+    "FSEvents",
+] }
 # The same objc2 line tauri, tao and wry already resolve, so this unifies
 # rather than adding a second copy of the AppKit bindings. Needed to install
 # `applicationShouldTerminate:`, which nothing above this crate exposes, and to

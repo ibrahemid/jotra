@@ -27,9 +27,9 @@
 //! unwatchable share does not put the rest of the machine on a timer.
 //!
 //! On macOS the native backend is one FSEvents stream over every folder,
-//! rebuilt off the caller's thread ([`super::fsevents`]); `notify`'s own
-//! restarted its stream on the main thread for every open and close and lost
-//! what changed during the restart.
+//! rebuilt off the caller's thread, which never waits for it
+//! ([`super::fsevents`]); `notify`'s own restarted its stream on the main
+//! thread for every open and close and lost what changed during the restart.
 
 use crate::poison::recover_poison;
 use jotra_core::events::bus::{EventBus, JotraEvent};
@@ -67,13 +67,15 @@ pub const DEBOUNCE_WINDOW: Duration = Duration::from_millis(500);
 /// entry in it.
 pub const POLL_INTERVAL: Duration = Duration::from_secs(4);
 
-/// The platform's own backend for the folders of open files.
+/// The platform's own backend for the folders of open files, with reads
+/// dropped before they are debounced.
 #[cfg(target_os = "macos")]
-type NativeWatcher = super::fsevents::FsEventsWatcher;
+type NativeWatcher = super::changes_only::ChangesOnly<super::fsevents::FsEventsWatcher>;
 
-/// The platform's own backend for the folders of open files.
+/// The platform's own backend for the folders of open files, with reads
+/// dropped before they are debounced.
 #[cfg(not(target_os = "macos"))]
-type NativeWatcher = notify::RecommendedWatcher;
+type NativeWatcher = super::changes_only::ChangesOnly<notify::RecommendedWatcher>;
 
 /// Which backend is watching a folder.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -479,8 +481,11 @@ pub fn start_open_file_watcher(
 ) -> Result<OpenFileWatcher, Box<dyn std::error::Error>> {
     let (tx, rx) = mpsc::channel::<DebounceEventResult>();
 
+    // The interval is the FSEvents backend's, for a folder no stream reports.
     let native: notify_debouncer_mini::Debouncer<NativeWatcher> = new_debouncer_opt(
-        DebounceConfig::default().with_timeout(DEBOUNCE_WINDOW),
+        DebounceConfig::default()
+            .with_timeout(DEBOUNCE_WINDOW)
+            .with_notify_config(NotifyConfig::default().with_poll_interval(POLL_INTERVAL)),
         tx.clone(),
     )?;
     // Size and modification time, never contents: a pass that read every file
@@ -501,9 +506,9 @@ pub fn start_open_file_watcher(
 
     let thread_registry = registry.clone();
     std::thread::spawn(move || {
-        // Outside the batch loop: the event a read of this watcher's own
-        // raises on Linux arrives in a later batch than the change that
-        // caused it, so a record scoped to one batch would never see it.
+        // Outside the batch loop: a change delivered twice arrives in a later
+        // batch the second time, so a record scoped to one batch would never
+        // see it.
         let mut seen = LastSeen::new();
         // A removal waits for the delivery that might answer it, so the wait
         // for the next event ends at its deadline rather than whenever the
@@ -647,9 +652,9 @@ fn report_delivery(
 /// This, rather than [`classify_open_file_event`], is what the watcher thread
 /// calls, and the two are separate so that the record of what has already been
 /// looked at cannot be skipped by the caller that matters. An event describing
-/// the file exactly as this watcher last found it is dropped before anything
-/// opens it, which is what keeps a classification's own read from arriving
-/// back as the next change on Linux ([`jotra_core::watcher::sighting`]).
+/// the file exactly as this watcher last found it, with a modification time
+/// fine enough to say no write landed since, is dropped before anything opens
+/// it ([`jotra_core::watcher::sighting`]).
 pub fn report_open_file_event(
     path: &Path,
     note_id: &str,
@@ -783,17 +788,17 @@ pub const WATCHER_READ_CAP_BYTES: u64 = jotra_core::file_ops::THRESHOLD_LARGE_BY
 /// Whether `metadata` still describes the file as Jotra last read or wrote it.
 ///
 /// Both the size and the modification time have to agree, and a record with
-/// no modification time matches nothing. An edit that keeps the size and
-/// lands inside one tick of the volume's clock is missed here; on APFS and
-/// ext4 that tick is a nanosecond, on FAT it is two seconds.
+/// no modification time, or a coarse one (FAT, exFAT, HFS+), matches nothing:
+/// the caller reads the file instead
+/// ([`jotra_core::notes::guard::metadata_matches_record`]).
 pub fn matches_last_look(last: Option<&DiskState>, metadata: &std::fs::Metadata) -> bool {
-    let Some(last) = last else {
-        return false;
-    };
-    let Some(recorded) = last.mtime else {
-        return false;
-    };
-    last.size == metadata.len() && metadata.modified().ok() == Some(recorded)
+    last.is_some_and(|last| {
+        jotra_core::notes::guard::metadata_matches_record(
+            last,
+            metadata.len(),
+            metadata.modified().ok(),
+        )
+    })
 }
 
 /// The file's bytes, or `None` where reading them is the wrong thing to do.
@@ -3002,6 +3007,126 @@ mod tests {
                 })
             ),
             "{event:?}"
+        );
+    }
+
+    #[test]
+    fn a_same_size_edit_inside_one_coarse_tick_is_read_and_reported() {
+        let dir = tempdir().unwrap();
+        let file = dir.path().join("stick.md");
+        let tick = std::time::UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+        let stamp = |file: &Path| {
+            fs::File::options()
+                .write(true)
+                .open(file)
+                .unwrap()
+                .set_modified(tick)
+                .unwrap();
+        };
+        fs::write(&file, b"abcd\n").unwrap();
+        stamp(&file);
+        let recorded = jotra_core::notes::guard::DiskState {
+            hash: jotra_core::hash::sha256_bytes(b"abcd\n"),
+            size: 5,
+            mtime: Some(tick),
+        };
+        fs::write(&file, b"wxyz\n").unwrap();
+        stamp(&file);
+        let (tracking, _) = tracking_with(RecordingFiles {
+            last: Some(recorded),
+            ..Default::default()
+        });
+
+        let event = classify_open_file_event(
+            &file,
+            "note-1",
+            &make_set(),
+            DEFAULT_IGNORE_TTL,
+            Instant::now(),
+            &VanishedContext {
+                hold: &holding(),
+                batch: std::slice::from_ref(&file),
+                tracking: &tracking,
+            },
+        );
+        assert!(
+            matches!(
+                event,
+                Some(JotraEvent::BufferExternal {
+                    change: ExternalChange::Modified,
+                    disk_hash: Some(_),
+                    ..
+                })
+            ),
+            "the same-size edit was not read and reported as a modification"
+        );
+    }
+
+    #[test]
+    fn a_second_same_size_save_inside_one_coarse_tick_is_reported() {
+        let dir = tempdir().unwrap();
+        let file = dir.path().join("stick.md");
+        let tick = std::time::UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+        let save = |bytes: &[u8]| {
+            fs::write(&file, bytes).unwrap();
+            fs::File::options()
+                .write(true)
+                .open(&file)
+                .unwrap()
+                .set_modified(tick)
+                .unwrap();
+        };
+        save(b"abcd\n");
+        let (tracking, _) = tracking_with(RecordingFiles {
+            last: Some(jotra_core::notes::guard::DiskState {
+                hash: jotra_core::hash::sha256_bytes(b"abcd\n"),
+                size: 5,
+                mtime: Some(tick),
+            }),
+            ..Default::default()
+        });
+        let ignore = make_set();
+        let mut seen = LastSeen::new();
+        let first_look = Instant::now();
+        let report = |seen: &mut LastSeen, now: Instant| {
+            report_open_file_event(
+                &file,
+                "note-1",
+                &ignore,
+                seen,
+                DEFAULT_IGNORE_TTL,
+                now,
+                &VanishedContext {
+                    hold: &holding(),
+                    batch: std::slice::from_ref(&file),
+                    tracking: &tracking,
+                },
+            )
+        };
+
+        save(b"wxyz\n");
+        let first = report(&mut seen, first_look);
+        save(b"1234\n");
+        let second = report(&mut seen, first_look + Duration::from_secs(1));
+
+        let modified = |event: &Option<JotraEvent>, bytes: &[u8]| {
+            let expected = jotra_core::hash::comparison_digest_hex(bytes);
+            matches!(
+                event,
+                Some(JotraEvent::BufferExternal {
+                    change: ExternalChange::Modified,
+                    disk_hash: Some(hash),
+                    ..
+                }) if *hash == expected
+            )
+        };
+        assert!(
+            modified(&first, b"wxyz\n"),
+            "the first save was not reported"
+        );
+        assert!(
+            modified(&second, b"1234\n"),
+            "the second save inside the same tick was not reported"
         );
     }
 

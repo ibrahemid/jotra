@@ -66,12 +66,15 @@ pub enum JotraEvent {
         removed: bool,
     },
     /// More changed in the open workspace folder in one window than was worth
-    /// listing ([`crate::watcher::budget::EmissionBudget`]), or the folder's
-    /// own ignore rules changed. Nothing is named: the tree reloads the
-    /// folders it has loaded and the file-name index walks again.
+    /// listing ([`crate::watcher::budget::EmissionBudget`]). The tree reloads
+    /// the folders it has loaded; the file-name index patches `paths`, or
+    /// walks again when there were more than a sweep carries.
     WorkspaceSwept {
         /// Absolute path of the workspace folder.
         root: String,
+        /// Absolute paths of the changes the sweep stands for, or `None` past
+        /// [`crate::watcher::budget::MAX_SWEPT_PATHS`].
+        paths: Option<Vec<String>>,
     },
     /// A file inside the notes folder was created, changed or removed on
     /// disk by something other than Jotra. Listeners refresh the notes tree

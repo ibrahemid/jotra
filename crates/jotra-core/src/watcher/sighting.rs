@@ -9,22 +9,20 @@
 //! events on CI. macOS and Windows never showed it because neither backend
 //! reports a read.
 //!
-//! [`LastSeen`] breaks the loop by asking, from the file's metadata alone,
-//! whether the event says anything the previous one did not. Metadata is read
-//! without opening the file, so the question costs nothing and raises nothing.
-//! A file whose length and modification time have not moved since the watcher
-//! last looked has nothing new to say, and the event is dropped before any
-//! read happens.
+//! The watchers drop read events where the backend delivers them, before they
+//! are debounced, so the read never comes back. [`LastSeen`] bounds what is
+//! left, the same change delivered more than once, by asking from the file's
+//! metadata alone whether the event says anything the previous one did not.
+//! Metadata is read without opening the file, so the question costs nothing
+//! and raises nothing. A file whose length and modification time have not
+//! moved since the watcher last looked has nothing new to say, and the event
+//! is dropped before any read happens.
 //!
-//! This is a bound on repetition, not a filter on content: a file that
-//! genuinely changed has a modification time later than the one recorded, so
-//! it is always reported. The one case it can miss is a write of exactly the
-//! previous length whose modification time is indistinguishable from the
-//! previous write's, which needs a filesystem whose timestamps are coarser
-//! than the debounce window (FAT and exFAT, at two seconds). There the tab is
-//! not told, and the write guard is the backstop: the save that would land
-//! over those bytes is refused rather than silently overwriting them
-//! (ADR-033).
+//! That answer holds only where the modification time can tell two writes
+//! apart ([`crate::notes::guard::is_fine_grained_mtime`]). A volume that keeps
+//! whole seconds or two (HFS+, FAT, exFAT) gives two saves of the same length
+//! inside one tick the same sighting, so a file with a coarse or missing time
+//! is always news and its bytes decide.
 //!
 //! Time is passed in rather than read, so the decision is testable without a
 //! clock or a filesystem.
@@ -85,10 +83,11 @@ impl LastSeen {
     /// Records `sighting` for `path`, and answers whether it differs from the
     /// last one recorded within `ttl`.
     ///
-    /// `true` for a path never looked at, for a look older than `ttl`, and for
-    /// a file whose length or modification time has moved. `false` only when
-    /// the file is exactly as this watcher last found it, which is what the
-    /// echo of its own read looks like.
+    /// `true` for a path never looked at, for a look older than `ttl`, for a
+    /// file whose length or modification time has moved, and for a file whose
+    /// modification time is too coarse to tell two writes apart. `false` only
+    /// when the file is exactly as this watcher last found it and its time
+    /// says no write landed since, or when the path is still empty.
     pub fn is_news(
         &mut self,
         path: &Path,
@@ -102,7 +101,9 @@ impl LastSeen {
             .insert(path.to_path_buf(), Sighted { sighting, at: now });
         match previous {
             Some(previous) => {
-                previous.sighting != sighting || now.saturating_duration_since(previous.at) > ttl
+                previous.sighting != sighting
+                    || !tells_writes_apart(sighting)
+                    || now.saturating_duration_since(previous.at) > ttl
             }
             None => true,
         }
@@ -125,6 +126,16 @@ impl LastSeen {
     }
 }
 
+/// Whether a sighting equal to the last one means no write landed between
+/// them: there is no file, or its modification time is fine grained.
+fn tells_writes_apart(sighting: Option<FileSighting>) -> bool {
+    sighting.is_none_or(|sighting| {
+        sighting
+            .modified
+            .is_some_and(crate::notes::guard::is_fine_grained_mtime)
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -134,8 +145,44 @@ mod tests {
     fn at(len: u64, modified_secs: u64) -> Option<FileSighting> {
         Some(FileSighting {
             len,
+            modified: Some(
+                SystemTime::UNIX_EPOCH
+                    + Duration::from_secs(modified_secs)
+                    + Duration::from_nanos(123_456_789),
+            ),
+        })
+    }
+
+    fn at_coarse(len: u64, modified_secs: u64) -> Option<FileSighting> {
+        Some(FileSighting {
+            len,
             modified: Some(SystemTime::UNIX_EPOCH + Duration::from_secs(modified_secs)),
         })
+    }
+
+    #[test]
+    fn a_same_length_write_inside_one_coarse_tick_is_news() {
+        let mut seen = LastSeen::new();
+        let path = Path::new("/notes/one.md");
+        let now = Instant::now();
+        assert!(seen.is_news(path, at_coarse(29, 100), now, TTL));
+        assert!(
+            seen.is_news(path, at_coarse(29, 100), now + Duration::from_secs(1), TTL),
+            "a coarse time cannot say the second write did not happen"
+        );
+    }
+
+    #[test]
+    fn a_file_with_no_modification_time_is_always_news() {
+        let mut seen = LastSeen::new();
+        let path = Path::new("/notes/one.md");
+        let now = Instant::now();
+        let untimed = Some(FileSighting {
+            len: 29,
+            modified: None,
+        });
+        assert!(seen.is_news(path, untimed, now, TTL));
+        assert!(seen.is_news(path, untimed, now, TTL));
     }
 
     #[test]
@@ -146,9 +193,7 @@ mod tests {
 
     #[test]
     fn a_burst_of_events_for_a_file_that_has_not_moved_is_news_once() {
-        // The shape of the Linux loop: one write, then eleven deliveries of
-        // the same unchanged file, each one raised by the read the previous
-        // one did.
+        // One write, then eleven deliveries of the same unchanged file.
         let mut seen = LastSeen::new();
         let path = Path::new("/notes/one.md");
         let now = Instant::now();
