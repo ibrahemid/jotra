@@ -136,6 +136,10 @@ fn default_reading_width() -> bool {
     false
 }
 
+fn default_reading_measure() -> ReadingMeasure {
+    ReadingMeasure::Medium
+}
+
 fn default_load_remote_images() -> bool {
     false
 }
@@ -443,6 +447,19 @@ impl Default for FirstRunConfig {
     }
 }
 
+/// How wide a line of prose runs while reading width is on, each one a
+/// `--jotra-prose-measure` token.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ReadingMeasure {
+    /// `--jotra-prose-measure-narrow`.
+    Narrow,
+    /// `--jotra-prose-measure`.
+    Medium,
+    /// `--jotra-prose-measure-wide`.
+    Wide,
+}
+
 /// Editor surface configuration.
 ///
 /// A config file written before `font_family` and `markdown_typography` were
@@ -480,6 +497,9 @@ pub struct EditorConfig {
     /// instead of running the width of the pane. Code keeps the full width.
     #[serde(default = "default_reading_width")]
     pub reading_width: bool,
+    /// How wide prose runs while `reading_width` is on.
+    #[serde(default = "default_reading_measure")]
+    pub reading_measure: ReadingMeasure,
     /// Whether an `http:` or `https:` image in a Markdown file is fetched as
     /// soon as it is shown, instead of waiting for its Load image button
     /// (ADR-057).
@@ -498,6 +518,7 @@ impl Default for EditorConfig {
             status_bar: default_status_bar(),
             status_bar_counts: default_status_bar_counts(),
             reading_width: default_reading_width(),
+            reading_measure: default_reading_measure(),
             load_remote_images: default_load_remote_images(),
         }
     }
@@ -961,6 +982,42 @@ mod tests {
         assert!(config.editor.reading_width);
         let written: JotraConfig = toml::from_str(&toml::to_string(&config).unwrap()).unwrap();
         assert!(written.editor.reading_width);
+    }
+
+    #[test]
+    fn editor_reading_measure_is_medium_when_the_file_does_not_name_it() {
+        let config: JotraConfig = toml::from_str("[editor]\nreading_width = true\n").unwrap();
+        assert_eq!(config.editor.reading_measure, ReadingMeasure::Medium);
+        assert_eq!(
+            EditorConfig::default().reading_measure,
+            ReadingMeasure::Medium
+        );
+    }
+
+    #[test]
+    fn editor_reading_measure_round_trips_each_width() {
+        for (text, measure) in [
+            ("narrow", ReadingMeasure::Narrow),
+            ("medium", ReadingMeasure::Medium),
+            ("wide", ReadingMeasure::Wide),
+        ] {
+            let config: JotraConfig =
+                toml::from_str(&format!("[editor]\nreading_measure = \"{text}\"\n")).unwrap();
+            assert_eq!(config.editor.reading_measure, measure);
+            let written: JotraConfig = toml::from_str(&toml::to_string(&config).unwrap()).unwrap();
+            assert_eq!(written.editor.reading_measure, measure);
+        }
+    }
+
+    #[test]
+    fn editor_reading_measure_falls_back_to_medium_on_an_unknown_width() {
+        let read = JotraConfig::parse_lenient(
+            "[editor]\nreading_width = true\nreading_measure = \"huge\"\n",
+        );
+        assert!(read.config.editor.reading_width);
+        assert_eq!(read.config.editor.reading_measure, ReadingMeasure::Medium);
+        assert_eq!(read.diagnostics.len(), 1);
+        assert_eq!(read.diagnostics[0].key, "editor.reading_measure");
     }
 
     #[test]

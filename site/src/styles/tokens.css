@@ -18,6 +18,8 @@
   --jotra-prose-size: 16px;
   --jotra-prose-lh: 1.6;
   --jotra-prose-measure: 704px;
+  --jotra-prose-measure-narrow: 576px;
+  --jotra-prose-measure-wide: 896px;
   --jotra-prose-pad-x: 32px;
   --jotra-prose-pad-y: 32px;
   --jotra-prose-pad-x-em: 2.2;

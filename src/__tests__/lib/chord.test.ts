@@ -72,6 +72,15 @@ describe("chordFromPosition", () => {
     ).toBe("CmdOrCtrl+Shift+/");
   });
 
+  it("reads the bracket key under an Option-composed quote on macOS", () => {
+    expect(
+      chordFromPosition({ key: "\u201c", code: "BracketLeft", metaKey: true, altKey: true }, "mac"),
+    ).toBe("CmdOrCtrl+Alt+[");
+    expect(
+      chordForRecording({ key: "\u2018", code: "BracketRight", metaKey: true, altKey: true }, "mac"),
+    ).toBe("CmdOrCtrl+Alt+]");
+  });
+
   it("reads the period key under Shift, on a Latin layout and a Cyrillic one", () => {
     expect(
       chordFromPosition({ key: ">", code: "Period", metaKey: true, shiftKey: true }, "mac"),

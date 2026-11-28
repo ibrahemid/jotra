@@ -1,11 +1,12 @@
 import { describe, it, expect, afterEach, vi } from "vitest";
-import { EditorSelection, EditorState } from "@codemirror/state";
+import { Compartment, EditorSelection, EditorState } from "@codemirror/state";
 import { EditorView } from "@codemirror/view";
 import { markdown, markdownLanguage } from "@codemirror/lang-markdown";
 import { ensureSyntaxTree, foldEffect } from "@codemirror/language";
 import { MARKDOWN_EXTENSIONS } from "../../editor/markdown-math";
 import {
   blockRenderField,
+  DIAGRAM_RUNTIME_CAPTION,
   diagramFailureCaption,
   diagramKey,
   drawnBlocks,
@@ -13,11 +14,14 @@ import {
   markdownBlocks,
   markdownBlocksIn,
   mathKey,
+  measuredHeight,
   setBlockRenders,
   setBlockWindow,
+  tableModelsBuilt,
 } from "../../editor/markdown-blocks";
+import { TYPING_PAUSE_MS } from "../../editor/markdown-images";
 import { folding } from "../../editor/folding";
-import type { BlockRenderer } from "../../editor/block-renderer";
+import { BlockRenderError, type BlockRenderer } from "../../editor/block-renderer";
 
 const NEVER: BlockRenderer = {
   renderMath: () => new Promise(() => {}),
@@ -68,7 +72,7 @@ describe("the blocks Inline draws", () => {
   it("reads a table's cells, alignment, empty cells and wikilinks", () => {
     const state = stateWith(DOC);
     const [table] = markdownBlocksIn(state, 0, state.doc.length);
-    const model = table.table!;
+    const model = table.table!();
     expect(model.align).toEqual(["left", "right", "center"]);
     expect(model.head).toEqual([
       [{ kind: "text", text: "Name" }],
@@ -82,6 +86,71 @@ describe("the blocks Inline draws", () => {
     expect(model.rows[1][1]).toEqual([]);
     expect(model.rows[1][2]).toEqual([{ kind: "text", text: "the plan" }]);
     expect(model.math).toEqual([mathKey("x^2", false)]);
+  });
+});
+
+/** A parsed state with no block field, so nothing builds a table model unasked. */
+function parsed(doc: string): EditorState {
+  const state = EditorState.create({ doc, extensions: [language()] as never });
+  ensureSyntaxTree(state, doc.length, 5000);
+  // The finished parse reaches the state with the next transaction.
+  return state.update({}).state;
+}
+
+function bigTable(rows: number, tag: string, note = ""): string {
+  const body = Array.from({ length: rows }, (_, i) => `| ${tag}${i} | ${i * 7} | note ${i}${note} |`);
+  return ["| Key | Value | Note |", "|---|--:|---|", ...body].join("\n");
+}
+
+describe("table models", () => {
+  it("builds none while the caret is typing inside a large table", () => {
+    const table = bigTable(400, "r");
+    const doc = `intro\n\n${table}\n\nend\n`;
+    const inside = doc.indexOf("| r200 |") + 2;
+    let state = stateWith(doc, inside);
+    const before = tableModelsBuilt();
+    let at = inside;
+    for (const char of "typed") {
+      state = state.update({ changes: { from: at, insert: char }, selection: EditorSelection.cursor(at + 1) }).state;
+      at++;
+    }
+    expect(drawnTexts(state)).toEqual([]);
+    expect(tableModelsBuilt() - before).toBe(0);
+    // Leaving the table draws it, from one model.
+    state = state.update({ selection: EditorSelection.cursor(0) }).state;
+    expect(drawnTexts(state)).toHaveLength(1);
+    expect(tableModelsBuilt() - before).toBe(1);
+  });
+
+  it("keeps a table drawn again ahead of the ones drawn since", () => {
+    const tables = Array.from({ length: 513 }, (_, i) => `| lru${i} | n |\n|---|---|\n| ${i} | x |`);
+    const state = parsed(`${tables.join("\n\n")}\n`);
+    const blocks = () => markdownBlocksIn(state, 0, state.doc.length);
+    const first = blocks();
+    expect(first).toHaveLength(513);
+    for (const block of first.slice(0, 512)) block.table!();
+    const before = tableModelsBuilt();
+    blocks()[0].table!();
+    expect(tableModelsBuilt() - before).toBe(0);
+    first[512].table!();
+    expect(tableModelsBuilt() - before).toBe(1);
+    blocks()[0].table!();
+    expect(tableModelsBuilt() - before).toBe(1);
+  });
+
+  it("lets go of old models once the tables held pass a total size", () => {
+    const long = " words".repeat(14);
+    const one = bigTable(5000, "a", long);
+    const two = bigTable(5000, "b", long);
+    expect(one.length + two.length).toBeGreaterThan(1 << 20);
+    const state = parsed(`${one}\n\n${two}\n`);
+    const [a, b] = markdownBlocksIn(state, 0, state.doc.length);
+    expect(b).toBeDefined();
+    a.table!();
+    b.table!();
+    const before = tableModelsBuilt();
+    markdownBlocksIn(state, 0, state.doc.length)[0].table!();
+    expect(tableModelsBuilt() - before).toBe(1);
   });
 });
 
@@ -128,6 +197,7 @@ const views: EditorView[] = [];
 afterEach(() => {
   while (views.length > 0) views.pop()!.destroy();
   vi.useRealTimers();
+  vi.restoreAllMocks();
 });
 
 function mount(doc: string, renderer: BlockRenderer, cursor = 0): EditorView {
@@ -186,6 +256,28 @@ describe("drawing the blocks", () => {
     }
   });
 
+  it("names the ids of each copy of one drawing apart, with its references kept", async () => {
+    const svg =
+      '<svg id="chart" aria-labelledby="chart-title"><title id="chart-title">t</title>' +
+      '<style>#chart .edge{stroke:red}</style><defs><marker id="arrow"></marker></defs>' +
+      '<path class="edge" marker-end="url(#arrow)"></path><use href="#arrow"></use></svg>';
+    const doc = `${DIAGRAM}\n\nbetween\n\n${DIAGRAM}\n\nend\n`;
+    const view = mount(doc, { renderMath: NEVER.renderMath, renderDiagram: async () => svg }, doc.indexOf("between"));
+    await settle();
+    const drawings = Array.from(view.dom.querySelectorAll(".cm-md-diagram[data-status='ready'] svg"));
+    expect(drawings).toHaveLength(2);
+    const ids = Array.from(view.dom.querySelectorAll("[id]")).map((element) => element.id);
+    expect(new Set(ids).size).toBe(ids.length);
+    for (const drawing of drawings) {
+      const own = (id: string) => drawing.querySelector(`[id="${id}"]`);
+      const marker = /^url\(#(.+)\)$/.exec(drawing.querySelector("path")!.getAttribute("marker-end")!)![1];
+      expect(own(marker)?.localName).toBe("marker");
+      expect(own(drawing.querySelector("use")!.getAttribute("href")!.slice(1))?.localName).toBe("marker");
+      expect(own(drawing.getAttribute("aria-labelledby")!)?.localName).toBe("title");
+      expect(drawing.querySelector("style")!.textContent).toBe(`#${drawing.id} .edge{stroke:red}`);
+    }
+  });
+
   it("draws a table from its text, with no renderer involved", () => {
     const view = mount(`intro\n\n${TABLE}\n`, NEVER);
     const cells = Array.from(view.dom.querySelectorAll(".cm-md-table-widget td")).map(
@@ -222,6 +314,81 @@ describe("drawing the blocks", () => {
     const frame = view.dom.querySelector(".cm-md-diagram[data-status='failed']");
     expect(frame?.querySelector(".cm-md-block-source")?.textContent).toBe("graph TD\n  A --> B");
     expect(frame?.querySelector(".cm-md-block-caption")?.textContent).toBe(diagramFailureCaption(2));
+  });
+
+  it("says when the renderer did not load, and asks again once the wait is over", async () => {
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "Date"] });
+    let attempts = 0;
+    const flaky: BlockRenderer = {
+      renderMath: NEVER.renderMath,
+      renderDiagram: async () => {
+        attempts++;
+        if (attempts === 1) throw new BlockRenderError("diagram", "the diagram runtime did not load", null, "runtime");
+        return `<svg class="drawn"><g></g></svg>`;
+      },
+    };
+    const doc = `intro\n\n${DIAGRAM}\n\nend\n`;
+    const view = mount(doc, flaky);
+    await vi.advanceTimersByTimeAsync(40);
+    const caption = view.dom.querySelector(".cm-md-diagram[data-status='failed'] .cm-md-block-caption");
+    expect(caption?.textContent).toBe(DIAGRAM_RUNTIME_CAPTION);
+    expect(caption?.textContent).not.toBe(diagramFailureCaption(null));
+    // An edit inside the wait does not ask again.
+    view.dispatch({ changes: { from: 0, insert: "a" } });
+    await vi.advanceTimersByTimeAsync(TYPING_PAUSE_MS + 40);
+    expect(attempts).toBe(1);
+    await vi.advanceTimersByTimeAsync(5000);
+    view.dispatch({ changes: { from: 0, insert: "b" } });
+    await vi.advanceTimersByTimeAsync(TYPING_PAUSE_MS + 40);
+    expect(attempts).toBe(2);
+    expect(view.dom.querySelector(".cm-md-diagram[data-status='ready'] svg.drawn")).not.toBeNull();
+  });
+
+  it("asks once for a diagram whose source has an error", async () => {
+    const renderDiagram = vi.fn(() => Promise.reject(new BlockRenderError("diagram", "Parse error on line 1", 1)));
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "Date"] });
+    const view = mount(`intro\n\n${DIAGRAM}\n\nend\n`, { renderMath: NEVER.renderMath, renderDiagram });
+    await vi.advanceTimersByTimeAsync(40);
+    await vi.advanceTimersByTimeAsync(10_000);
+    view.dispatch({ changes: { from: 0, insert: "a" } });
+    await vi.advanceTimersByTimeAsync(TYPING_PAUSE_MS + 40);
+    expect(renderDiagram).toHaveBeenCalledTimes(1);
+    expect(view.dom.querySelector(".cm-md-block-caption")?.textContent).toBe(diagramFailureCaption(1));
+  });
+
+  it("holds a diagram's space across a theme switch, from its height in the other theme", async () => {
+    const DRAWN = 183;
+    vi.spyOn(Element.prototype, "getBoundingClientRect").mockImplementation(function (this: Element) {
+      const height = this.classList.contains("cm-md-diagram") ? DRAWN : 0;
+      return { x: 0, y: 0, top: 0, left: 0, right: 0, bottom: height, width: 0, height, toJSON: () => ({}) } as DOMRect;
+    });
+    const source = "graph LR\n  Theme --> Switch";
+    const doc = `intro\n\n\`\`\`mermaid\n${source}\n\`\`\`\n\nend\n`;
+    const theme = new Compartment();
+    const view = new EditorView({
+      state: EditorState.create({
+        doc,
+        extensions: [
+          language(),
+          theme.of(EditorView.darkTheme.of(false)),
+          markdownBlocks({
+            renderMath: NEVER.renderMath,
+            renderDiagram: (_source, polarity) =>
+              polarity === "light" ? Promise.resolve(`<svg class="drawn"><g></g></svg>`) : new Promise(() => {}),
+          }),
+        ] as never,
+      }),
+      parent: document.body,
+    });
+    views.push(view);
+    ensureSyntaxTree(view.state, doc.length, 5000);
+    view.dispatch({ effects: setBlockWindow.of({ from: 0, to: doc.length }) });
+    await settle();
+    expect(measuredHeight(diagramKey(source, "light"))).toBe(DRAWN);
+    expect(measuredHeight(diagramKey(source, "dark"))).toBeUndefined();
+    view.dispatch({ effects: theme.reconfigure(EditorView.darkTheme.of(true)) });
+    const pending = view.dom.querySelector<HTMLElement>(".cm-md-diagram[data-status='pending']");
+    expect(pending?.style.minHeight).toBe(`${DRAWN}px`);
   });
 
   it("records drawings in one transaction per batch", async () => {

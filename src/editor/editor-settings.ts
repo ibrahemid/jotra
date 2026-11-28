@@ -2,6 +2,7 @@ import { EditorState, Prec, type Extension } from "@codemirror/state";
 import { EditorView } from "@codemirror/view";
 import { indentUnit } from "@codemirror/language";
 import { CSS_VAR } from "../styles/generated/tokens";
+import type { ReadingMeasure } from "../types/config";
 
 // The range Settings, Editor offers for Tab size. A config written by hand can
 // hold anything, so the editor holds the value to the same range.
@@ -32,20 +33,32 @@ export function indentationFor(tabSize: number): Extension {
   return [EditorState.tabSize.of(size), indentUnit.of(" ".repeat(size))];
 }
 
+function measureAt(token: string): Extension {
+  return Prec.high(EditorView.theme({ ".cm-content": { maxWidth: `var(${token})` } }));
+}
+
 /**
  * The reading measure: the text column stops at `--jotra-prose-measure` and
  * sits centered in the pane. Above the theme's own `maxWidth: none`.
  */
-export const readingMeasure: Extension = Prec.high(
-  EditorView.theme({
-    ".cm-content": { maxWidth: `var(${CSS_VAR.proseMeasure})` },
-  }),
-);
+export const readingMeasure: Extension = measureAt(CSS_VAR.proseMeasure);
+
+const READING_MEASURES: Readonly<Record<ReadingMeasure, Extension>> = {
+  narrow: measureAt(CSS_VAR.proseMeasureNarrow),
+  medium: readingMeasure,
+  wide: measureAt(CSS_VAR.proseMeasureWide),
+};
 
 /**
- * Settings, Editor, Reading width, for prose: a note or a text file. A source
- * file is read in columns of its own and keeps the width of the pane.
+ * Settings, Editor, Reading width, for prose: a note or a text file, at the
+ * width Line length picks. A source file is read in columns of its own and
+ * keeps the width of the pane.
  */
-export function readingWidthFor(enabled: boolean, code: boolean): Extension {
-  return enabled && !code ? readingMeasure : [];
+export function readingWidthFor(
+  enabled: boolean,
+  code: boolean,
+  measure: ReadingMeasure = "medium",
+): Extension {
+  if (!enabled || code) return [];
+  return READING_MEASURES[measure] ?? readingMeasure;
 }

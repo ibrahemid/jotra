@@ -4,6 +4,7 @@ mod bundle_rename;
 pub mod bus_subscribers;
 pub mod capture;
 pub mod commands;
+pub mod devtools;
 pub mod dictation;
 pub mod events;
 pub mod first_run;
@@ -668,7 +669,6 @@ pub fn run() {
             commands::update::restart_app,
             commands::preview::preview_list_renderers,
             commands::preview::preview_close,
-            commands::preview::preview_render,
             commands::preview::preview_force_render,
             commands::preview::preview_set_layout,
             commands::preview::preview_get_layout,
@@ -893,6 +893,11 @@ pub fn run() {
 
             if let Err(e) = hotkey::setup_global_hotkey(&handle) {
                 tracing::warn!(error = %e, "failed to register global hotkey");
+            }
+
+            #[cfg(debug_assertions)]
+            if let Err(e) = app.add_capability(devtools::devtools_toggle_capability()) {
+                tracing::warn!(error = %e, "failed to grant the devtools toggle");
             }
 
             {

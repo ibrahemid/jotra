@@ -1290,16 +1290,6 @@ export async function previewListRenderers(): Promise<PreviewRendererInfo[]> {
   return invoke("preview_list_renderers");
 }
 
-export async function previewRender(
-  bufferId: string,
-  contentType: string,
-  text: string,
-  theme: ThemePolarity,
-  zoom: number,
-): Promise<PreviewRenderResult> {
-  return invoke("preview_render", { bufferId, contentType, text, theme, zoom });
-}
-
 export async function previewForceRender(
   bufferId: string,
   contentType: string,

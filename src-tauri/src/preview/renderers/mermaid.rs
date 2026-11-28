@@ -1,7 +1,7 @@
 //! Mermaid renderer + shared runtime injection — ADR-009 roster, L5.
 //!
 //! Mermaid diagrams render client-side from a bundled, offline runtime
-//! (`mermaid.min.js`, the v11.15.0 single-file IIFE) served **same-origin**
+//! (`mermaid.min.js`, the single-file IIFE of the installed `mermaid`) served **same-origin**
 //! under the `_assets/` route, as is the first-party init script that
 //! configures and runs it. Both are loaded from the document origin (a
 //! cross-origin `jotra-preview://chrome` subresource is refused by that scope's

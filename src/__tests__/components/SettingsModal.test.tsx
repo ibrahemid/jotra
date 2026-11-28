@@ -613,6 +613,35 @@ describe("SettingsModal", () => {
     expect(saved.preview.default_layout_markdown).toBe("source");
   });
 
+  it("offers three line lengths while reading width is on and writes the choice", async () => {
+    mocks.config.mockReturnValue({ ...baseConfig(), editor: { ...baseConfig().editor, reading_width: true } });
+    const { container } = render(() => <SettingsModal />);
+    openSettings("editor");
+    await waitFor(() => expect(container.querySelector("[data-section='editor']")).not.toBeNull());
+    const select = container.querySelector<HTMLSelectElement>("[data-setting='reading_measure']")!;
+    expect(Array.from(select.options).map((o) => [o.value, o.text])).toEqual([
+      ["narrow", "Narrow"],
+      ["medium", "Medium"],
+      ["wide", "Wide"],
+    ]);
+    expect(select.disabled).toBe(false);
+    expect(select.value).toBe("medium");
+    fireEvent.change(select, { target: { value: "wide" } });
+    await waitFor(() => expect(mocks.save).toHaveBeenCalledTimes(1));
+    const saved = mocks.save.mock.calls[0][0] as JotraConfig;
+    expect(saved.editor).toMatchObject({ reading_width: true, reading_measure: "wide" });
+  });
+
+  it("holds the line length row until reading width is on", async () => {
+    const { container } = render(() => <SettingsModal />);
+    openSettings("editor");
+    await waitFor(() => expect(container.querySelector("[data-section='editor']")).not.toBeNull());
+    const row = container.querySelector<HTMLElement>("[data-setting-id='editor.reading_measure']")!;
+    const select = row.querySelector<HTMLSelectElement>("[data-setting='reading_measure']")!;
+    expect(select.disabled).toBe(true);
+    expect(row.textContent).toContain("Turn on Reading width to pick a line length.");
+  });
+
   it("offers no markdown typography row", async () => {
     const { container } = render(() => <SettingsModal />);
     openSettings("editor");

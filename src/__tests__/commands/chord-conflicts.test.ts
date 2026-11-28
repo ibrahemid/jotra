@@ -1,6 +1,7 @@
 import { describe, it, expect } from "vitest";
 import { MENU_COMMANDS } from "../../commands/menu-commands";
 import { EDITOR_COMMAND_KEYS } from "../../editor/editor-command-keys";
+import { FOLD_COMMANDS } from "../../editor/folding";
 import { APP_REGISTRATIONS, APP_TSX_COUNTS, DICTATION_REGISTRATIONS } from "./app-registrations";
 
 // Three tables hand out chords, and until now each was only checked against
@@ -32,6 +33,10 @@ function claims(): Map<string, Set<string>> {
   }
   for (const entry of MENU_COMMANDS) {
     if (entry.accelerator) claim(entry.accelerator, entry.id);
+  }
+  for (const fold of FOLD_COMMANDS) {
+    claim(fold.mac, fold.id);
+    claim(fold.other, fold.id);
   }
 
   return byChord;
