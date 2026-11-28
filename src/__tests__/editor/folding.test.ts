@@ -122,7 +122,11 @@ describe("heading fold controls", () => {
 
   it("styles a right-to-left control by the attribute, which the build does not lower", () => {
     const css = readFileSync(resolve(process.cwd(), "src/components/Editor/cm-markdown-typography.css"), "utf8");
-    const rule = (selector: string) => css.match(new RegExp(`${selector.replace(/[.[\]"]/g, "\\$&")} \\{([^}]*)\\}`))?.[1] ?? "";
+    const rule = (selector: string) => {
+      const open = css.indexOf(`${selector} {`);
+      const close = open < 0 ? -1 : css.indexOf("}", open);
+      return close < 0 ? "" : css.slice(open + selector.length + 2, close);
+    };
     expect(rule('.cm-editor .cm-md-fold[data-dir="rtl"] .cm-md-fold-control')).toMatch(/right: auto;[\s\S]*left: 0\.3em;/);
     expect(rule('.cm-editor .cm-md-fold[data-folded][data-dir="rtl"] .cm-fold-chevron')).toContain("rotate(90deg)");
     expect(css).not.toMatch(/:dir\(|inset-inline/);
