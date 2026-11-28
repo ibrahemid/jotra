@@ -44,21 +44,36 @@ serde_json = "1"
 tracing = "0.1"
 url = "2"
 
+# The keyring-core API with one store crate per platform, the crates the
+# `keyring` crate wraps; taken directly so Linux links the libdbus store alone.
+[target.'cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))'.dependencies]
+keyring-core = "1"
+
 [target.'cfg(target_os = "macos")'.dependencies]
-keyring = { version = "3", features = ["apple-native"] }
+apple-native-keyring-store = { version = "1", features = ["keychain"] }
 
 [target.'cfg(target_os = "windows")'.dependencies]
-keyring = { version = "3", features = ["windows-native"] }
+windows-native-keyring-store = { version = "1", default-features = false }
 
 # The Secret Service over libdbus, through the `dbus` 0.9 crate tao already
-# links on Linux. keyring 3's zbus backend needs zbus 4, and the tree's zbus is
-# 5 (tauri-plugin-single-instance), so that backend would add a second copy.
+# links on Linux; the zbus store would add zbus 4 beside the tree's zbus 5.
 # `crypto-rust` encrypts the session the secret crosses the bus in, without
 # OpenSSL.
 [target.'cfg(target_os = "linux")'.dependencies]
-keyring = { version = "3", features = ["sync-secret-service", "crypto-rust"] }
+dbus-secret-service-keyring-store = { version = "1", features = ["crypto-rust"] }
 
 [dev-dependencies]
 tempfile = "3"
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "time", "test-util", "net", "io-util"] }
 tracing-subscriber = { version = "0.3", default-features = false, features = ["registry", "std"] }
+
+# Each OS store's tests write an item the way keyring 3 did, through the
+# platform API the store crate already links.
+[target.'cfg(target_os = "macos")'.dev-dependencies]
+security-framework = "3"
+
+[target.'cfg(target_os = "windows")'.dev-dependencies]
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Security_Credentials"] }
+
+[target.'cfg(target_os = "linux")'.dev-dependencies]
+dbus-secret-service = { version = "4.1", features = ["crypto-rust"] }

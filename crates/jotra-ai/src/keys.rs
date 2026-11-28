@@ -131,14 +131,34 @@ impl std::error::Error for KeyStoreUnread {}
 /// the in-memory fallback.
 #[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
 mod keychain {
-    use keyring::{Entry, Error};
+    use std::sync::Arc;
+
+    use keyring_core::{CredentialStore, Entry, Error};
 
     /// Keychain service name under which provider keys are stored. The account
     /// is the provider id, so switching providers keeps independent keys.
     const KEYCHAIN_SERVICE: &str = "com.writ.ai";
 
+    #[cfg(target_os = "macos")]
+    fn platform_store() -> keyring_core::Result<Arc<CredentialStore>> {
+        Ok(apple_native_keyring_store::keychain::Store::new()?)
+    }
+
+    #[cfg(target_os = "windows")]
+    fn platform_store() -> keyring_core::Result<Arc<CredentialStore>> {
+        Ok(windows_native_keyring_store::Store::new()?)
+    }
+
+    /// The Secret Service store connects to the bus when it is built, so one
+    /// built per call keeps answering once a Secret Service starts.
+    #[cfg(target_os = "linux")]
+    fn platform_store() -> keyring_core::Result<Arc<CredentialStore>> {
+        Ok(dbus_secret_service_keyring_store::Store::new()?)
+    }
+
     fn entry(account: &str) -> Result<Entry, String> {
-        Entry::new(KEYCHAIN_SERVICE, account).map_err(|e| e.to_string())
+        let store = platform_store().map_err(|e| e.to_string())?;
+        Entry::new_in_store(&store, KEYCHAIN_SERVICE, account).map_err(|e| e.to_string())
     }
 
     pub fn set(account: &str, key: &str) -> Result<(), String> {

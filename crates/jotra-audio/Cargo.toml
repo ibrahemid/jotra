@@ -17,7 +17,7 @@ publish = false
 jotra-core = { path = "../jotra-core" }
 # Pinned: an upgrade of either is a deliberate change to the capture path.
 cpal = "=0.18.2"
-rubato = "=5.0.1"
+rubato = "=5.1.0"
 tokio = { version = "1", default-features = false, features = ["sync"] }
 tracing = "0.1"
 thiserror = "2"
