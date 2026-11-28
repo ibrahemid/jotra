@@ -84,6 +84,57 @@ class BumpReleaseJsonTest(unittest.TestCase):
             "https://github.com/ibrahemid/jotra/releases/download/v0.5.0/Jotra_0.5.0_x64_en-US.msi",
         )
 
+    def test_the_download_urls_name_the_installers_the_release_publishes(self) -> None:
+        base = "https://github.com/ibrahemid/jotra/releases/download"
+        data = {
+            **RELEASE_JSON,
+            "platforms": {
+                "mac": {
+                    "dmg": f"{base}/v0.3.4/Earlier_0.3.4_universal.dmg",
+                    "pkg": f"{base}/v0.3.4/Earlier_0.3.4_universal.pkg",
+                },
+                "win": {"msi": f"{base}/v0.3.4/Earlier_0.3.4_x64_en-US.msi"},
+                "linux": {
+                    "deb": f"{base}/v0.3.4/Earlier_0.3.4_amd64.deb",
+                    "appImage": f"{base}/v0.3.4/Earlier_0.3.4_amd64.AppImage",
+                },
+            },
+        }
+
+        bumped = self.bump("1.2.0-1", data=data)
+
+        self.assertEqual(
+            bumped["platforms"],
+            {
+                "mac": {
+                    "dmg": f"{base}/v1.2.0-1/Jotra_1.2.0-1_universal.dmg",
+                    "pkg": f"{base}/v1.2.0-1/Jotra_1.2.0-1_universal.pkg",
+                },
+                "win": {"msi": f"{base}/v1.2.0-1/Jotra_1.2.0-1_x64_en-US.msi"},
+                "linux": {
+                    "deb": f"{base}/v1.2.0-1/Jotra_1.2.0-1_amd64.deb",
+                    "appImage": f"{base}/v1.2.0-1/Jotra_1.2.0-1_amd64.AppImage",
+                },
+            },
+        )
+
+    def test_a_url_naming_no_installer_is_refused(self) -> None:
+        url = "https://github.com/ibrahemid/jotra/releases/download/v0.3.4/Jotra_0.3.4_arm64.zip"
+
+        with self.assertRaises(bump_version.BumpError):
+            bump_version.get_installer_url(url, "0.3.4", "0.5.0")
+
+    def test_a_url_of_another_version_is_refused(self) -> None:
+        data = {
+            **RELEASE_JSON,
+            "platforms": {
+                "macos": {"dmg": "https://github.com/ibrahemid/jotra/releases/download/v0.3.3/Jotra_0.3.3_universal.dmg"},
+            },
+        }
+
+        with self.assertRaises(bump_version.BumpError):
+            self.bump(data=data)
+
     def test_the_date_is_left_to_the_site_deploy(self) -> None:
         # The bump has no date to give: publishedAt is the release's, and the
         # deploy rewrites the whole file from the published release.

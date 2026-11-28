@@ -160,7 +160,7 @@ jobs:
             - `packaging/aur/writ-bin/PKGBUILD` + regenerated `.SRCINFO`
 
             Follow-up submission steps (manual):
-            - Copy the updated cask into the `homebrew-writ` tap repo and push.
+            - Copy the updated cask and `cask_renames.json` into the `homebrew-writ` tap repo, remove `Casks/writ.rb`, and push.
             - Open a PR in `microsoft/winget-pkgs` with the new version folder.
             - Push the updated PKGBUILD and `.SRCINFO` to the AUR `writ-bin` remote.
 

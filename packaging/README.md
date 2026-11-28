@@ -6,7 +6,7 @@ This directory documents Jotra's package-manager release channels and holds thei
 
 | Platform | Install |
 |---|---|
-| macOS | `brew install --cask ibrahemid/writ/jotra` |
+| macOS | `brew install --cask ibrahemid/writ/writ` |
 | Windows | `winget install -e --id ibrahemid.Writ` |
 | Any Linux | `curl -fsSL https://github.com/ibrahemid/jotra/raw/main/install.sh \| sh` |
 | Arch Linux | `yay -S writ-bin` (or any AUR helper) |
@@ -17,6 +17,7 @@ This directory documents Jotra's package-manager release channels and holds thei
 packaging/
   homebrew/                   # Homebrew cask (self-hosted tap)
     Casks/jotra.rb
+    cask_renames.json
     README.md
   winget/                     # winget manifests for microsoft/winget-pkgs
     manifests/i/ibrahemid/Writ/<version>/
@@ -24,21 +25,23 @@ packaging/
   aur/                        # Arch User Repository package
     writ-bin/
       PKGBUILD
+      .SRCINFO
     README.md
 ```
 
 Each subdirectory has its own README covering the channel-specific submission process. Start there if you are publishing a channel for the first time.
 
-## Channel status
+## Release step per channel
 
-| Channel | Status | Notes |
-|---|---|---|
-| Homebrew (self-hosted tap) | Live | Each release needs the cask copied to `github.com/ibrahemid/homebrew-writ` after the bump PR merges. |
-| Homebrew upstream | Not submitted | The self-hosted tap is the Homebrew channel. |
-| winget | Live | Each release needs a new manifest PR in `microsoft/winget-pkgs`. |
-| AUR `writ-bin` | Live | Each release needs `PKGBUILD` and `.SRCINFO` pushed to `ssh://aur@aur.archlinux.org/writ-bin.git`. |
-| Flatpak | Not configured | The repository has no Flatpak manifest. |
-| Snap | Not configured | The repository has no `snapcraft.yaml`. |
+After the packaging bump PR merges, each channel takes one manual step:
+
+| Channel | Step |
+|---|---|
+| Homebrew tap `github.com/ibrahemid/homebrew-writ` | Copy `Casks/jotra.rb` and `cask_renames.json` into the tap, remove `Casks/writ.rb`, and push. |
+| winget | Open a manifest PR in `microsoft/winget-pkgs`. |
+| AUR `writ-bin` | Push `PKGBUILD` and `.SRCINFO` to `ssh://aur@aur.archlinux.org/writ-bin.git`. |
+
+The repository has no Flatpak manifest and no `snapcraft.yaml`.
 
 ## Artifact names (source of truth)
 
@@ -89,7 +92,7 @@ If these filenames change, update `.github/workflows/packages.yml` and the three
    - `packaging/aur/writ-bin/PKGBUILD` and regenerates `.SRCINFO`
 4. Opens a PR titled `chore(packaging): bump distribution manifests to v<version>` on the `packages/bump-<version>` branch.
 
-The PR is NOT auto-merged. A human reviews the numbers before merging. After the PR merges, each channel has a short manual push step described in its own README.
+The PR is NOT auto-merged. A human reviews the numbers before merging. After the PR merges, each channel takes the step in the table above.
 
 The workflow also accepts `workflow_dispatch` with a `tag` input for replays and for bumping against a past release if the automatic run failed.
 
@@ -110,15 +113,3 @@ VERSION=0.2.0 \
 SHA_UNIVERSAL=0000000000000000000000000000000000000000000000000000000000000000 \
 python3 scripts/packaging_bump_homebrew.py
 ```
-
-## Placeholders in source-controlled manifests
-
-Each manifest ships with placeholders rather than real SHAs so the files are readable in the repo and the first release cycle starts clean.
-
-| File | Placeholder | Replaced by |
-|---|---|---|
-| `packaging/homebrew/Casks/jotra.rb` | `__SHA256_UNIVERSAL__` | `packages.yml` |
-| `packaging/winget/.../installer.yaml` | `__SHA256_MSI__` | `packages.yml` |
-| `packaging/aur/writ-bin/PKGBUILD` | `__SHA256_APPIMAGE__` | `packages.yml` |
-
-Replacing these by hand for the first release is also supported; just run the dry-run command above and commit the result.

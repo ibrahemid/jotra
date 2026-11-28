@@ -32,8 +32,7 @@ later release can reach them, and each person has to reinstall by hand.
 ### 1.2 Install the public key into `tauri.conf.json`
 
 Copy the contents of `~/.tauri/writ.key.pub` and paste the base64 string into
-`src-tauri/tauri.conf.json` under `plugins.updater.pubkey`, replacing the
-`REPLACE_WITH_PUBLIC_KEY_FROM_TAURI_SIGNER_GENERATE` placeholder.
+`src-tauri/tauri.conf.json` under `plugins.updater.pubkey`.
 
 Commit that change on a branch and merge via PR. Never commit the private key.
 
@@ -72,9 +71,9 @@ repository secret of the same name under `Settings` -> `Secrets and variables`
 exist, so moving a secret is safe in this order: add it to the environment,
 then delete the repository copy.
 
-**Windows signing.** `sign-windows` signs the sidecar, the app executable and
-the MSI through `bundle.windows.signCommand`, with signtool and an Azure
-Artifact Signing account. Setting one up:
+**Windows signing.** `sign-windows` signs the command under both its names,
+the app executable, the legacy launcher `writ-tauri.exe` and the MSI, with
+signtool and an Azure Artifact Signing account. Setting one up:
 
 1. Create an Artifact Signing account and a public-trust certificate profile
    in Azure, which includes Microsoft's identity validation.
@@ -112,7 +111,7 @@ client flow lives in `src-tauri/src/commands/update.rs`:
   an update genuinely exists and never auto-installs.
 - "Check for Updates…" (app menu) and the `app.check_updates` command run a
   user-visible check.
-- The `UpdateBanner` component (backed by `src/stores/update.ts`) prompts the
+- The `UpdateBanner` component (backed by `src/stores/global/update.ts`) prompts the
   user to install, shows download progress, and offers "Restart now".
 
 No further one-time code change is required.
@@ -166,8 +165,9 @@ semver (e.g. `0.1.0`, `0.2.0-1`). The workflow updates:
 - `src-tauri/tauri.conf.json` (top-level `version`)
 - `package.json` (top-level `version`)
 - `site/package.json` (top-level `version`)
-- `site/src/data/release.json` (version, tag and download URLs; the artifact
-  fields are cleared)
+- `site/src/data/release.json` (version, tag, and download URLs naming the
+  installers in `.github/scripts/release_assets.py`; the artifact fields are
+  cleared)
 
 It opens a PR against `main` by default. A PR the workflow opens does not start
 CI, so the changelog commit from §2.2, pushed to the same branch, is what runs
@@ -249,8 +249,9 @@ Before tagging:
    rustup installs the compiler `rust-toolchain.toml` pins on the first cargo
    command, the same one CI and the release workflow use.
 
-The script ends by printing the tag command, reading the version from
-`site/package.json`:
+The script ends by printing the `git tag` and `git push` commands, which read
+the version from `site/package.json`. Run them on an up-to-date `main` after
+the bump PR merges:
 
 ```bash
 git checkout main
@@ -281,7 +282,9 @@ job restores or saves an Actions cache: every release build starts cold.
    - `macos-latest`  universal binary (`aarch64` + `x86_64` merged), producing
      `Jotra.app`, ad-hoc signed, inside `Jotra_<version>_universal.dmg`.
    - `windows-latest`  x64, producing `Jotra_<version>_x64_en-US.msi`, plus the
-     two executables `sign-windows` signs.
+     executables `sign-windows` signs: `jotra-tauri.exe`, the command under
+     both names in `bundle.externalBin`, and the legacy launcher
+     `writ-tauri.exe`.
    - `ubuntu-22.04`  x64, producing `Jotra_<version>_amd64.deb`,
      `Jotra_<version>_amd64.AppImage` and
      `Jotra_<version>_amd64.AppImage.source-offer.md`, the table of system
@@ -301,9 +304,12 @@ job restores or saves an Actions cache: every release build starts cold.
 5. `sign-macos` signs, notarizes and staples the app, the `.pkg` and the
    `.dmg`, and archives the signed app as the updater payload
    `Jotra_<version>_universal.app.tar.gz` (below).
-6. `sign-windows` rebuilds the MSI around the build's executables with
-   `tauri bundle`, signing each through `bundle.windows.signCommand`. It runs
-   only when a Windows signing account exists.
+6. `sign-windows` signs the legacy launcher `writ-tauri.exe`, which a WiX
+   fragment adds outside what the bundler signs, then rebuilds the MSI around
+   the build's executables with `tauri bundle`, which signs the command under
+   both names, the app executable and the MSI through
+   `bundle.windows.signCommand`. It runs only when a Windows signing account
+   exists.
 7. `sign-updater` checks out the release scripts and `tauri.conf.json` only,
    installs a pinned minisign (`scripts/install-minisign.sh`), and refuses any
    input file missing or extra. It signs each updater payload as
@@ -314,9 +320,20 @@ job restores or saves an Actions cache: every release build starts cold.
    writes `latest.json` (the Tauri updater manifest). It then verifies all of
    it against the key of the latest published release (1.5).
 8. `attest-sboms` attests each SBOM against the installers it describes.
-9. `publish`, the only job that can write release assets (`attest-sboms`
-   writes attestations), downloads the
-   signed set, refuses a missing or extra file and any checksum mismatch,
+9. Six upgrade jobs install the previous release, then this build over it:
+   `deb-upgrade`, `deb-desktop-upgrade` (the desktop integration through a deb
+   update), `install-sh-upgrade`, `aur-upgrade` (`writ-bin` built from this
+   repository's PKGBUILD), `msi-upgrade` (default and custom install folder)
+   and `macos-upgrade` (the updater's swap over a user-owned app from the
+   previous `.app.tar.gz` and an admin-owned app from the previous `.pkg`).
+   `PREVIOUS_TAG` in each job names the release it installs first, and
+   `.github/scripts/test_release_workflow.py` pins it.
+   `.github/workflows/upgrade-checks.yml` runs the same six jobs on a manual
+   run and on a pull request that changes a file its `paths` list names.
+10. `publish` runs only when `sign-updater`, `attest-sboms` and the six
+   upgrade jobs pass. The only job that can write release assets
+   (`attest-sboms` writes attestations), it downloads the signed set,
+   refuses a missing or extra file and any checksum mismatch,
    attests build provenance for every asset, creates (or reuses) the **draft**
    release with the notes, and uploads the assets.
 
@@ -490,13 +507,17 @@ check:
 - The Linux one-liner resolves the new tag:
 
   ```bash
-  curl -s https://api.github.com/repos/ibrahemid/jotra/releases/latest | jq -r .tag_name
+  curl -fsSI https://github.com/ibrahemid/jotra/releases/latest | grep -i '^location:'
   ```
 
-  This must print the tag you just published. `install.sh` reads that endpoint
-  to decide which release to download, and a draft release is not served by it.
-- The packaging bump PR carries the right SHAs. Merge it, then follow the
-  per-channel push steps in `packaging/README.md`.
+  The location must end in the tag you just published. `install.sh` reads the
+  tag from that redirect to decide which release to download, and a draft
+  release is not served by it.
+- The packaging bump PR carries the right SHAs. Merge it, then take each
+  channel's push step in `packaging/homebrew/README.md`,
+  `packaging/winget/README.md` and `packaging/aur/README.md`. The Homebrew step
+  copies `Casks/jotra.rb` and `cask_renames.json` into the tap and removes
+  `Casks/writ.rb` there.
 
 ## 3. Release-candidate builds
 
@@ -625,8 +646,9 @@ in **debug builds only**; a release binary ignores both.
    python3 -m http.server 8000
    ```
 
-4. Run a lower-version debug build pointed at the local endpoint with the
-   matching test public key (contents of `/tmp/jotra-test.key.pub`):
+4. Revert the version bump from step 2, then run a lower-version debug build
+   pointed at the local endpoint with the matching test public key (contents
+   of `/tmp/jotra-test.key.pub`):
 
    ```bash
    JOTRA_UPDATER_ENDPOINT="http://localhost:8000/latest.json" \
@@ -637,14 +659,13 @@ in **debug builds only**; a release binary ignores both.
 5. Trigger "Check for Updates…", click **Install**, watch the progress bar,
    then **Restart now**. Confirm the app relaunches reporting `0.9.0`.
 
-Revert the version bumps from step 2 before committing.
-
 ## 7. Related files
 
 - `.github/workflows/release.yml`         release pipeline
 - `.github/workflows/bump-version.yml`    version bump automation
 - `.github/workflows/packages.yml`        post-release manifest bumps
 - `.github/workflows/site.yml`            site deploy, release.json sync
+- `.github/workflows/upgrade-checks.yml`  the release's upgrade jobs, on pull requests
 - `.github/scripts/bump_version.py`       version bump implementation
 - `.github/scripts/release_notes.py`      draft release notes and their range
 - `.github/scripts/build_latest_json.py`  updater manifest builder

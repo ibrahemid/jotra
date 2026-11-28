@@ -17,7 +17,7 @@ What Jotra does, at the level of detail that answers "does it do X".
 - Open tabs and unsaved text come back after a restart or a crash.
 - Binary files open as hex. Large files open with syntax colouring off.
 - A file over 50 MiB asks before it opens and says how large it is. A file over 500 MiB (524 MB) doesn't open, and Jotra says why. Jotra measures the tabs it restores at launch as it starts: one over 50 MiB asks when it is shown, and one over 500 MiB says why.
-- On macOS, Jotra can register as the app that opens text, config, data and source files (Settings, Integrations).
+- On macOS and Linux, Jotra can register as the app that opens text, config, data and source files (Settings, Integrations).
 
 ## Markdown
 

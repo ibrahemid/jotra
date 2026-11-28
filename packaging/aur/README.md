@@ -13,6 +13,7 @@ paru -S writ-bin
 ```
 packaging/aur/writ-bin/
   PKGBUILD    # Arch build recipe pulling the official AppImage from GitHub Releases
+  .SRCINFO    # package metadata the AUR reads, generated from the PKGBUILD
 ```
 
 Package name: `writ-bin`. The `-bin` suffix follows AUR convention for packages that ship a prebuilt binary rather than compiling from source. If we add a from-source package later it will live at `packaging/aur/jotra/`.
@@ -76,6 +77,6 @@ git commit -m "writ-bin <version>-1"
 git push origin HEAD:master
 ```
 
-AUR only accepts `master`, and a fresh clone checks out whatever `init.defaultBranch` says, so push `HEAD:master` rather than `master`. Copy the two files by name; `packaging/aur/` carries a `.DS_Store`. The AUR server validates `.SRCINFO` against the `PKGBUILD` on push and rejects the push if they disagree, which is what makes the script-generated `.SRCINFO` safe to ship without an Arch host.
+AUR only accepts `master`, and a fresh clone checks out whatever `init.defaultBranch` says, so push `HEAD:master` rather than `master`. Copy the two files by name. The AUR server validates `.SRCINFO` against the `PKGBUILD` on push and rejects the push if they disagree, which is what makes the script-generated `.SRCINFO` safe to ship without an Arch host.
 
 A follow-up improvement is to push directly from the workflow using a deploy key registered with the AUR account.

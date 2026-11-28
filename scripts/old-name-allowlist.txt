@@ -20,6 +20,11 @@ scripts/deb_legacy_entries.py :lines /(?i)legacy/ -- legacy: deb command, launch
 scripts/gen-legacy-progids.py :lines /(?i)legacy/ -- legacy: generator for the old ProgIDs
 packaging/aur/writ-bin/** -- legacy: AUR package keeps its name
 **/cask_renames.json -- legacy: tap rename map from the old cask
+README.md :text /\bibrahemid\/writ\/writ\b|\bCasks\/writ\.rb\b/ -- legacy: old cask token and file the tap serves until a release's tap step removes the file
+packaging/README.md :text /\bibrahemid\/writ\/writ\b|\bCasks\/writ\.rb\b/ -- legacy: old cask token and file the tap serves until a release's tap step removes the file
+packaging/homebrew/README.md :text /\bibrahemid\/writ\/writ\b|\bCasks\/writ\.rb\b/ -- legacy: old cask token and file the tap serves until a release's tap step removes the file
+docs/RELEASING.md :text /\bibrahemid\/writ\/writ\b|\bCasks\/writ\.rb\b/ -- legacy: old cask token and file the tap serves until a release's tap step removes the file
+.github/workflows/packages.yml :text /\bibrahemid\/writ\/writ\b|\bCasks\/writ\.rb\b/ -- legacy: old cask token and file the tap serves until a release's tap step removes the file
 packaging/homebrew/Casks/*.rb :from /^\s*uninstall\b/ -- legacy: cask uninstall and zap paths
 install.sh :lines /(?i)legacy/ -- legacy: installer branch for old installs
 scripts/build-mac-pkg.sh :lines /(?i)legacy/ -- legacy: pkg branch for old installs
@@ -66,7 +71,7 @@ README.md :text /Jotra was called Writ through version 1\.0\.1\.|`writ`|`open_in
 CHANGELOG.md :text /Writ is now called Jotra\.|started as Writ\b|`(?:writ|~\/\.writ|~\/Writ|writ:\/\/|WRIT_\*|open_in_writ)`/ -- former name and kept values in the unreleased notes
 docs/ARCHITECTURE.md :text /`(?:~\/Writ|~\/\.writ|writ\.db)`/ -- kept: data folder, notes folder and index of earlier installs
 docs/FEATURES.md :text /`(?:~\/Writ|writ|writ mcp|writ:\/\/)`|\bran Writ\b|\bopen_in_writ\b/ -- kept: notes folder, command, MCP server name and tool, link scheme
-docs/RELEASING.md :text /`~\/Writ`|\bran\s+Writ\b/ -- kept: notes folder of earlier installs
+docs/RELEASING.md :text /`~\/Writ`|\bran\s+Writ\b|`writ-tauri\.exe`/ -- kept: notes folder of earlier installs and the legacy launcher
 docs/cli-verbs.md :text /`(?:WRIT_NOTES_DIR|WRIT_DATA_DIR|~\/Writ|~\/\.writ|writ\.db|Writ|writ|writ mcp|open_in_writ)`|\bran\s+Writ\b/ -- kept: variables, folders, index, command and MCP names of earlier installs
 docs/importing-from-obsidian.md :text /`~\/\.writ`|\bran Writ\b/ -- kept: data folder of earlier installs
 docs/integrations/claude-code.md :text /`(?:writ|writ\.exe|open_in_writ|mcp__writ__open_in_writ)`/ -- kept: command, MCP server name and tool

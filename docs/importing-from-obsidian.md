@@ -55,8 +55,10 @@ install: switch on Connections, Tags and Graph under Settings, Apps.
 
 Settings, the index and earlier versions of each file live in Jotra's data
 folder (`~/.jotra`, or `~/.writ` on a machine that ran Writ), not beside your
-files. Inside the folder Jotra writes the files you create and edit, and a dated
-conflict copy beside a file when a save would overwrite a newer version on disk.
+files. Inside the folder Jotra writes the files you create and edit, images you
+paste or drop (in `assets`, or the folder Settings, General, Image folder names),
+and a dated conflict copy beside a file when a save would overwrite a newer
+version on disk.
 
 Implementation: `crates/jotra-storage/src/notes_index/`, with the folder this
 page describes as a fixture in
