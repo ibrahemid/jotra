@@ -113,7 +113,7 @@ const NO_KEY: AiKeyState = { is_set: false, memory_only: false };
 export function getEndpointState(ai: AiConfig, key: AiKeyState): AiEndpointState {
   const target = resolveEndpoint(getEffectiveBaseUrl(ai));
   if (!target) {
-    return { host: null, host_port: null, is_hosted: false, is_private_network: false, is_allowed: false, is_consented: false, provider: ai.provider, key_state: key, is_on_device: false };
+    return { host: null, host_port: null, is_hosted: false, is_private_network: false, is_allowed: false, is_consented: false, provider: ai.provider, key_state: key, sends_key: false, is_on_device: false };
   }
   return {
     host: target.host,
@@ -124,6 +124,7 @@ export function getEndpointState(ai: AiConfig, key: AiKeyState): AiEndpointState
     is_consented: !target.is_hosted || isConsented(ai, target.host),
     provider: ai.provider,
     key_state: target.is_hosted ? key : NO_KEY,
+    sends_key: target.is_hosted && key.is_set,
     is_on_device: false,
   };
 }
@@ -142,6 +143,7 @@ export function getChatState(ai: AiConfig, key: AiKeyState): ChatEndpointState {
     is_allowed: state.is_allowed,
     is_consented: state.is_consented,
     key_state: state.key_state,
+    sends_key: state.sends_key,
     is_on_device: state.is_on_device,
   };
 }

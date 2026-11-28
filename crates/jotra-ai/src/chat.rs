@@ -107,9 +107,98 @@ struct LiveRequest {
 #[derive(Default, Clone)]
 pub struct ChatState {
     tasks: Arc<Mutex<HashMap<String, LiveRequest>>>,
+    earlier: EarlierTexts,
+}
+
+/// How many earlier texts [`EarlierTexts`] holds at once.
+const EARLIER_TEXTS_MAX: usize = 32;
+
+/// How many bytes of earlier text [`EarlierTexts`] holds at once.
+const EARLIER_TEXTS_MAX_BYTES: usize = 16 * 1024 * 1024;
+
+/// What a file outside the notes folder held before a card's Apply wrote it,
+/// kept for this session so the card can offer Undo.
+///
+/// A note's earlier text is a version in the folder's history. A file outside
+/// the folder has no history, and a copy on disk would be a second copy of
+/// somebody else's file, so the text lives in memory until Undo puts it back or
+/// the app quits. The oldest is dropped first once the store holds
+/// [`EARLIER_TEXTS_MAX`] texts or [`EARLIER_TEXTS_MAX_BYTES`] bytes.
+#[derive(Default, Clone)]
+pub struct EarlierTexts {
+    kept: Arc<Mutex<std::collections::VecDeque<EarlierText>>>,
+}
+
+struct EarlierText {
+    key: String,
+    before_hash: String,
+    text: String,
+}
+
+impl EarlierTexts {
+    /// Keeps what the file `key` held when it matched `before_hash`, returning
+    /// false for a text larger than the whole store.
+    pub fn keep(&self, key: &str, before_hash: &str, text: String) -> bool {
+        if text.len() > EARLIER_TEXTS_MAX_BYTES {
+            return false;
+        }
+        let mut kept = recover_poison(self.kept.lock(), "jotra_ai::chat::EarlierTexts::keep");
+        kept.retain(|entry| !(entry.key == key && entry.before_hash == before_hash));
+        kept.push_back(EarlierText {
+            key: key.to_string(),
+            before_hash: before_hash.to_string(),
+            text,
+        });
+        while kept.len() > EARLIER_TEXTS_MAX
+            || kept.iter().map(|entry| entry.text.len()).sum::<usize>() > EARLIER_TEXTS_MAX_BYTES
+        {
+            kept.pop_front();
+        }
+        true
+    }
+
+    /// Whether the text `key` held at `before_hash` is kept.
+    pub fn has(&self, key: &str, before_hash: &str) -> bool {
+        self.text(key, before_hash).is_some()
+    }
+
+    fn text(&self, key: &str, before_hash: &str) -> Option<String> {
+        recover_poison(self.kept.lock(), "jotra_ai::chat::EarlierTexts::text")
+            .iter()
+            .find(|entry| entry.key == key && entry.before_hash == before_hash)
+            .map(|entry| entry.text.clone())
+    }
+
+    fn forget(&self, key: &str, before_hash: &str) {
+        recover_poison(self.kept.lock(), "jotra_ai::chat::EarlierTexts::forget")
+            .retain(|entry| !(entry.key == key && entry.before_hash == before_hash));
+    }
+}
+
+/// Where a card's Undo finds the text it puts back.
+#[derive(Clone, Copy, Default)]
+pub struct UndoSources<'a> {
+    /// The notes folder's version history.
+    pub history: Option<&'a jotra_storage::note_history::NoteHistoryStore>,
+    /// This session's earlier texts of files outside the folder.
+    pub session: Option<&'a EarlierTexts>,
+}
+
+impl UndoSources<'_> {
+    /// Nothing to put back from: no card offers Undo.
+    pub const NONE: UndoSources<'static> = UndoSources {
+        history: None,
+        session: None,
+    };
 }
 
 impl ChatState {
+    /// The earlier texts this session's applies kept of files outside the
+    /// notes folder.
+    pub fn earlier_texts(&self) -> &EarlierTexts {
+        &self.earlier
+    }
+
     /// Claims a conversation for one request and hands back the token that
     /// stops it, or `None` when a reply is already arriving for it.
     ///
@@ -313,6 +402,10 @@ pub struct ChatEndpointState {
     pub is_consented: bool,
     /// Whether a key is stored for this provider, and where it lives.
     pub key_state: AiKeyState,
+    /// A send carries the stored key: one is set and the target takes it
+    /// ([`polish::EndpointTarget::takes_key`]), which an https address on a
+    /// private network does.
+    pub sends_key: bool,
     /// The connection is Apple's on-device model, which serves Rewrite only.
     pub is_on_device: bool,
 }
@@ -372,6 +465,20 @@ pub struct ProposalDto {
     /// The note has moved on since the proposal was made, so applying it would
     /// be refused by the guard.
     pub stale: bool,
+    /// The file is outside the notes folder and no tab has it open, so it
+    /// cannot be read or written until one does.
+    pub needs_tab: bool,
+    /// The file an open offer names, through every symlink, which is how the
+    /// watcher and the index name it. None for a decided proposal.
+    pub resolved_path: Option<String>,
+    /// What an applied proposal left the note holding, which Undo is judged
+    /// against.
+    pub applied_hash: Option<String>,
+    /// Undo put back what the note held before the proposal was applied.
+    pub undone: bool,
+    /// An applied proposal can be undone: the note still holds what the apply
+    /// left, and the text it held before is kept.
+    pub undoable: bool,
 }
 
 /// What a send was accepted as: the id its frames carry, and the notes the
@@ -430,11 +537,13 @@ pub fn endpoint_state_from(cfg: &AiConfig, key_state: AiKeyState) -> ChatEndpoin
         is_allowed: false,
         is_consented: false,
         key_state,
+        sends_key: false,
         is_on_device: jotra_core::ai::on_device::is_on_device(&cfg.provider),
     };
     match polish::resolve_endpoint(&cfg.effective_base_url()) {
         Ok(target) => ChatEndpointState {
             is_consented: !target.is_hosted || is_consented(cfg, &target.host),
+            sends_key: base.key_state.is_set && target.takes_key(),
             host: Some(target.host),
             host_port: Some(target.host_port),
             is_hosted: target.is_hosted,
@@ -492,6 +601,7 @@ pub fn missing_or(error: ChatStoreError) -> String {
 pub fn conversation_dto(
     notes_root: &Path,
     open_tabs: &dyn TabLookup,
+    undo: UndoSources<'_>,
     conversation: Conversation,
 ) -> ConversationDto {
     ConversationDto {
@@ -511,7 +621,7 @@ pub fn conversation_dto(
                 proposals: turn
                     .proposals
                     .into_iter()
-                    .map(|proposal| proposal_dto(notes_root, open_tabs, proposal))
+                    .map(|proposal| proposal_dto(notes_root, open_tabs, undo, proposal))
                     .collect(),
             })
             .collect(),
@@ -526,15 +636,32 @@ pub fn conversation_dto(
 /// the note's shape holds `\n` lines and would rewrite every line of a CRLF
 /// note; one read in that shape from the bytes still on disk already holds the
 /// ending and comes through unchanged.
+///
+/// An applied proposal offers Undo while the note holds what the apply left
+/// and the text before it is kept, so a conversation opened again offers what
+/// the card offered when it was written.
 fn proposal_dto(
     notes_root: &Path,
     open_tabs: &dyn TabLookup,
+    undo: UndoSources<'_>,
     proposal: StoredProposal,
 ) -> ProposalDto {
     if matches!(
         proposal.status,
         ProposalStatus::Applied | ProposalStatus::Discarded
     ) {
+        let undoable = proposal.status == ProposalStatus::Applied
+            && !proposal.undone
+            && proposal.applied_hash.as_deref().is_some_and(|applied| {
+                can_undo(
+                    notes_root,
+                    open_tabs,
+                    undo,
+                    &proposal.path,
+                    &proposal.before_hash,
+                    applied,
+                )
+            });
         return ProposalDto {
             path: proposal.path,
             summary: proposal.summary,
@@ -543,14 +670,22 @@ fn proposal_dto(
             status: proposal.status,
             hunks: Vec::new(),
             stale: false,
+            needs_tab: false,
+            resolved_path: None,
+            applied_hash: proposal.applied_hash,
+            undone: proposal.undone,
+            undoable,
         };
     }
 
     // A note that cannot be read is a note the proposal can no longer be
     // measured against, which is the same thing to a reader as one that
     // changed: there is nothing to show but the summary, and applying will be
-    // refused.
+    // refused. A file outside the folder whose tab is closed is the exception:
+    // it is unread rather than changed, and opening it is what lets it be read.
+    let resolved_path = Some(resolved_path(notes_root, &proposal.path));
     let Some(current) = note_now(notes_root, open_tabs, &proposal.path) else {
+        let needs_tab = waits_for_a_tab(notes_root, open_tabs, &proposal.path);
         return ProposalDto {
             path: proposal.path,
             summary: proposal.summary,
@@ -558,7 +693,12 @@ fn proposal_dto(
             new_content: proposal.new_content,
             status: proposal.status,
             hunks: Vec::new(),
-            stale: true,
+            stale: !needs_tab,
+            needs_tab,
+            resolved_path,
+            applied_hash: None,
+            undone: false,
+            undoable: false,
         };
     };
 
@@ -568,13 +708,71 @@ fn proposal_dto(
     let hunks = line_diff_exact(&current.text, &new_content).unwrap_or_default();
     ProposalDto {
         stale: current.hash != proposal.before_hash,
+        needs_tab: false,
+        resolved_path,
         path: proposal.path,
         summary: proposal.summary,
         before_hash: proposal.before_hash,
         new_content,
         status: proposal.status,
         hunks,
+        applied_hash: None,
+        undone: false,
+        undoable: false,
     }
+}
+
+/// The file `path` names, a note folder-relative or a file outside the folder
+/// absolute, with every symlink resolved, as the index keys it.
+fn resolved_path(notes_root: &Path, path: &str) -> String {
+    let named = Path::new(path);
+    if named.is_absolute() {
+        jotra_storage::notes_index::index_key(named)
+    } else {
+        jotra_storage::notes_index::index_key(&notes_root.join(named))
+    }
+}
+
+/// Whether Undo can put back what the file held at `before_hash`: it still
+/// holds what the apply left, and the earlier text is a version of the note or
+/// a text this session kept of a file outside the folder.
+fn can_undo(
+    notes_root: &Path,
+    open_tabs: &dyn TabLookup,
+    undo: UndoSources<'_>,
+    path: &str,
+    before_hash: &str,
+    applied_hash: &str,
+) -> bool {
+    let Ok(context) = resolve_context_file(notes_root, open_tabs, path) else {
+        return false;
+    };
+    let holds_the_apply = read_context(notes_root, &context, path)
+        .is_ok_and(|current| current.hash.eq_ignore_ascii_case(applied_hash));
+    holds_the_apply
+        && match context.scope {
+            ContextScope::Notes => undo.history.is_some_and(|history| {
+                kept_version(history, notes_root, &context, before_hash).is_some()
+            }),
+            ContextScope::OpenTab { .. } => undo
+                .session
+                .is_some_and(|session| session.has(&context.key, before_hash)),
+        }
+}
+
+/// Whether `path` names a file outside the notes folder that is there but has
+/// no tab open on it, which is the only way the pane reaches such a file.
+fn waits_for_a_tab(notes_root: &Path, open_tabs: &dyn TabLookup, path: &str) -> bool {
+    let given = Path::new(path);
+    if !given.is_absolute() {
+        return false;
+    }
+    let Some(file) = resolved_spelling(given).map(PathBuf::from) else {
+        return false;
+    };
+    !jotra_core::notes::containment::is_inside(&canonical_notes_root(notes_root), &file)
+        && open_tabs.tab_at(&file).is_none()
+        && file.is_file()
 }
 
 /// What one note holds now, read through the context host and nothing else.
@@ -1307,6 +1505,122 @@ pub fn undo_proposal_inner(
         Some(history),
         CardWrite::Undo,
     )
+}
+
+/// [`apply_proposal_inner`], keeping what a file outside the notes folder held
+/// before the write in `earlier`, so its card can offer Undo for the rest of
+/// the session.
+#[allow(clippy::too_many_arguments)]
+pub fn apply_proposal_in_session(
+    earlier: &EarlierTexts,
+    notes_root: &Path,
+    open_tabs: &dyn TabLookup,
+    jotra_dir: &Path,
+    host: &str,
+    path: &str,
+    new_content: &str,
+    before_hash: &str,
+    history: Option<&jotra_storage::note_history::NoteHistoryStore>,
+    write_tab: impl FnOnce(&str, &str, &[u8]) -> Result<(), String>,
+) -> Result<ProposalOutcome, String> {
+    let mut replaced: Option<Vec<u8>> = None;
+    let outcome = apply_proposal_inner(
+        notes_root,
+        open_tabs,
+        jotra_dir,
+        host,
+        path,
+        new_content,
+        before_hash,
+        history,
+        |tab_id, content, verified| {
+            write_tab(tab_id, content, verified)?;
+            replaced = Some(verified.to_vec());
+            Ok(())
+        },
+    )?;
+    let kept = replaced
+        .and_then(|bytes| String::from_utf8(bytes).ok())
+        .is_some_and(|text| earlier.keep(&outcome.path, before_hash, text));
+    Ok(ProposalOutcome {
+        undoable: outcome.undoable || kept,
+        ..outcome
+    })
+}
+
+/// [`undo_proposal_inner`] for any file a card wrote: a note goes back to the
+/// version its history kept, and a file outside the folder to the text
+/// [`apply_proposal_in_session`] kept, written through its tab.
+///
+/// A file outside the folder that changed since the apply is refused with
+/// nothing written beside it, as its apply would have been, and its earlier
+/// text stays kept for a second try.
+#[allow(clippy::too_many_arguments)]
+pub fn undo_proposal_in_session(
+    earlier: &EarlierTexts,
+    notes_root: &Path,
+    open_tabs: &dyn TabLookup,
+    jotra_dir: &Path,
+    host: &str,
+    path: &str,
+    before_hash: &str,
+    applied_hash: &str,
+    history: Option<&jotra_storage::note_history::NoteHistoryStore>,
+    write_tab: impl FnOnce(&str, &str, &[u8]) -> Result<(), String>,
+) -> Result<ProposalOutcome, String> {
+    let context = resolve_context_file(notes_root, open_tabs, path)?;
+    let ContextScope::OpenTab { tab_id } = &context.scope else {
+        return undo_proposal_inner(
+            notes_root,
+            open_tabs,
+            jotra_dir,
+            host,
+            path,
+            before_hash,
+            applied_hash,
+            history,
+        );
+    };
+    let name = context_name(&context);
+    let Some(text) = earlier.text(&context.key, before_hash) else {
+        return Err(format!("The earlier text of {name} is not kept."));
+    };
+    let refuse = |sentence: String| {
+        record_proposal(
+            jotra_dir,
+            host,
+            CardWrite::Undo.action(),
+            &context.key,
+            Decision::Refuse,
+            None,
+        );
+        Err(sentence)
+    };
+    let current = read_context(notes_root, &context, path)?;
+    if !current.hash.eq_ignore_ascii_case(applied_hash) {
+        return refuse(format!(
+            "{name} changed since the change was applied and was not written."
+        ));
+    }
+    if let Err(error) = write_tab(tab_id, &text, current.text.as_bytes()) {
+        return refuse(error);
+    }
+    earlier.forget(&context.key, before_hash);
+    record_proposal(
+        jotra_dir,
+        host,
+        CardWrite::Undo.action(),
+        &context.key,
+        Decision::Allow,
+        Some(text.len() as u64),
+    );
+    Ok(ProposalOutcome {
+        path: context.key.clone(),
+        hash: jotra_core::hash::sha256_hex(text.as_bytes()),
+        bytes: text.len() as u64,
+        changed: true,
+        undoable: false,
+    })
 }
 
 /// Which write a proposal's card asked for: what the log line names it, and
@@ -2088,6 +2402,70 @@ pub fn record_status(
     }
 }
 
+/// Records what a card's write did: an apply that landed is applied with the
+/// digest Undo is judged against, a refused one is refused.
+pub fn record_apply(
+    store: &ChatStore,
+    conversation_id: &str,
+    turn: usize,
+    path: &str,
+    outcome: &Result<ProposalOutcome, String>,
+) {
+    let Ok(applied) = outcome else {
+        record_status(store, conversation_id, turn, path, ProposalStatus::Refused);
+        return;
+    };
+    update_conversation(store, conversation_id, |conversation| {
+        conversation.record_applied(turn, path, applied.hash.clone(), ChatStore::now())
+    });
+}
+
+/// Records that Undo put back what the note held before the proposal.
+pub fn record_undo(store: &ChatStore, conversation_id: &str, turn: usize, path: &str) {
+    update_conversation(store, conversation_id, |conversation| {
+        conversation.record_undone(turn, path, ChatStore::now())
+    });
+}
+
+/// Loads, changes and saves one conversation, warning when the change names
+/// no proposal or the file cannot be saved.
+fn update_conversation(
+    store: &ChatStore,
+    conversation_id: &str,
+    change: impl FnOnce(&mut Conversation) -> bool,
+) {
+    let saved = store.load(conversation_id).and_then(|mut conversation| {
+        if !change(&mut conversation) {
+            tracing::warn!("no stored proposal answers to that turn");
+        }
+        store.save(&conversation)
+    });
+    if let Err(error) = saved {
+        tracing::warn!(error = %error, "a proposal's status was not saved");
+    }
+}
+
+/// One conversation as the pane opens it.
+///
+/// A file written before decided proposals dropped their text still holds
+/// that text, and is saved without it here; a save that fails leaves the file
+/// as it was and the pane gets the conversation all the same.
+pub fn open_conversation(
+    store: &ChatStore,
+    notes_root: &Path,
+    open_tabs: &dyn TabLookup,
+    undo: UndoSources<'_>,
+    id: &str,
+) -> Result<ConversationDto, String> {
+    let mut conversation = store.load(id).map_err(missing_or)?;
+    if conversation.drop_decided_text() {
+        if let Err(error) = store.save(&conversation) {
+            tracing::warn!(error = %error, "a conversation was not saved without its decided text");
+        }
+    }
+    Ok(conversation_dto(notes_root, open_tabs, undo, conversation))
+}
+
 /// Whether the document would still fit in a file once it is saved.
 ///
 /// Measured on the bytes a save would write, which is what the store's own cap
@@ -2474,6 +2852,342 @@ mod tests {
         );
         let recent = jotra_storage::activity_log::read_recent(jotra.path(), 1);
         assert_eq!(recent[0].decision, Decision::Refuse);
+    }
+
+    /// A tab's save path that writes what it is handed to `file`.
+    fn saves_to(file: &Path) -> impl FnOnce(&str, &str, &[u8]) -> Result<(), String> + '_ {
+        move |_tab_id, content, _verified| {
+            std::fs::write(file, content).map_err(|error| error.to_string())
+        }
+    }
+
+    /// Applies "a tighter readme" over the outside file through its tab,
+    /// keeping what it held in `earlier`.
+    fn apply_outside(
+        earlier: &EarlierTexts,
+        notes: &Path,
+        tabs: &StubTabs,
+        jotra: &Path,
+        given: &str,
+    ) -> ProposalOutcome {
+        apply_proposal_in_session(
+            earlier,
+            notes,
+            tabs,
+            jotra,
+            "api.example.com",
+            given,
+            "a tighter readme\n",
+            &jotra_core::hash::sha256_hex(b"the readme text\n"),
+            None,
+            saves_to(Path::new(given)),
+        )
+        .expect("the proposal applies")
+    }
+
+    #[test]
+    fn an_outside_file_applied_this_session_can_be_undone() {
+        let (_dir, notes, given) = notes_and_an_outside_file(b"the readme text\n");
+        let jotra = tempfile::TempDir::new().expect("temp dir");
+        let tabs = StubTabs::open(Path::new(&given), "tab-1");
+        let earlier = EarlierTexts::default();
+        let before = jotra_core::hash::sha256_hex(b"the readme text\n");
+
+        let applied = apply_outside(&earlier, &notes, &tabs, jotra.path(), &given);
+        assert!(applied.undoable, "the text it replaced is kept");
+        assert!(earlier.has(&resolved_key(&given), &before));
+
+        let undone = undo_proposal_in_session(
+            &earlier,
+            &notes,
+            &tabs,
+            jotra.path(),
+            "api.example.com",
+            &given,
+            &before,
+            &applied.hash,
+            None,
+            saves_to(Path::new(&given)),
+        )
+        .expect("undone");
+
+        assert!(undone.changed);
+        assert_eq!(undone.hash, before);
+        assert_eq!(
+            std::fs::read_to_string(&given).expect("read"),
+            "the readme text\n"
+        );
+        assert!(
+            !earlier.has(&resolved_key(&given), &before),
+            "a text put back is not kept for a second Undo"
+        );
+        let recent = jotra_storage::activity_log::read_recent(jotra.path(), 1);
+        assert_eq!(recent[0].action, "undo_proposal");
+        assert_eq!(recent[0].decision, Decision::Allow);
+    }
+
+    #[test]
+    fn undo_refuses_an_outside_file_that_changed_since_the_apply() {
+        let (_dir, notes, given) = notes_and_an_outside_file(b"the readme text\n");
+        let jotra = tempfile::TempDir::new().expect("temp dir");
+        let tabs = StubTabs::open(Path::new(&given), "tab-1");
+        let earlier = EarlierTexts::default();
+        let before = jotra_core::hash::sha256_hex(b"the readme text\n");
+        let applied = apply_outside(&earlier, &notes, &tabs, jotra.path(), &given);
+        std::fs::write(&given, "somebody else's readme\n").expect("rewrite the file");
+
+        let refusal = undo_proposal_in_session(
+            &earlier,
+            &notes,
+            &tabs,
+            jotra.path(),
+            "api.example.com",
+            &given,
+            &before,
+            &applied.hash,
+            None,
+            |_, _, _| panic!("the write ran"),
+        );
+
+        assert_eq!(
+            refusal,
+            Err("README.md changed since the change was applied and was not written.".to_string())
+        );
+        assert_eq!(
+            std::fs::read_to_string(&given).expect("read"),
+            "somebody else's readme\n"
+        );
+        let outside = Path::new(&given).parent().expect("the outside folder");
+        assert_eq!(
+            std::fs::read_dir(outside)
+                .expect("the outside folder")
+                .count(),
+            1,
+            "nothing was written beside the file"
+        );
+        let recent = jotra_storage::activity_log::read_recent(jotra.path(), 1);
+        assert_eq!(recent[0].action, "undo_proposal");
+        assert_eq!(recent[0].decision, Decision::Refuse);
+    }
+
+    #[test]
+    fn undo_of_an_outside_file_with_nothing_kept_is_refused() {
+        let (_dir, notes, given) = notes_and_an_outside_file(b"a tighter readme\n");
+        let jotra = tempfile::TempDir::new().expect("temp dir");
+        let tabs = StubTabs::open(Path::new(&given), "tab-1");
+
+        let refusal = undo_proposal_in_session(
+            &EarlierTexts::default(),
+            &notes,
+            &tabs,
+            jotra.path(),
+            "api.example.com",
+            &given,
+            &jotra_core::hash::sha256_hex(b"the readme text\n"),
+            &jotra_core::hash::sha256_hex(b"a tighter readme\n"),
+            None,
+            |_, _, _| panic!("the write ran"),
+        );
+
+        assert_eq!(
+            refusal,
+            Err("The earlier text of README.md is not kept.".to_string())
+        );
+    }
+
+    /// A conversation whose one reply proposed a change to `path` that was
+    /// applied, leaving the file holding `applied_hash`.
+    fn applied_card(
+        path: &str,
+        before_hash: &str,
+        applied_hash: &str,
+        undone: bool,
+    ) -> Conversation {
+        let mut conversation = Conversation::new(
+            "0b7d6b7a-5555-4b6a-9d5e-000000000005".to_string(),
+            ChatStore::now(),
+            "custom".to_string(),
+            "a-model".to_string(),
+        );
+        conversation.push_assistant(
+            "Done.".to_string(),
+            AssistantReply {
+                proposals: vec![StoredProposal {
+                    path: path.to_string(),
+                    summary: "Tighten it".to_string(),
+                    before_hash: before_hash.to_string(),
+                    new_content: String::new(),
+                    status: ProposalStatus::Applied,
+                    applied_hash: Some(applied_hash.to_string()),
+                    undone,
+                }],
+                ..AssistantReply::default()
+            },
+            None,
+            ChatStore::now(),
+        );
+        conversation
+    }
+
+    fn reopened(
+        notes: &Path,
+        tabs: &dyn TabLookup,
+        undo: UndoSources<'_>,
+        conversation: &Conversation,
+    ) -> ProposalDto {
+        conversation_dto(notes, tabs, undo, conversation.clone()).turns[0].proposals[0].clone()
+    }
+
+    /// The watcher and the index name a note through every symlink, so an
+    /// offer under a notes folder reached through one carries that spelling
+    /// for the pane to match their events against.
+    #[cfg(unix)]
+    #[test]
+    fn an_open_offer_under_a_symlinked_folder_carries_its_resolved_path() {
+        let dir = tempfile::TempDir::new().expect("temp dir");
+        let real = dir.path().join("real");
+        std::fs::create_dir(&real).expect("the notes folder");
+        std::fs::write(real.join("Launch.md"), "the text\n").expect("the note");
+        let link = dir.path().join("link");
+        std::os::unix::fs::symlink(&real, &link).expect("the symlink");
+        let mut card = applied_card("Launch.md", "abc", "def", false);
+        card.turns[0].proposals[0].status = ProposalStatus::Pending;
+        let no_tabs = StubTabs(std::collections::HashMap::new());
+
+        let offered = reopened(&link, &no_tabs, UndoSources::NONE, &card);
+
+        let expected = resolved_key(&real.join("Launch.md").to_string_lossy());
+        assert_eq!(offered.resolved_path.as_deref(), Some(expected.as_str()));
+        assert!(!expected.contains("/link/"));
+    }
+
+    #[test]
+    fn a_decided_offer_carries_no_resolved_path() {
+        let (_dir, notes, given) = notes_and_an_outside_file(b"the readme text\n");
+        let card = applied_card(&resolved_key(&given), "abc", "def", false);
+        let no_tabs = StubTabs(std::collections::HashMap::new());
+
+        assert_eq!(
+            reopened(&notes, &no_tabs, UndoSources::NONE, &card).resolved_path,
+            None
+        );
+    }
+
+    #[test]
+    fn a_reopened_card_offers_undo_while_the_session_keeps_the_text() {
+        let (_dir, notes, given) = notes_and_an_outside_file(b"the readme text\n");
+        let jotra = tempfile::TempDir::new().expect("temp dir");
+        let tabs = StubTabs::open(Path::new(&given), "tab-1");
+        let earlier = EarlierTexts::default();
+        let before = jotra_core::hash::sha256_hex(b"the readme text\n");
+        let applied = apply_outside(&earlier, &notes, &tabs, jotra.path(), &given);
+        let session = UndoSources {
+            history: None,
+            session: Some(&earlier),
+        };
+        let card = applied_card(&resolved_key(&given), &before, &applied.hash, false);
+
+        let offered = reopened(&notes, &tabs, session, &card);
+        assert!(offered.undoable);
+        assert_eq!(offered.applied_hash.as_deref(), Some(applied.hash.as_str()));
+        assert!(
+            !reopened(&notes, &tabs, UndoSources::NONE, &card).undoable,
+            "nothing kept is nothing to put back"
+        );
+        let undone = applied_card(&resolved_key(&given), &before, &applied.hash, true);
+        assert!(!reopened(&notes, &tabs, session, &undone).undoable);
+        assert!(reopened(&notes, &tabs, session, &undone).undone);
+
+        std::fs::write(&given, "somebody else's readme\n").expect("rewrite the file");
+        assert!(
+            !reopened(&notes, &tabs, session, &card).undoable,
+            "a file that moved on since the apply is not put back"
+        );
+    }
+
+    #[test]
+    fn a_reopened_card_offers_undo_while_the_history_keeps_the_version() {
+        let dir = tempfile::TempDir::new().expect("temp dir");
+        let notes = std::fs::canonicalize(dir.path()).expect("canonical root");
+        let jotra = notes.join(".jotra");
+        std::fs::create_dir_all(&jotra).expect("jotra folder");
+        std::fs::write(notes.join("Launch.md"), "before\n").expect("seed a note");
+        let history =
+            jotra_storage::note_history::NoteHistoryStore::open(&jotra).expect("history store");
+        history.set_notes_root(notes.clone());
+        let before = jotra_core::hash::sha256_hex(b"before\n");
+        let applied = apply_proposal_inner(
+            &notes,
+            &NoTabs,
+            &jotra,
+            "probe-host",
+            "Launch.md",
+            "after\n",
+            &before,
+            Some(&history),
+            |_, _, _| unreachable!("a note in the folder is not written through a tab"),
+        )
+        .expect("applied");
+        let versions = UndoSources {
+            history: Some(&history),
+            session: None,
+        };
+        let card = applied_card("Launch.md", &before, &applied.hash, false);
+
+        assert!(reopened(&notes, &NoTabs, versions, &card).undoable);
+        assert!(!reopened(&notes, &NoTabs, UndoSources::NONE, &card).undoable);
+        let undone = applied_card("Launch.md", &before, &applied.hash, true);
+        assert!(!reopened(&notes, &NoTabs, versions, &undone).undoable);
+    }
+
+    #[test]
+    fn a_pending_card_for_an_outside_file_with_no_tab_waits_for_one() {
+        let (_dir, notes, given) = notes_and_an_outside_file(b"the readme text\n");
+        let mut conversation = applied_card(
+            &given,
+            &jotra_core::hash::sha256_hex(b"the readme text\n"),
+            "unused",
+            false,
+        );
+        let proposal = &mut conversation.turns[0].proposals[0];
+        proposal.status = ProposalStatus::Pending;
+        proposal.applied_hash = None;
+        proposal.new_content = "a tighter readme\n".to_string();
+
+        let closed = reopened(&notes, &NoTabs, UndoSources::NONE, &conversation);
+        assert!(closed.needs_tab);
+        assert!(!closed.stale, "a file nobody can read yet has not moved on");
+
+        let tabs = StubTabs::open(Path::new(&given), "tab-1");
+        let open = reopened(&notes, &tabs, UndoSources::NONE, &conversation);
+        assert!(!open.needs_tab);
+        assert!(!open.stale);
+        assert!(!open.hunks.is_empty());
+
+        std::fs::remove_file(&given).expect("remove the file");
+        let gone = reopened(&notes, &NoTabs, UndoSources::NONE, &conversation);
+        assert!(!gone.needs_tab, "a file that is gone waits for nothing");
+        assert!(gone.stale);
+    }
+
+    #[test]
+    fn the_session_drops_its_oldest_earlier_text_first() {
+        let earlier = EarlierTexts::default();
+        for index in 0..=EARLIER_TEXTS_MAX {
+            assert!(earlier.keep(&format!("file-{index}"), "hash", "text".to_string()));
+        }
+        assert!(!earlier.has("file-0", "hash"));
+        assert!(earlier.has("file-1", "hash"));
+        assert!(earlier.has(&format!("file-{EARLIER_TEXTS_MAX}"), "hash"));
+
+        let half = EARLIER_TEXTS_MAX_BYTES / 2 + 1;
+        assert!(earlier.keep("first-large", "hash", "x".repeat(half)));
+        assert!(earlier.keep("second-large", "hash", "x".repeat(half)));
+        assert!(!earlier.has("first-large", "hash"));
+        assert!(earlier.has("second-large", "hash"));
+
+        assert!(!earlier.keep("huge", "hash", "x".repeat(EARLIER_TEXTS_MAX_BYTES + 1)));
+        assert!(!earlier.has("huge", "hash"));
     }
 
     #[test]
@@ -2914,6 +3628,24 @@ mod tests {
     }
 
     #[test]
+    fn the_state_says_when_a_send_carries_the_stored_key() {
+        let key = AiKeyState {
+            is_set: true,
+            memory_only: false,
+        };
+        let encrypted = config(true, "https://192.168.1.20/v1", "llama3");
+        let state = endpoint_state_from(&encrypted, key);
+        assert!(state.is_private_network && state.sends_key);
+        let plain = config(true, "http://192.168.1.20:11434/v1", "llama3");
+        assert!(!endpoint_state_from(&plain, key).sends_key);
+        let no_key = AiKeyState {
+            is_set: false,
+            memory_only: false,
+        };
+        assert!(!endpoint_state_from(&encrypted, no_key).sends_key);
+    }
+
+    #[test]
     fn the_key_is_read_under_the_connection_s_provider_id() {
         let mut cfg = config(true, "", "llama-3.3-70b-versatile");
         cfg.provider = "groq".to_string();
@@ -3230,6 +3962,104 @@ Tell me if that reads better.\n";
         );
     }
 
+    /// A store whose conversation's reply proposed a change to `Launch.md`.
+    fn store_with_a_proposal(dir: &Path) -> ChatStore {
+        let store = store_in(dir);
+        let (_notes, attached) = notes_with("one intro\nand another intro\n");
+        let mut buffer = ReplyBuffer::new();
+        stream_through(&mut buffer, REPLY_WITH_A_PROPOSAL);
+        let parsed = chat::parse_proposals(&buffer.raw, &attached, false);
+        record_reply(
+            &store,
+            ID,
+            &buffer.shown,
+            &parsed,
+            false,
+            &tests_support::test_identity(),
+        );
+        store
+    }
+
+    #[test]
+    fn an_apply_and_its_undo_are_recorded_where_the_card_was_offered() {
+        let data = tempfile::TempDir::new().expect("temp dir");
+        let store = store_with_a_proposal(data.path());
+        let landed = Ok(ProposalOutcome {
+            path: "Launch.md".to_string(),
+            hash: "digest-the-apply-left".to_string(),
+            bytes: 18,
+            changed: true,
+            undoable: true,
+        });
+
+        record_apply(&store, ID, 1, "Launch.md", &landed);
+        let applied = store.load(ID).expect("load").turns[1].proposals[0].clone();
+        assert_eq!(applied.status, ProposalStatus::Applied);
+        assert_eq!(
+            applied.applied_hash.as_deref(),
+            Some("digest-the-apply-left")
+        );
+        assert!(!applied.undone);
+
+        record_undo(&store, ID, 1, "Launch.md");
+        let undone = store.load(ID).expect("load").turns[1].proposals[0].clone();
+        assert_eq!(undone.status, ProposalStatus::Applied);
+        assert!(undone.undone);
+    }
+
+    #[test]
+    fn a_refused_apply_is_recorded_as_refused() {
+        let data = tempfile::TempDir::new().expect("temp dir");
+        let store = store_with_a_proposal(data.path());
+
+        record_apply(
+            &store,
+            ID,
+            1,
+            "Launch.md",
+            &Err("Launch.md changed since this was proposed.".to_string()),
+        );
+
+        let proposal = store.load(ID).expect("load").turns[1].proposals[0].clone();
+        assert_eq!(proposal.status, ProposalStatus::Refused);
+        assert_eq!(proposal.applied_hash, None);
+        assert!(!proposal.new_content.is_empty(), "Apply is still offered");
+    }
+
+    #[test]
+    fn opening_a_conversation_saves_it_without_the_text_of_decided_proposals() {
+        let data = tempfile::TempDir::new().expect("temp dir");
+        let store = store_with_a_proposal(data.path());
+        let mut earlier = store.load(ID).expect("load");
+        earlier.turns[1].proposals[0].status = ProposalStatus::Applied;
+        store
+            .save(&earlier)
+            .expect("save the file an earlier build wrote");
+        let (notes, _attached) = notes_with("one intro\n");
+
+        let opened = open_conversation(&store, notes.path(), &NoTabs, UndoSources::NONE, ID)
+            .expect("opened");
+
+        assert!(opened.turns[1].proposals[0].new_content.is_empty());
+        assert!(
+            store.load(ID).expect("load").turns[1].proposals[0]
+                .new_content
+                .is_empty(),
+            "the file no longer holds the proposed text"
+        );
+        assert_eq!(
+            open_conversation(
+                &store,
+                notes.path(),
+                &NoTabs,
+                UndoSources::NONE,
+                "0b7d6b7a-9999-4b6a-9d5e-000000000009"
+            )
+            .map(|_| ()),
+            Err(MISSING_CONVERSATION.to_string())
+        );
+    }
+
     #[test]
     fn a_pending_proposal_is_read_against_the_note_as_it_stands() {
         let (notes, attached) = notes_with("one intro\nand another intro\n");
@@ -3248,6 +4078,8 @@ Tell me if that reads better.\n";
                     before_hash: attached[0].before_hash.clone(),
                     new_content: "one intro, folded\n".to_string(),
                     status: ProposalStatus::Pending,
+                    applied_hash: None,
+                    undone: false,
                 }],
                 ..AssistantReply::default()
             },
@@ -3255,7 +4087,12 @@ Tell me if that reads better.\n";
             ChatStore::now(),
         );
 
-        let fresh = conversation_dto(notes.path(), &NoTabs, conversation.clone());
+        let fresh = conversation_dto(
+            notes.path(),
+            &NoTabs,
+            UndoSources::NONE,
+            conversation.clone(),
+        );
         let card = &fresh.turns[0].proposals[0];
         assert!(!card.stale);
         assert!(!card.hunks.is_empty());
@@ -3271,14 +4108,19 @@ Tell me if that reads better.\n";
         // the card says so.
         std::fs::write(notes.path().join("Launch.md"), "somebody else's opening\n")
             .expect("rewrite the note");
-        let moved = conversation_dto(notes.path(), &NoTabs, conversation.clone());
+        let moved = conversation_dto(
+            notes.path(),
+            &NoTabs,
+            UndoSources::NONE,
+            conversation.clone(),
+        );
         assert!(moved.turns[0].proposals[0].stale);
         assert!(!moved.turns[0].proposals[0].hunks.is_empty());
 
         // The note is gone: nothing to compare against, and applying would be
         // refused.
         std::fs::remove_file(notes.path().join("Launch.md")).expect("remove the note");
-        let gone = conversation_dto(notes.path(), &NoTabs, conversation);
+        let gone = conversation_dto(notes.path(), &NoTabs, UndoSources::NONE, conversation);
         assert!(gone.turns[0].proposals[0].stale);
         assert!(gone.turns[0].proposals[0].hunks.is_empty());
     }
@@ -3301,6 +4143,8 @@ Tell me if that reads better.\n";
                     before_hash: attached[0].before_hash.clone(),
                     new_content: "one intro, folded\n".to_string(),
                     status: ProposalStatus::Applied,
+                    applied_hash: None,
+                    undone: false,
                 }],
                 ..AssistantReply::default()
             },
@@ -3308,7 +4152,9 @@ Tell me if that reads better.\n";
             ChatStore::now(),
         );
 
-        let card = &conversation_dto(notes.path(), &NoTabs, conversation).turns[0].proposals[0];
+        let card = &conversation_dto(notes.path(), &NoTabs, UndoSources::NONE, conversation).turns
+            [0]
+        .proposals[0];
         assert!(card.hunks.is_empty());
         assert!(!card.stale);
         assert_eq!(card.status, ProposalStatus::Applied);
@@ -3332,6 +4178,8 @@ Tell me if that reads better.\n";
                     before_hash: attached[0].before_hash.clone(),
                     new_content: "one intro, folded\n".to_string(),
                     status: ProposalStatus::Refused,
+                    applied_hash: None,
+                    undone: false,
                 }],
                 ..AssistantReply::default()
             },
@@ -3341,7 +4189,9 @@ Tell me if that reads better.\n";
         std::fs::write(notes.path().join("Launch.md"), "somebody else's opening\n")
             .expect("rewrite the note");
 
-        let card = &conversation_dto(notes.path(), &NoTabs, conversation).turns[0].proposals[0];
+        let card = &conversation_dto(notes.path(), &NoTabs, UndoSources::NONE, conversation).turns
+            [0]
+        .proposals[0];
         assert_eq!(card.status, ProposalStatus::Refused);
         assert!(card.stale, "a second Apply would only be refused again");
         assert!(!card.hunks.is_empty());
@@ -3366,8 +4216,13 @@ Tell me if that reads better.\n";
             "2026-09-15T10:01:00+00:00".to_string(),
         );
 
-        let written = serde_json::to_value(conversation_dto(notes.path(), &NoTabs, conversation))
-            .expect("serialize");
+        let written = serde_json::to_value(conversation_dto(
+            notes.path(),
+            &NoTabs,
+            UndoSources::NONE,
+            conversation,
+        ))
+        .expect("serialize");
         assert_eq!(written["id"], ID);
         assert_eq!(written["title"], "Tighten the opening.");
         assert_eq!(written["provider"], "anthropic");
@@ -3444,7 +4299,12 @@ Tell me if that reads better.\n";
                 false,
                 &tests_support::test_identity(),
             );
-            let reopened = conversation_dto(notes.path(), &NoTabs, store.load(ID).expect("load"));
+            let reopened = conversation_dto(
+                notes.path(),
+                &NoTabs,
+                UndoSources::NONE,
+                store.load(ID).expect("load"),
+            );
             let card = &reopened.turns[1].proposals[0];
             assert!(!card.stale, "{note:?}");
             assert_eq!(card.new_content, settled.new_content, "{note:?}");
@@ -3473,6 +4333,8 @@ Tell me if that reads better.\n";
                     before_hash: attached[0].before_hash.clone(),
                     new_content: "one intro\nand a second intro\nthe end\n".to_string(),
                     status: ProposalStatus::Pending,
+                    applied_hash: None,
+                    undone: false,
                 }],
                 ..AssistantReply::default()
             },
@@ -3480,8 +4342,10 @@ Tell me if that reads better.\n";
             ChatStore::now(),
         );
 
-        let card =
-            conversation_dto(notes.path(), &NoTabs, conversation).turns[0].proposals[0].clone();
+        let card = conversation_dto(notes.path(), &NoTabs, UndoSources::NONE, conversation).turns
+            [0]
+        .proposals[0]
+            .clone();
         assert_eq!(
             card.new_content,
             "one intro\r\nand a second intro\r\nthe end\r\n"
@@ -3546,8 +4410,10 @@ Tell me if that reads better.\n";
         std::fs::write(notes.path().join("Launch.md"), "one intro\nthe end\n")
             .expect("save the note as LF");
 
-        let card =
-            conversation_dto(notes.path(), &NoTabs, conversation).turns[0].proposals[0].clone();
+        let card = conversation_dto(notes.path(), &NoTabs, UndoSources::NONE, conversation).turns
+            [0]
+        .proposals[0]
+            .clone();
         assert!(card.stale);
         assert_eq!(card.new_content, "one intro, folded\nthe end\n");
         assert_eq!(

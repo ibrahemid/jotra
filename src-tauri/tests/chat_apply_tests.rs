@@ -21,11 +21,13 @@ use jotra_storage::database::migrations::run_migrations;
 use jotra_storage::layout_state::LayoutStateStore;
 use jotra_storage::notes_index::NotesIndexStore;
 use jotra_tauri_lib::commands::chat::{
-    announce_applied_note, apply_proposal_inner, undo_proposal_to_state,
+    announce_applied_note, apply_proposal_inner, apply_proposal_to_state, undo_proposal_to_state,
+    EarlierTexts,
 };
+use jotra_tauri_lib::commands::file::open_file_from_path;
 use jotra_tauri_lib::preview::handler::RenderCache;
 use jotra_tauri_lib::quit::QuitState;
-use jotra_tauri_lib::security::AuthorizedPaths;
+use jotra_tauri_lib::security::{canonicalize_for_authorization, AuthorizedPaths};
 use jotra_tauri_lib::state::AppState;
 use jotra_tauri_lib::watcher::handler::create_ignore_set;
 use jotra_tauri_lib::watcher::moves::FileTracking;
@@ -274,8 +276,15 @@ fn an_undo_puts_the_text_back_and_tells_the_tab_holding_the_note() {
     assert!(applied.undoable);
     while events.try_recv().is_ok() {}
 
-    let undone = undo_proposal_to_state(&state, "probe-host", "Launch.md", &before, &applied.hash)
-        .expect("undone");
+    let undone = undo_proposal_to_state(
+        &state,
+        &EarlierTexts::default(),
+        "probe-host",
+        "Launch.md",
+        &before,
+        &applied.hash,
+    )
+    .expect("undone");
 
     assert!(undone.changed);
     assert_eq!(std::fs::read_to_string(&file).expect("read"), "before\n");
@@ -290,6 +299,63 @@ fn an_undo_puts_the_text_back_and_tells_the_tab_holding_the_note() {
     assert_eq!(
         state.disk_state("note-1").expect("on record").hash,
         sha256_bytes(b"before\n")
+    );
+}
+
+#[test]
+fn an_undo_puts_back_a_file_outside_the_folder_through_its_tab() {
+    let dir = TempDir::new().expect("temp dir");
+    let (state, events) = watching_state(&dir);
+    let file = dir.path().join("README.md");
+    std::fs::write(&file, "the readme text\n").expect("seed the file");
+    let path = canonicalize_for_authorization(&file).expect("canonical");
+    state.authorized_paths.record_for_open(path.clone());
+    let tab = open_file_from_path(&state, &path)
+        .expect("open")
+        .doc
+        .expect("a row")
+        .id;
+    let earlier = EarlierTexts::default();
+    let before = sha256_hex(b"the readme text\n");
+
+    let applied = apply_proposal_to_state(
+        &state,
+        &earlier,
+        "probe-host",
+        &path,
+        "a tighter readme\n",
+        &before,
+    )
+    .expect("applied");
+    assert!(applied.undoable, "the text the apply replaced is kept");
+    while events.try_recv().is_ok() {}
+
+    let undone = undo_proposal_to_state(
+        &state,
+        &earlier,
+        "probe-host",
+        &path,
+        &before,
+        &applied.hash,
+    )
+    .expect("undone");
+
+    assert!(undone.changed);
+    assert_eq!(
+        std::fs::read_to_string(&path).expect("read"),
+        "the readme text\n"
+    );
+    let told = std::iter::from_fn(|| events.try_recv().ok()).any(|event| {
+        matches!(
+            event,
+            JotraEvent::BufferExternal { ref buffer_id, change: ExternalChange::Modified, .. }
+                if *buffer_id == tab
+        )
+    });
+    assert!(told, "the tab holding the file was not told");
+    assert_eq!(
+        state.disk_state(&tab).expect("on record").hash,
+        sha256_bytes(b"the readme text\n")
     );
 }
 

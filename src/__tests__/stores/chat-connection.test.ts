@@ -9,7 +9,9 @@ import type { JotraConfig } from "../../types/config";
 
 const mocks = vi.hoisted(() => ({
   aiListModels: vi.fn(),
+  aiListModelsUnprompted: vi.fn(),
   aiCheckConnection: vi.fn(),
+  aiCheckConnectionUnprompted: vi.fn(),
   aiSetProvider: vi.fn(),
   aiProbeLocal: vi.fn(),
   aiOpenrouterConnect: vi.fn(),
@@ -28,7 +30,9 @@ const mocks = vi.hoisted(() => ({
 
 vi.mock("../../services/tauri", () => ({
   aiListModels: mocks.aiListModels,
+  aiListModelsUnprompted: mocks.aiListModelsUnprompted,
   aiCheckConnection: mocks.aiCheckConnection,
+  aiCheckConnectionUnprompted: mocks.aiCheckConnectionUnprompted,
   aiSetProvider: mocks.aiSetProvider,
   aiProbeLocal: mocks.aiProbeLocal,
   aiOpenrouterConnect: mocks.aiOpenrouterConnect,
@@ -128,12 +132,17 @@ beforeEach(async () => {
 
 describe("the catalog the pane reads", () => {
   it("clears the stale list when config changes on disk", async () => {
+    mocks.aiListModelsUnprompted.mockImplementation(async (provider: string) =>
+      catalog(provider, ["qwen2.5"]),
+    );
     mocks.aiListModels.mockImplementation(async (provider: string) =>
       catalog(provider, provider === "ollama" ? ["qwen2.5"] : ["claude-4"]),
     );
     aiConnectionStore.watch();
     await flush();
     expect(chatStore.liveModels()).toEqual(["qwen2.5"]);
+    expect(mocks.aiListModelsUnprompted).toHaveBeenCalledTimes(1);
+    expect(mocks.aiListModels).not.toHaveBeenCalled();
 
     // An external edit of config.toml reaches the running config through
     // config-sync, and the list read for the connection it replaced is not an
@@ -207,6 +216,23 @@ describe("what the pane says about the connection", () => {
 
   it("says nothing is wrong until something says so", () => {
     expect(chatStore.readiness()).toEqual({ state: "ready" });
+  });
+
+  it("opening the pane runs no check that would read a key the keychain was not asked for", async () => {
+    mocks.aiCheckConnectionUnprompted.mockResolvedValue(null);
+    await chatStore.openPane();
+    await flush();
+
+    expect(mocks.aiCheckConnectionUnprompted).toHaveBeenCalledTimes(1);
+    expect(mocks.aiCheckConnection).not.toHaveBeenCalled();
+    expect(aiConnectionStore.status()).toBeNull();
+    expect(chatStore.readiness()).toEqual({ state: "ready" });
+
+    mocks.aiCheckConnectionUnprompted.mockResolvedValue(probe("key_required", "api.deepseek.com"));
+    await chatStore.openPane();
+    await flush();
+    expect(aiConnectionStore.status()?.kind).toBe("key_required");
+    expect(mocks.aiCheckConnection).not.toHaveBeenCalled();
   });
 
   it("reports a model the provider's own list does not hold", async () => {

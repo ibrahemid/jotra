@@ -233,12 +233,14 @@ describe("a card whose note changes while it is on screen", () => {
 
     mocks.chatOpen.mockResolvedValue(fileWith({ status: "applied", hunks: [] }));
     fireEvent.click(apply());
-    await waitFor(() => expect(container.textContent).toContain("Applied to Launch.md."));
+    await waitFor(() =>
+      expect(container.querySelector(".chat-proposal-verdict")?.textContent).toBe("Applied."),
+    );
 
     emit("notes:changed", { path: "/notes/Launch.md", removed: false });
     await flush();
 
-    expect(container.textContent).toContain("Applied to Launch.md.");
+    expect(container.querySelector(".chat-proposal-verdict")?.textContent).toBe("Applied.");
     expect(container.textContent).not.toContain("The file changed since this was offered.");
     expect(getByRole("button", { name: "Undo" })).toBeTruthy();
   });
