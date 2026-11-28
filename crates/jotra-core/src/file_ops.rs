@@ -365,8 +365,10 @@ pub fn extract_filename(path: &Path) -> String {
         .to_string()
 }
 
-/// `true` when the first [`BINARY_CHECK_BYTES`] of `data` contain a NUL byte
-/// and declare no text encoding.
+/// `true` when the first [`BINARY_CHECK_BYTES`] of `data` hold a NUL: a NUL
+/// byte when they declare no text encoding, a NUL character in the text after
+/// the byte order mark when they declare one
+/// ([`crate::text_encoding::sniffs_binary`]).
 ///
 /// UTF-16 has a NUL in nearly every unit of Latin text, so a byte order mark
 /// or the shape of UTF-16 ([`crate::text_encoding::declared`]) is asked about
@@ -378,7 +380,5 @@ pub fn extract_filename(path: &Path) -> String {
 /// the file a second time. An empty slice is never binary.
 pub fn is_binary_bytes(data: &[u8]) -> bool {
     let checked = &data[..data.len().min(BINARY_CHECK_BYTES)];
-    !checked.is_empty()
-        && crate::text_encoding::declared(checked).is_none()
-        && checked.contains(&0u8)
+    !checked.is_empty() && crate::text_encoding::sniffs_binary(checked)
 }

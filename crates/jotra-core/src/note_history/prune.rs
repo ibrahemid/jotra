@@ -14,7 +14,8 @@
 //! of each session, the first of each day, and a text that something other
 //! than a run of saves set aside. The newest entry, the first of the newest
 //! session, and the last entry before that session are never given up to
-//! the cap.
+//! the cap, and the size cap takes them only once no other entry it could
+//! take is left.
 //!
 //! One thing is held back from every pass. A note's newest entry is the last
 //! text of that note the store holds, and a note that has been deleted has no
@@ -109,6 +110,12 @@ pub fn prune_plan(entries: &[VersionFacts], now: SystemTime) -> PrunePlan {
             by_note.entry(entries[i].note).or_default().push(i);
         }
     }
+    let mut pinned = vec![false; entries.len()];
+    for note in by_note.values() {
+        for k in pinned_positions(note.len(), &session_starts(note, entries)) {
+            pinned[note[k]] = true;
+        }
+    }
     let mut over_cap: Vec<usize> = by_note
         .values()
         .flat_map(|note| thin(note, entries, now))
@@ -119,23 +126,26 @@ pub fn prune_plan(entries: &[VersionFacts], now: SystemTime) -> PrunePlan {
     }
 
     // Total size. Oldest first among the entries that are not the last their
-    // note has, then, only if the store is still over, the last entries of
-    // the notes holding the most bytes.
+    // note has, the pinned ones only once no other is left, then, only if the
+    // store is still over, the last entries of the notes holding the most
+    // bytes.
     let mut total: u64 = alive
         .iter()
         .zip(entries)
         .filter(|(alive, _)| **alive)
         .map(|(_, entry)| entry.bytes)
         .sum();
-    let mut cursor = 0;
-    while total > MAX_STORE_BYTES && cursor < oldest_first.len() {
-        let i = oldest_first[cursor];
-        cursor += 1;
-        if !alive[i] || held[&entries[i].note] <= 1 {
-            continue;
+    for spare_pinned in [true, false] {
+        for &i in &oldest_first {
+            if total <= MAX_STORE_BYTES {
+                break;
+            }
+            if !alive[i] || held[&entries[i].note] <= 1 || (spare_pinned && pinned[i]) {
+                continue;
+            }
+            total -= entries[i].bytes;
+            take(i, entries, &mut alive, &mut held, &mut retire);
         }
-        total -= entries[i].bytes;
-        take(i, entries, &mut alive, &mut held, &mut retire);
     }
     while total > MAX_STORE_BYTES {
         let Some(note) = costliest_note(entries, &alive) else {
@@ -187,14 +197,9 @@ fn thin(note: &[usize], entries: &[VersionFacts], now: SystemTime) -> Vec<usize>
     let mut worth = vec![Worth::Ordinary; note.len()];
     let mut raise = |k: usize, to: Worth| worth[k] = worth[k].max(to);
 
-    let mut session_starts = vec![0];
-    for k in 1..note.len() {
-        if gap(at(k - 1), at(k)) >= SESSION_GAP {
-            session_starts.push(k);
-        }
-    }
-    for (n, &start) in session_starts.iter().enumerate() {
-        let end = session_starts.get(n + 1).map_or(note.len(), |&next| next) - 1;
+    let starts = session_starts(note, entries);
+    for (n, &start) in starts.iter().enumerate() {
+        let end = starts.get(n + 1).map_or(note.len(), |&next| next) - 1;
         raise(start, Worth::Marker);
         raise(end, Worth::Marker);
     }
@@ -209,11 +214,8 @@ fn thin(note: &[usize], entries: &[VersionFacts], now: SystemTime) -> Vec<usize>
             raise(k, Worth::Marker);
         }
     }
-    let newest_session = *session_starts.last().unwrap_or(&0);
-    raise(note.len() - 1, Worth::Pinned);
-    raise(newest_session, Worth::Pinned);
-    if newest_session > 0 {
-        raise(newest_session - 1, Worth::Pinned);
+    for k in pinned_positions(note.len(), &starts) {
+        raise(k, Worth::Pinned);
     }
 
     let mut seen: HashSet<(u64, u64)> = HashSet::new();
@@ -233,6 +235,34 @@ fn thin(note: &[usize], entries: &[VersionFacts], now: SystemTime) -> Vec<usize>
         .take(excess)
         .map(|k| note[k])
         .collect()
+}
+
+/// Where each session of one note starts, as positions in `note` (its live
+/// entries, oldest first): the first entry, and every entry made
+/// [`SESSION_GAP`] or more after the one before it.
+fn session_starts(note: &[usize], entries: &[VersionFacts]) -> Vec<usize> {
+    let mut starts = vec![0];
+    for k in 1..note.len() {
+        if gap(entries[note[k - 1]].at, entries[note[k]].at) >= SESSION_GAP {
+            starts.push(k);
+        }
+    }
+    starts
+}
+
+/// The positions in a note of `len` entries whose sessions start at `starts`
+/// that a cap takes last: the newest entry, the newest session's first, and
+/// the last entry before that session.
+fn pinned_positions(len: usize, starts: &[usize]) -> Vec<usize> {
+    if len == 0 {
+        return Vec::new();
+    }
+    let newest_session = starts.last().copied().unwrap_or(0);
+    let mut pinned = vec![len - 1, newest_session];
+    if newest_session > 0 {
+        pinned.push(newest_session - 1);
+    }
+    pinned
 }
 
 const DAY_SECONDS: u64 = 24 * 60 * 60;
@@ -515,6 +545,21 @@ mod tests {
             plan.retire,
             vec![2, 3],
             "the busy note pays before the quiet note loses everything"
+        );
+    }
+
+    #[test]
+    fn the_size_cap_spares_the_text_from_before_a_session_while_the_session_has_more() {
+        let entries = [
+            entry(1, 1, 3 * DAY, 100 * MB),
+            entry(2, 1, Duration::from_secs(30 * 60), 60 * MB),
+            entry(3, 1, Duration::from_secs(20 * 60), 60 * MB),
+            entry(4, 1, Duration::from_secs(10 * 60), 60 * MB),
+        ];
+        assert_eq!(
+            prune_plan(&entries, now()).retire,
+            vec![3],
+            "the session's own middle goes before the text from before it"
         );
     }
 

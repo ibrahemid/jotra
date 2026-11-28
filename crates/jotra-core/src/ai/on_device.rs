@@ -119,6 +119,9 @@ pub enum OnDeviceFailure {
     /// The system is limiting requests, or another one is running.
     #[error("The on-device model is busy. Try again in a moment.")]
     Busy,
+    /// The framework went silent for longer than a rewrite may wait.
+    #[error("The on-device model stopped answering. Try again.")]
+    Stalled,
     /// Anything else the framework reported.
     #[error("The on-device model could not finish the rewrite.")]
     Failed,
@@ -153,6 +156,7 @@ impl OnDeviceFailure {
             Self::Declined => "declined",
             Self::Language => "language",
             Self::Busy => "busy",
+            Self::Stalled => "stalled",
             Self::Failed => "failed",
         }
     }

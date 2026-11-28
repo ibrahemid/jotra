@@ -73,8 +73,11 @@ export function createAiChatCommands(state: DemoState): CommandTable {
         return structuredClone(state.config.ai);
       }, describeAiRefusal),
     ai_list_models: (): Answer<"aiListModels"> => ai.listModels(state.config.ai),
+    ai_list_models_unprompted: (): Answer<"aiListModelsUnprompted"> => ai.listModels(state.config.ai),
     ai_probe_local: (): Answer<"aiProbeLocal"> => ({ ollama: false, lmstudio: false, llamacpp: false, jan: false }),
     ai_check_connection: (): Answer<"aiCheckConnection"> =>
+      ai.checkConnection(state.config.ai, keyed.has(state.config.ai.provider)),
+    ai_check_connection_unprompted: (): Answer<"aiCheckConnectionUnprompted"> =>
       ai.checkConnection(state.config.ai, keyed.has(state.config.ai.provider)),
     ai_has_api_key: (args): Answer<"aiHasApiKey"> => getKeyState(String(args.provider)),
     ai_set_api_key: (args): Answer<"aiSetApiKey"> | Promise<never> => {

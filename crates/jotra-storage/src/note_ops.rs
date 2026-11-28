@@ -15,19 +15,21 @@ use std::path::{Path, PathBuf};
 
 use chrono::{DateTime, Utc};
 use jotra_core::config::FileExtension;
+use jotra_core::hash::Sha256Digest;
 
 use jotra_core::notes::guard::{is_not_downloaded, DiskState};
 use jotra_core::notes::links;
 use jotra_core::notes::rename::{rewrite_links, Rewrite};
 use jotra_core::notes::WriteOrigin;
 
-use crate::buffer_store::{dataless_flags, BeforeWrite, DatalessProbe};
+use crate::buffer_store::{dataless_flags, read_disk_state_and_bytes, BeforeWrite, DatalessProbe};
 use crate::errors::{StorageError, StorageResult};
 use crate::guarded::{
-    create_note_guarded, guard_rename, write_note_guarded, ConflictPolicy, CreateNote, DiskRead,
+    check_rename, create_note_guarded, write_note_guarded, ConflictPolicy, CreateNote, DiskRead,
     GuardedWrite, TakenName,
 };
 use crate::notes_index::{build_notes_walk, indexes_as_note, names_a_note};
+use crate::write_lock::WriteLock;
 
 /// Creates an empty note file in `notes_root`, named from `stem` and
 /// `extension`.
@@ -52,6 +54,7 @@ pub fn create_note(
     extension: &str,
     origin: WriteOrigin,
     before_write: BeforeWrite<'_>,
+    lock: Option<&WriteLock>,
 ) -> StorageResult<PathBuf> {
     create_note_guarded(
         CreateNote {
@@ -62,7 +65,7 @@ pub fn create_note(
             origin,
             on_taken_name: TakenName::Dedupe,
             history: None,
-            lock: None,
+            lock,
         },
         before_write,
     )
@@ -86,6 +89,7 @@ pub fn save_copy(
     content: &str,
     origin: WriteOrigin,
     before_write: BeforeWrite<'_>,
+    lock: Option<&WriteLock>,
 ) -> StorageResult<PathBuf> {
     create_note_guarded(
         CreateNote {
@@ -96,7 +100,7 @@ pub fn save_copy(
             origin,
             on_taken_name: TakenName::Dedupe,
             history: None,
-            lock: None,
+            lock,
         },
         before_write,
     )
@@ -157,7 +161,7 @@ pub fn rename_note(
 }
 
 /// [`rename_note`] up to the move: the name checks, the guard and the stamps,
-/// each of which reads the whole file.
+/// which share one read of the whole file ([`PreparedRename::bytes`]).
 ///
 /// A caller that keeps the move atomic with a lock it must not hold across a
 /// file's bytes runs this before taking the lock and
@@ -185,18 +189,49 @@ pub fn prepare_rename(
 
 /// A rename that passed its checks and stamped both names, before the move.
 #[must_use = "a prepared rename moves nothing until it is committed"]
-#[derive(Debug)]
 pub struct PreparedRename {
     from: PathBuf,
     to: PathBuf,
     /// `false` when the new name is the one the file already has.
     moves: bool,
+    /// The file's digest and bytes, when the checks or the stamps read it.
+    read: Option<(Sha256Digest, Vec<u8>)>,
+    /// Whether both names were stamped with that digest.
+    stamped: bool,
+}
+
+impl std::fmt::Debug for PreparedRename {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PreparedRename")
+            .field("from", &self.from)
+            .field("to", &self.to)
+            .field("moves", &self.moves)
+            .field("stamped", &self.stamped)
+            .finish_non_exhaustive()
+    }
 }
 
 impl PreparedRename {
     /// The path the file has once the rename is committed.
     pub fn to(&self) -> &Path {
         &self.to
+    }
+
+    /// What the file held when both names were stamped, or `None` when they
+    /// were not: a caller that waits before [`Self::commit`] stamps them again
+    /// with it, without reading the file a second time.
+    pub fn stamped_digest(&self) -> Option<Sha256Digest> {
+        self.read
+            .as_ref()
+            .filter(|_| self.stamped)
+            .map(|(digest, _)| *digest)
+    }
+
+    /// The bytes the checks and the stamps read, or `None` when they read
+    /// nothing: a file with no record and no stamps, or one whose bytes are not
+    /// on this machine.
+    pub fn bytes(&self) -> Option<&[u8]> {
+        self.read.as_ref().map(|(_, bytes)| bytes.as_slice())
     }
 
     /// Moves the file. Only the two names are touched, never the bytes.
@@ -259,6 +294,8 @@ fn prepare_rename_probed(
                 from: from.to_path_buf(),
                 to,
                 moves: false,
+                read: None,
+                stamped: false,
             });
         }
         // The same file under a spelling that is not a case or normalisation
@@ -276,19 +313,41 @@ fn prepare_rename_probed(
         });
     }
 
-    guard_rename(from, last_known, origin)?;
-
-    if let Some(stamp) = before_write {
-        if !is_not_downloaded(dataless(from)) {
-            let bytes = std::fs::read(from).unwrap_or_default();
-            stamp(from, &bytes);
-            stamp(&to, &bytes);
+    let not_downloaded = is_not_downloaded(dataless(from));
+    let read = match last_known {
+        Some(last_known) => {
+            if not_downloaded {
+                return Err(StorageError::SourceNotDownloaded {
+                    path: from.to_string_lossy().into_owned(),
+                });
+            }
+            let read = read_disk_state_and_bytes(from)?;
+            check_rename(
+                from,
+                &last_known,
+                read.as_ref().map(|(state, _)| state),
+                &origin,
+            )?;
+            read.map(|(state, bytes)| (state.hash, bytes))
         }
+        None if before_write.is_some() && !not_downloaded => std::fs::read(from)
+            .ok()
+            .map(|bytes| (jotra_core::hash::sha256_bytes(&bytes), bytes)),
+        None => None,
+    };
+
+    let mut stamped = false;
+    if let (Some(stamp), Some((_, bytes))) = (before_write, read.as_ref()) {
+        stamp(from, bytes);
+        stamp(&to, bytes);
+        stamped = true;
     }
     Ok(PreparedRename {
         from: from.to_path_buf(),
         to,
         moves: true,
+        read,
+        stamped,
     })
 }
 
@@ -423,6 +482,7 @@ pub fn rewrite_links_in_file(
     dataless: DatalessProbe<'_>,
     before_write: BeforeWrite<'_>,
     history: Option<&crate::note_history::NoteHistoryStore>,
+    lock: Option<&WriteLock>,
 ) -> StorageResult<LinkRewrite> {
     let flags = match dataless {
         Some(probe) => probe(path),
@@ -435,16 +495,23 @@ pub fn rewrite_links_in_file(
     }
 
     let bytes = std::fs::read(path)?;
-    let text = String::from_utf8(bytes).map_err(|_| {
+    let decoded = jotra_core::text_encoding::decode_file(&bytes).ok_or_else(|| {
         StorageError::Io(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
             format!("{} is not text", path.display()),
         ))
     })?;
+    // A replacement character stands in for bytes the rewrite would write it
+    // back over.
+    if decoded.replaced {
+        return Err(StorageError::NotInEncoding {
+            encoding: decoded.encoding,
+        });
+    }
 
     let from = crate::notes_index::index_key(path);
     let rewritten = match rewrite_links(
-        &text,
+        &decoded.text,
         &from,
         rename.target,
         rename.new_name,
@@ -455,6 +522,7 @@ pub fn rewrite_links_in_file(
         Rewrite::NoLink => return Ok(LinkRewrite::NoLink),
         Rewrite::NameNotUnique(other) => return Ok(LinkRewrite::NameNotUnique(other)),
     };
+    let written = decoded.encoding.encode(&rewritten)?;
 
     // The state of the file the rewrite is measured against is read from the
     // bytes the rewrite is built from, not from a second read: two reads of a
@@ -462,11 +530,11 @@ pub fn rewrite_links_in_file(
     // guard would then be answering about the one that was not rewritten.
     let metadata = std::fs::metadata(path).ok();
     let on_disk = DiskState {
-        hash: jotra_core::hash::sha256_bytes(text.as_bytes()),
+        hash: jotra_core::hash::sha256_bytes(&bytes),
         size: metadata
             .as_ref()
             .map(|m| m.len())
-            .unwrap_or(text.len() as u64),
+            .unwrap_or(bytes.len() as u64),
         mtime: metadata.as_ref().and_then(|m| m.modified().ok()),
     };
 
@@ -474,7 +542,7 @@ pub fn rewrite_links_in_file(
     write_note_guarded(
         GuardedWrite {
             target: path,
-            bytes: rewritten.as_bytes(),
+            bytes: &written,
             last_known,
             on_disk: DiskRead::Read(Some(on_disk)),
             dataless,
@@ -483,7 +551,7 @@ pub fn rewrite_links_in_file(
             history: keep
                 .as_ref()
                 .map(|hook| hook as &dyn Fn(crate::guarded::WriteCapture<'_>)),
-            lock: None,
+            lock,
         },
         before_write,
     )?;
@@ -527,6 +595,7 @@ pub fn restore_trashed(
     path: &Path,
     bytes: &[u8],
     before_write: BeforeWrite<'_>,
+    lock: Option<&WriteLock>,
 ) -> StorageResult<()> {
     let folder = path.parent().ok_or_else(|| {
         StorageError::Io(std::io::Error::new(
@@ -557,7 +626,7 @@ pub fn restore_trashed(
             origin: WriteOrigin::Editor,
             on_conflict: ConflictPolicy::RefuseOnly,
             history: None,
-            lock: None,
+            lock,
         },
         before_write,
     )
@@ -699,15 +768,20 @@ pub(crate) fn rename_no_replace(from: &Path, to: &Path) -> std::io::Result<()> {
             .collect()
     };
     let (from, to) = (wide(from), wide(to));
-    // SAFETY: both buffers are NUL-terminated UTF-16 that outlive the call.
-    unsafe {
-        MoveFileExW(
-            PCWSTR(from.as_ptr()),
-            PCWSTR(to.as_ptr()),
-            MOVE_FILE_FLAGS(0),
-        )
-    }
-    .map_err(|error| std::io::Error::from_raw_os_error(error.code().0 & 0xFFFF))
+    crate::atomic::retry_while_in_use(
+        || {
+            // SAFETY: both buffers are NUL-terminated UTF-16 that outlive the call.
+            unsafe {
+                MoveFileExW(
+                    PCWSTR(from.as_ptr()),
+                    PCWSTR(to.as_ptr()),
+                    MOVE_FILE_FLAGS(0),
+                )
+            }
+            .map_err(|error| std::io::Error::from_raw_os_error(error.code().0 & 0xFFFF))
+        },
+        |attempt| std::thread::sleep(crate::atomic::persist_retry_delay(attempt)),
+    )
 }
 
 #[cfg(not(any(
@@ -849,6 +923,72 @@ mod tests {
         .expect("rename");
 
         assert_eq!(*stamped.borrow(), vec![from, to]);
+    }
+
+    #[test]
+    fn a_guarded_rename_keeps_the_one_read_its_guard_and_stamps_share() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let from = dir.path().join("Kept.md");
+        std::fs::write(&from, "guarded text").expect("seed");
+        let (last_known, _) = read_disk_state_and_bytes(&from)
+            .expect("read")
+            .expect("the file is there");
+        let stamped = RefCell::new(Vec::new());
+        let stamp = |path: &Path, bytes: &[u8]| {
+            stamped
+                .borrow_mut()
+                .push((path.to_path_buf(), bytes.to_vec()))
+        };
+
+        let prepared = prepare_rename_probed(
+            &from,
+            "Moved",
+            Some(last_known),
+            WriteOrigin::Editor,
+            Some(&stamp),
+            &|_| None,
+        )
+        .expect("prepare");
+
+        assert_eq!(prepared.bytes(), Some(&b"guarded text"[..]));
+        assert_eq!(
+            prepared.stamped_digest(),
+            Some(jotra_core::hash::sha256_bytes(b"guarded text"))
+        );
+        let to = prepared.to().to_path_buf();
+        assert_eq!(
+            *stamped.borrow(),
+            vec![
+                (from, b"guarded text".to_vec()),
+                (to, b"guarded text".to_vec())
+            ]
+        );
+    }
+
+    #[test]
+    fn a_rename_that_stamps_nothing_has_no_digest_to_stamp_again() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let from = dir.path().join("Plain.md");
+        std::fs::write(&from, "text").expect("seed");
+        let stamp = |_: &Path, _: &[u8]| {};
+
+        let unstamped =
+            prepare_rename_probed(&from, "Other", None, WriteOrigin::Editor, None, &|_| None)
+                .expect("prepare");
+        assert_eq!(unstamped.bytes(), None);
+        assert_eq!(unstamped.stamped_digest(), None);
+
+        let evicted = prepare_rename_probed(
+            &from,
+            "Other",
+            None,
+            WriteOrigin::Editor,
+            Some(&stamp),
+            &|_| Some(SF_DATALESS),
+        )
+        .expect("prepare");
+        assert_eq!(evicted.bytes(), None);
+        assert_eq!(evicted.stamped_digest(), None);
     }
 }
 

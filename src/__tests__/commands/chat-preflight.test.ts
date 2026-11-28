@@ -182,6 +182,9 @@ describe("what the send dialog says", () => {
       "Launch.md (8 KB) and this message go to 192.168.1.20:11434 on your local network.",
     );
     expect(sendNotice("192.168.1.20", [], true).message).not.toContain("API key");
+    expect(sendNotice("192.168.1.20", [], true, true).message).toBe(
+      "This message goes to 192.168.1.20 on your local network with your API key.",
+    );
   });
 
   it("says a size in the unit that reads", () => {
@@ -227,6 +230,22 @@ describe("the blockers before a send", () => {
     expect(asked.message).toContain("on your local network");
     expect(mocks.consentHost).toHaveBeenCalledTimes(1);
     expect(mocks.openSettings).not.toHaveBeenCalled();
+  });
+
+  it("names the key when a stored one goes to an https address on the local network", async () => {
+    const lan = {
+      provider: "custom",
+      host: "192.168.1.20",
+      host_port: "192.168.1.20",
+      is_private_network: true,
+      key_state: { is_set: true, memory_only: false },
+      sends_key: true,
+    };
+    mocks.endpointState.mockResolvedValue(endpoint({ ...lan, is_consented: false }));
+    expect(await clearBlockersBeforeSending([NOTES[0]])).toBe(true);
+    expect(mocks.requestConfirm.mock.calls[0][0].message).toBe(
+      "Launch.md (8 KB) and this message go to 192.168.1.20 on your local network with your API key.",
+    );
   });
 
   it("asks about the host once and records the answer for that host", async () => {

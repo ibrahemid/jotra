@@ -138,6 +138,33 @@ pub fn classify_persist_failure(error: io::Error) -> io::Error {
     error
 }
 
+/// Runs `op` until it succeeds, fails with something other than Windows's
+/// in-use codes, or [`PERSIST_ATTEMPTS`] are gone, calling `wait` with the
+/// attempt's number between two attempts.
+///
+/// The schedule [`should_retry_persist`] and [`classify_persist_failure`] set
+/// for a save's rename, for the Windows moves that replace nothing.
+///
+/// # Errors
+///
+/// The last attempt's error, read by [`classify_persist_failure`].
+pub fn retry_while_in_use<T>(
+    mut op: impl FnMut() -> io::Result<T>,
+    mut wait: impl FnMut(u32),
+) -> io::Result<T> {
+    let mut attempt = 0;
+    loop {
+        match op() {
+            Ok(value) => return Ok(value),
+            Err(error) if should_retry_persist(error.raw_os_error(), attempt) => {
+                wait(attempt);
+                attempt += 1;
+            }
+            Err(error) => return Err(classify_persist_failure(error)),
+        }
+    }
+}
+
 fn is_file_in_use(raw_os_error: Option<i32>) -> bool {
     matches!(
         raw_os_error,
@@ -145,35 +172,13 @@ fn is_file_in_use(raw_os_error: Option<i32>) -> bool {
     )
 }
 
-/// Moves the written replacement onto `target`.
-#[cfg(not(windows))]
-fn persist_replacement(tmp: NamedTempFile, target: &Path) -> io::Result<()> {
-    tmp.persist(target).map(|_| ()).map_err(|e| e.error)
-}
-
-/// Moves the written replacement onto `target`, retrying while Windows says
-/// the destination is in use.
-///
-/// `persist` hands the temp file back with every failure, so the written bytes
-/// stay on disk across the waits and are dropped, which deletes them, only
-/// once the last attempt is gone.
-#[cfg(windows)]
-fn persist_replacement(mut tmp: NamedTempFile, target: &Path) -> io::Result<()> {
-    let mut attempt = 0;
-    loop {
-        let error = match tmp.persist(target) {
-            Ok(_) => return Ok(()),
-            Err(refused) => {
-                tmp = refused.file;
-                refused.error
-            }
-        };
-        if !should_retry_persist(error.raw_os_error(), attempt) {
-            return Err(classify_persist_failure(error));
-        }
-        std::thread::sleep(persist_retry_delay(attempt));
-        attempt += 1;
-    }
+/// Why one try at moving a replacement onto its destination did not land.
+pub(crate) enum PlaceFailure {
+    /// Windows says another program has the destination open, and attempts
+    /// remain. The replacement is handed back for the next one.
+    InUse(PreparedReplacement),
+    /// The rename failed for good.
+    Failed(AtomicWriteError),
 }
 
 /// Copies the destination's permission bits onto the replacement file.
@@ -861,17 +866,69 @@ pub(crate) fn prepare_replacement(
 }
 
 impl PreparedReplacement {
-    /// Renames the replacement over `target`, the one step a reader can see.
+    /// Renames the replacement over `target`, the one step a reader can see,
+    /// waiting and trying again while Windows says the destination is in use.
     pub(crate) fn place(self, target: &Path) -> Result<PlacedReplacement, AtomicWriteError> {
-        persist_replacement(self.tmp, target)?;
-        Ok(PlacedReplacement {
+        let mut prepared = self;
+        let mut attempt = 0;
+        loop {
+            match prepared.try_place(target, attempt) {
+                Ok(placed) => return Ok(placed),
+                Err(PlaceFailure::Failed(error)) => return Err(error),
+                Err(PlaceFailure::InUse(back)) => {
+                    std::thread::sleep(persist_retry_delay(attempt));
+                    prepared = back;
+                    attempt += 1;
+                }
+            }
+        }
+    }
+
+    /// One try at [`Self::place`], numbered `attempt` from zero.
+    ///
+    /// `persist` hands the temp file back with every failure, so the written
+    /// bytes stay on disk across the waits and are dropped, which deletes them,
+    /// only once the last attempt is gone.
+    pub(crate) fn try_place(
+        self,
+        target: &Path,
+        attempt: u32,
+    ) -> Result<PlacedReplacement, PlaceFailure> {
+        let Self {
+            tmp,
             #[cfg(unix)]
-            dir: self.dir,
+            dir,
             #[cfg(target_os = "macos")]
-            target: target.to_path_buf(),
-            #[cfg(target_os = "macos")]
-            birthtime: self.birthtime,
-        })
+            birthtime,
+        } = self;
+        match tmp.persist(target) {
+            Ok(_) => Ok(PlacedReplacement {
+                #[cfg(unix)]
+                dir,
+                #[cfg(target_os = "macos")]
+                target: target.to_path_buf(),
+                #[cfg(target_os = "macos")]
+                birthtime,
+            }),
+            Err(refused) => {
+                let error = refused.error;
+                if cfg!(windows) && should_retry_persist(error.raw_os_error(), attempt) {
+                    return Err(PlaceFailure::InUse(Self {
+                        tmp: refused.file,
+                        #[cfg(unix)]
+                        dir,
+                        #[cfg(target_os = "macos")]
+                        birthtime,
+                    }));
+                }
+                let error = if cfg!(windows) {
+                    classify_persist_failure(error)
+                } else {
+                    error
+                };
+                Err(PlaceFailure::Failed(AtomicWriteError::Io(error)))
+            }
+        }
     }
 }
 

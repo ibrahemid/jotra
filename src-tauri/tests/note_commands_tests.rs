@@ -105,6 +105,9 @@ fn make_state(dir: &TempDir) -> AppState {
         preview_registry: Arc::new(RwLock::new(ContentRendererRegistry::new())),
         preview_render_cache: Arc::new(RenderCache::new()),
         layout_state: LayoutStateStore::new(open_database(&db_path).expect("layout db")),
+        tab_rows: jotra_storage::tab_rows::TabRowStore::new(
+            open_database(&db_path).expect("tab rows db"),
+        ),
         command_usage: jotra_storage::command_usage::CommandUsageStore::new(
             open_database(&db_path).expect("usage db"),
         ),
@@ -174,6 +177,39 @@ fn open_note_at(state: &AppState, path: &std::path::Path, content: &str) -> Stri
         .doc
         .expect("the file opened")
         .id
+}
+
+#[test]
+fn a_new_note_and_a_copy_wait_for_the_write_lock_without_holding_the_store() {
+    let dir = TempDir::new().expect("temp dir");
+    let state = make_state(&dir);
+    let elsewhere = dir.path().join("report.md");
+    let id = open_note_at(&state, &elsewhere, "the text");
+    let lock = jotra_storage::write_lock::WriteLock::in_data_folder(&state.jotra_dir);
+    let held = lock.hold().expect("the lock is free");
+
+    std::thread::scope(|scope| {
+        let created = scope.spawn(|| new_note_named_inner(&state, "Grocery list"));
+        let copied = scope.spawn(|| save_note_copy_inner(&state, &id, "the text plus more"));
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        assert!(
+            !created.is_finished() && !copied.is_finished(),
+            "a write landed while another writer held the data folder's lock"
+        );
+        assert!(
+            state.store.try_lock().is_ok(),
+            "a write waits for the lock holding the buffer store"
+        );
+        drop(held);
+        created
+            .join()
+            .expect("the create thread")
+            .expect("the note is made once the lock is free");
+        copied
+            .join()
+            .expect("the copy thread")
+            .expect("the copy is made once the lock is free");
+    });
 }
 
 #[test]
@@ -835,6 +871,7 @@ fn a_rename_the_row_cannot_follow_puts_the_file_back() {
     let before = note_file(&state, &doc.id);
 
     let refuse = |_: &jotra_storage::buffer_store::BufferStore,
+                  _: &str,
                   _: &str,
                   _: &str,
                   _: &str|

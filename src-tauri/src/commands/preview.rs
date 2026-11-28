@@ -35,7 +35,7 @@ use jotra_core::preview::{
 use tracing::{info, warn};
 
 use jotra_storage::buffer_store::BufferStore;
-use jotra_storage::errors::StorageResult;
+use jotra_storage::errors::{StorageError, StorageResult};
 use jotra_storage::layout_state::LayoutStateRecord;
 
 use crate::commands::materialise::{materialise_with, read_and_verify_with};
@@ -114,7 +114,7 @@ pub fn preview_get_scripts(state: State<'_, AppState>, buffer_id: String) -> Res
 /// file or wrote to it. No file is read, so the status bar never waits on one
 /// that does not answer. An id the store does not hold answers off.
 pub fn preview_get_scripts_inner(state: &AppState, buffer_id: &str) -> Result<bool, String> {
-    let store = state.store.lock().map_err(|e| e.to_string())?;
+    let store = state.lock_store();
     scripts_may_run(state, &store, buffer_id).map_err(|e| e.to_string())
 }
 
@@ -140,7 +140,7 @@ pub fn preview_set_scripts_inner(
     buffer_id: &str,
     enabled: bool,
 ) -> Result<(), String> {
-    let store = state.store.lock().map_err(|e| e.to_string())?;
+    let store = state.lock_store();
     if enabled {
         return store
             .enable_preview_scripts(buffer_id, bytes_jotra_holds(state, buffer_id))
@@ -212,15 +212,25 @@ pub fn lapse_scripts_opt_in(store: &BufferStore, cache: &RenderCache, buffer_id:
     }
 }
 
-/// [`lapse_scripts_opt_in`] for a caller that does not hold the store: it is
-/// taken for the row's read and write and let go. A caller holding it would wait on
-/// itself, so one that does calls [`lapse_scripts_opt_in`] with its guard.
+/// [`lapse_scripts_opt_in`] for a caller that does not hold the store. The row
+/// is changed through [`AppState::tab_rows`] in one statement, so a watcher
+/// thread reporting the change never waits on the store's lock.
 pub fn lapse_scripts_opt_in_now(state: &AppState, buffer_id: &str) -> bool {
-    let store = recover_poison(
-        state.store.lock(),
-        "commands::preview::lapse_scripts_opt_in_now",
-    );
-    lapse_scripts_opt_in(&store, &state.preview_render_cache, buffer_id)
+    state.preview_render_cache.turn_scripts_off(buffer_id);
+    match state.tab_rows.lapse_preview_scripts(buffer_id) {
+        Ok(true) => {
+            info!(
+                buffer_id,
+                "scripts turned off: the file changed outside the editor"
+            );
+            true
+        }
+        Ok(false) => false,
+        Err(e) => {
+            warn!(buffer_id, error = %e, "could not turn off the scripts of a changed file");
+            false
+        }
+    }
 }
 
 /// A buffer's persisted layout, returned to the frontend on open.
@@ -310,10 +320,13 @@ pub enum PreviewRenderResult {
 ///
 /// `None` for a buffer with no file on disk — a scratch note embeds nothing,
 /// because there is no folder to resolve a relative reference against.
-/// ADR-035.
+/// ADR-035. `None` too once a panic was held through the store (ADR-045).
 fn asset_scope(state: &AppState, buffer_id: &str) -> Option<AssetScope> {
     let source_path = {
-        let store = state.store.lock().ok()?;
+        let store = state.lock_store();
+        if store.was_held_through_a_panic() {
+            return None;
+        }
         store.get(buffer_id).ok()?.source_path?
     };
     // The buffer's recorded scope keeps its token across re-renders and the
@@ -377,19 +390,13 @@ pub fn render_into_cache(
                 assets,
                 scripts_enabled,
             };
-            let scripts_enabled = match state.store.lock() {
-                Ok(store) => {
-                    let scripts_enabled =
-                        scripts_may_run(state, &store, buffer_id).unwrap_or(false);
-                    state
-                        .preview_render_cache
-                        .put(buffer_id, doc(scripts_enabled));
-                    scripts_enabled
-                }
-                Err(_) => {
-                    state.preview_render_cache.put(buffer_id, doc(false));
-                    false
-                }
+            let scripts_enabled = {
+                let store = state.lock_store();
+                let scripts_enabled = scripts_may_run(state, &store, buffer_id).unwrap_or(false);
+                state
+                    .preview_render_cache
+                    .put(buffer_id, doc(scripts_enabled));
+                scripts_enabled
             };
             CachedRender::Rendered {
                 used_fallback_stylesheet: output.used_fallback_stylesheet,
@@ -859,13 +866,17 @@ fn read_head(path: &std::path::Path) -> std::io::Result<Vec<u8>> {
 
 /// The folder an open buffer's images resolve against: the one holding its
 /// file, or the notes folder for a buffer with none. `None` when no open tab
-/// is that buffer. The store is let go before any file is touched.
+/// is that buffer. The store is let go before any file is touched. An error
+/// once a panic was held through the store (ADR-045).
 fn open_buffer_folder(
     state: &AppState,
     buffer_id: &str,
 ) -> Result<Option<std::path::PathBuf>, String> {
     let row = {
-        let store = state.store.lock().map_err(|e| e.to_string())?;
+        let store = state.lock_store();
+        if store.was_held_through_a_panic() {
+            return Err(StorageError::HeldThroughAPanic.to_string());
+        }
         store.find(buffer_id).map_err(|e| e.to_string())?
     };
     let Some(row) = row.filter(|row| row.status == BufferStatus::Active) else {

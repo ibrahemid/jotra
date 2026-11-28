@@ -383,10 +383,21 @@ export default function AiConnectionRows(props: { withChatModel: boolean }) {
               </p>
             }
           >
-            <p class="settings-ai-consent-text">
-              The files you attach and the text you rewrite are sent to {endpointHost()} on your
-              local network. Jotra also checks the address is reachable. The check sends no text.
-            </p>
+            <Show
+              when={endpoint()?.sends_key}
+              fallback={
+                <p class="settings-ai-consent-text">
+                  The files you attach and the text you rewrite are sent to {endpointHost()} on your
+                  local network. Jotra also checks the address is reachable. The check sends no text.
+                </p>
+              }
+            >
+              <p class="settings-ai-consent-text">
+                The files you attach and the text you rewrite are sent to {endpointHost()} on your
+                local network with your API key. Jotra also sends the key on its own to check the
+                address is reachable. The check sends no text.
+              </p>
+            </Show>
           </Show>
           <Button data-action="ai-consent" onClick={() => void onConsent()}>
             Allow

@@ -1,4 +1,4 @@
-import { createSignal } from "solid-js";
+import { createEffect, createMemo, createRoot, createSignal, untrack } from "solid-js";
 import { onAutosaveSuccess } from "../../../services/autosave";
 import { onEvent, type UnlistenFn } from "../../../services/events";
 import {
@@ -37,23 +37,32 @@ function comparable(path: string): string {
 }
 
 /** Whether a change at `changed` can move the file an offer names: the file
- * itself, or a folder holding it, which is what a walk or a move names. */
-function changeTouches(changed: string, offered: string, root: string | null): boolean {
+ * itself, or a folder holding it, which is what a walk or a move names. The
+ * file is matched by the path it was offered under and by its resolved path,
+ * which is how the watcher names a note in a folder reached through a
+ * symlink. */
+function changeTouches(changed: string, offer: ChatProposal, root: string | null): boolean {
   const at = comparable(changed);
   if (at.length === 0) return false;
+  const offered = offer.path;
   const relative = !isAbsolutePath(offered);
-  const whole = relative
+  const named = relative
     ? root
       ? `${comparable(root)}/${comparable(offered)}`
       : null
     : comparable(offered);
-  if (whole !== null && (whole === at || whole.startsWith(`${at}/`))) return true;
+  const resolved = offer.resolved_path ? comparable(offer.resolved_path) : null;
+  for (const whole of [named, resolved]) {
+    if (whole !== null && (whole === at || whole.startsWith(`${at}/`))) return true;
+  }
   return relative && at.endsWith(`/${comparable(offered)}`);
 }
 
 function sameMeasure(held: ChatProposal, now: ChatProposal): boolean {
   return (
     (held.stale ?? false) === (now.stale ?? false) &&
+    (held.needs_tab ?? false) === (now.needs_tab ?? false) &&
+    (held.resolved_path ?? null) === (now.resolved_path ?? null) &&
     held.new_content === now.new_content &&
     JSON.stringify(held.hunks) === JSON.stringify(now.hunks)
   );
@@ -88,13 +97,14 @@ export function createProposals(view: ChatView, hooks: ProposalHooks) {
   let measuring: Promise<void> | null = null;
   let measureAgain = false;
   let watching = false;
+  const unsubscribe: (() => void)[] = [];
 
   /** Whether a change at `path` can move a file an offer on screen names. */
   function touchesOffer(path: string): boolean {
     const root = notesStore.root();
     return (view.current()?.turns ?? []).some((turn) =>
       turn.proposals.some(
-        (proposal) => isOpen(proposal) && changeTouches(path, proposal.path, root),
+        (proposal) => isOpen(proposal) && changeTouches(path, proposal, root),
       ),
     );
   }
@@ -122,7 +132,14 @@ export function createProposals(view: ChatView, hooks: ProposalHooks) {
           return proposal;
         }
         changed = true;
-        return { ...proposal, stale: now.stale, hunks: now.hunks, new_content: now.new_content };
+        return {
+          ...proposal,
+          stale: now.stale,
+          needs_tab: now.needs_tab,
+          resolved_path: now.resolved_path,
+          hunks: now.hunks,
+          new_content: now.new_content,
+        };
       });
       if (!changed) return turn;
       moved = true;
@@ -164,9 +181,53 @@ export function createProposals(view: ChatView, hooks: ProposalHooks) {
     return measuring;
   }
 
+  /** The files outside the notes folder that open offers on screen name and
+   * a tab holds. Such a file is read and written through its tab, so a tab
+   * opening or closing changes what its card can do. */
+  function tabbedOutsideOffers(): string {
+    const held = view.current();
+    if (!held) return "";
+    const tabs = new Set(
+      bufferRegistry
+        .activeTabs()
+        .flatMap((tab) => (tab.source_path ? [comparable(tab.source_path)] : [])),
+    );
+    return held.turns
+      .flatMap((turn) => turn.proposals)
+      .filter(
+        (proposal) =>
+          isOpen(proposal) && isAbsolutePath(proposal.path) && tabs.has(comparable(proposal.path)),
+      )
+      .map((proposal) => comparable(proposal.path))
+      .join("\n");
+  }
+
+  /** Measures the offers again when a tab opens or closes on a file outside
+   * the notes folder that one names. A conversation put on screen is
+   * measured by the read that put it there. */
+  function watchOutsideTabs(): () => void {
+    return createRoot((dispose) => {
+      const tabbed = createMemo(tabbedOutsideOffers);
+      let seenId: string | null = null;
+      let seenTabs = "";
+      createEffect(() => {
+        const id = view.current()?.id ?? null;
+        const now = tabbed();
+        untrack(() => {
+          const moved = id !== null && id === seenId && now !== seenTabs;
+          seenId = id;
+          seenTabs = now;
+          if (moved) void remeasure();
+        });
+      });
+      return dispose;
+    });
+  }
+
   /** Measures the offers again whenever a file one names changes: a save
-   * Jotra made (which the folder watcher drops), another program's write, and
-   * a rename or restore Jotra indexed. Subscribed once. */
+   * Jotra made (which the folder watcher drops), another program's write, a
+   * rename or restore Jotra indexed, and a tab opening on a file outside the
+   * notes folder. Subscribed once per pane open. */
   function watchOfferedNotes(): void {
     if (watching) return;
     watching = true;
@@ -175,14 +236,21 @@ export function createProposals(view: ChatView, hooks: ProposalHooks) {
     };
     const listen = (subscribe: () => Promise<UnlistenFn>) => {
       try {
-        void subscribe().catch(() => undefined);
+        const pending = subscribe();
+        void pending.catch(() => undefined);
+        unsubscribe.push(() => {
+          void pending.then((stop) => stop()).catch(() => undefined);
+        });
       } catch {
         // A host with no event bus leaves the offers as the last read left them.
       }
     };
-    onAutosaveSuccess((bufferId) =>
-      changedAt(bufferRegistry.activeTabs().find((tab) => tab.id === bufferId)?.source_path),
+    unsubscribe.push(
+      onAutosaveSuccess((bufferId) =>
+        changedAt(bufferRegistry.activeTabs().find((tab) => tab.id === bufferId)?.source_path),
+      ),
     );
+    unsubscribe.push(watchOutsideTabs());
     listen(() => onEvent("notes:changed", (payload) => changedAt(payload?.path)));
     listen(() =>
       onEvent("notes:indexed", (payload) => {
@@ -195,6 +263,14 @@ export function createProposals(view: ChatView, hooks: ProposalHooks) {
         changedAt(payload?.newPath);
       }),
     );
+  }
+
+  /** Drops what `watchOfferedNotes` subscribed, for a pane that closed: a
+   * card nobody can see needs no read. */
+  function unwatchOfferedNotes(): void {
+    if (!watching) return;
+    watching = false;
+    for (const stop of unsubscribe.splice(0)) stop();
   }
 
   /** Why applying was refused, for the proposal it was refused for. */
@@ -313,12 +389,30 @@ export function createProposals(view: ChatView, hooks: ProposalHooks) {
     }
   }
 
-  /** Puts back what the note held before this session applied the proposal.
+  /** What the apply of a proposal left the file holding, when Undo can put
+   * the earlier text back: this session's write, or the stored record of an
+   * earlier one. */
+  function undoableHash(key: string, proposal: ChatProposal): string | null {
+    const held = verdicts()[key];
+    if (held) return held.kind === "applied" && held.outcome.undoable ? held.outcome.hash : null;
+    if (proposal.status !== "applied" || proposal.undoable !== true) return null;
+    return proposal.applied_hash ?? null;
+  }
+
+  /** Whether the card for that proposal offers Undo. */
+  function canUndo(turn: number, proposal: ChatProposal): boolean {
+    const id = view.current()?.id;
+    return id ? undoableHash(writeKey(id, turn, proposal.path), proposal) !== null : false;
+  }
+
+  /** Puts back what the file held before the proposal was applied.
    *
-   * The text comes from the version the apply kept, and it goes back through
-   * the same guarded write: a note that changed since the apply is refused
-   * rather than overwritten. `conversationId` is the conversation the apply
-   * was made in, which the toast's Undo still names after the pane moved on. */
+   * The text comes from what the apply kept, a note's version or, for a file
+   * outside the notes folder, the text this session holds, and it goes back
+   * through the same guarded write: a file that changed since the apply is
+   * refused rather than overwritten. `conversationId` is the conversation the
+   * apply was made in, which the toast's Undo still names after the pane moved
+   * on. */
   async function undo(
     turn: number,
     proposal: ChatProposal,
@@ -326,8 +420,8 @@ export function createProposals(view: ChatView, hooks: ProposalHooks) {
   ): Promise<boolean> {
     if (!conversationId) return false;
     const key = writeKey(conversationId, turn, proposal.path);
-    const held = verdicts()[key];
-    if (held?.kind !== "applied" || !held.outcome.undoable) return false;
+    const applied = undoableHash(key, proposal);
+    if (applied === null) return false;
     const busy = turnKey(turn, proposal.path);
     if (applying()[busy]) return false;
     const onScreen = () => view.current()?.id === conversationId;
@@ -335,9 +429,11 @@ export function createProposals(view: ChatView, hooks: ProposalHooks) {
     if (onScreen()) setRefusals(({ [busy]: _gone, ...rest }) => rest);
     try {
       const back = await chatUndoProposal(
+        conversationId,
+        turn,
         proposal.path,
         proposal.before_hash,
-        held.outcome.hash,
+        applied,
       );
       endApplying(busy);
       setVerdicts((all) => ({ ...all, [key]: { kind: "undone", outcome: back } }));
@@ -389,6 +485,7 @@ export function createProposals(view: ChatView, hooks: ProposalHooks) {
     refusalFor,
     isApplying,
     verdictFor,
+    canUndo,
     clearRefusals,
     reset,
     apply,
@@ -396,6 +493,7 @@ export function createProposals(view: ChatView, hooks: ProposalHooks) {
     openTarget,
     discard,
     watchOfferedNotes,
+    unwatchOfferedNotes,
   };
 }
 

@@ -151,13 +151,13 @@ const RUST_ALLOWLIST: &[AllowedString] = &[
     },
     AllowedString {
         file: "crates/jotra-core/src/chat/prompt.rs",
-        line: 84,
+        line: 78,
         word: "note",
         note: "model-facing offer instructions, not app copy",
     },
     AllowedString {
         file: "crates/jotra-core/src/chat/prompt.rs",
-        line: 111,
+        line: 105,
         word: "note",
         note: "attachment tag the model reads; renaming it breaks parsing",
     },
@@ -175,19 +175,19 @@ const RUST_ALLOWLIST: &[AllowedString] = &[
     },
     AllowedString {
         file: "crates/jotra-ai/src/chat.rs",
-        line: 987,
+        line: 1186,
         word: "note",
         note: "debug_assert text, never rendered",
     },
     AllowedString {
         file: "src-tauri/src/state.rs",
-        line: 456,
+        line: 461,
         word: "note",
         note: "log line the prefix test misses inside a multi-line macro",
     },
     AllowedString {
         file: "src-tauri/src/state.rs",
-        line: 651,
+        line: 659,
         word: "note",
         note: "log line the prefix test misses inside a multi-line macro",
     },

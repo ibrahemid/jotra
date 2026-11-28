@@ -4,7 +4,7 @@ use jotra_core::maintenance::{needs_vacuum, VACUUM_MIN_FREE_PAGES};
 use jotra_storage::buffer_store::BufferStore;
 use jotra_storage::database::connection::open_database;
 use jotra_storage::database::migrations::run_migrations;
-use jotra_storage::maintenance::checkpoint_truncate;
+use jotra_storage::maintenance::{checkpoint_truncate, run_maintenance_at};
 use tempfile::TempDir;
 
 fn setup_store() -> (TempDir, BufferStore) {
@@ -100,6 +100,25 @@ fn maintenance_reclaims_the_space_left_by_pruned_snapshots() {
         "vacuum must shrink the file: {before:?} -> {:?}",
         outcome.after
     );
+}
+
+#[test]
+fn maintenance_on_a_connection_of_its_own_reclaims_the_store_s_file() {
+    let (dir, store) = setup_store();
+    bloat_with_snapshots(&dir, &store, 60);
+    let database = store.database_path().expect("the store lives in a file");
+    assert_eq!(
+        std::fs::canonicalize(&database).expect("canonical"),
+        std::fs::canonicalize(dir.path().join("jotra.db")).expect("canonical")
+    );
+
+    let outcome = run_maintenance_at(&database).expect("maintenance");
+
+    assert!(outcome.vacuumed, "a bloated database must be vacuumed");
+    assert_eq!(store.database_stats().expect("stats").freelist_count, 0);
+    store
+        .mark_session_clean()
+        .expect("the store's own connection still writes");
 }
 
 #[test]

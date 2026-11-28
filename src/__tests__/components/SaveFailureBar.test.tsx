@@ -21,6 +21,7 @@ vi.mock("../../stores/global/save-status", () => ({
 
 const stubs = vi.hoisted(() => ({
   saveCopyOfNote: vi.fn(async () => {}),
+  saveNoteAsUtf8: vi.fn(async () => {}),
   retrySave: vi.fn(async () => ({ ok: true, failures: [] })),
   readDiskState: vi.fn(
     async () =>
@@ -30,9 +31,12 @@ const stubs = vi.hoisted(() => ({
         | { state: "undescribed" },
   ),
 }));
-const { saveCopyOfNote, retrySave, readDiskState } = stubs;
+const { saveCopyOfNote, saveNoteAsUtf8, retrySave, readDiskState } = stubs;
 
-vi.mock("../../lib/note-actions", () => ({ saveCopyOfNote: stubs.saveCopyOfNote }));
+vi.mock("../../lib/note-actions", () => ({
+  saveCopyOfNote: stubs.saveCopyOfNote,
+  saveNoteAsUtf8: stubs.saveNoteAsUtf8,
+}));
 vi.mock("../../components/WindowProvider/WindowProvider", () => ({
   useWindow: () => ({
     editor: {
@@ -64,6 +68,7 @@ beforeEach(() => {
   retrySave.mockClear();
   readDiskState.mockClear();
   saveCopyOfNote.mockClear();
+  saveNoteAsUtf8.mockClear();
 });
 
 afterEach(cleanup);
@@ -215,5 +220,40 @@ describe("SaveFailureBar", () => {
     fireEvent.click(getByText("Save a copy…"));
 
     expect(saveCopyOfNote).toHaveBeenCalledWith("one");
+  });
+
+  describe("a save the file's encoding cannot hold", () => {
+    const lossy = () =>
+      failure({
+        code: "ERR_ENCODING_LOSSY",
+        message: "this file is Windows-1252, which cannot hold “😀”.",
+        retryable: false,
+      });
+
+    it("offers to save the note in UTF-8", () => {
+      fixtures.setStatuses({ one: lossy() });
+      const { getByText, queryByText } = render(() => <SaveFailureBar noteId="one" />);
+
+      fireEvent.click(getByText("Save as UTF-8"));
+
+      expect(saveNoteAsUtf8).toHaveBeenCalledWith("one");
+      expect(queryByText("Try again")).toBeNull();
+      expect(getByText("Save a copy…")).not.toBeNull();
+    });
+
+    it("does not offer it for any other failure", () => {
+      fixtures.setStatuses({ one: failure() });
+      const { queryByText } = render(() => <SaveFailureBar noteId="one" />);
+
+      expect(queryByText("Save as UTF-8")).toBeNull();
+    });
+
+    it("does not offer it while the note's file is being asked about", () => {
+      fixtures.setStatuses({ one: lossy() });
+      fixtures.setHeld(["one"]);
+      const { queryByText } = render(() => <SaveFailureBar noteId="one" />);
+
+      expect(queryByText("Save as UTF-8")).toBeNull();
+    });
   });
 });

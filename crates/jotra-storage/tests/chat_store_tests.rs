@@ -118,6 +118,8 @@ fn a_saved_conversation_loads_back_as_it_was() {
                 before_hash: "abcd".to_string(),
                 new_content: "Shorter.".to_string(),
                 status: ProposalStatus::Pending,
+                applied_hash: None,
+                undone: false,
             }],
             ..AssistantReply::default()
         },
@@ -340,23 +342,78 @@ fn the_list_reads_no_conversation_bodies() {
         .save(&conversation(ID_B, "2026-09-14T10:00:00+00:00"))
         .unwrap();
 
+    // A file last written an hour ago, listed once so its row is written well
+    // after that time.
+    let file = chats_dir(dir.path()).join(format!("{ID_A}.json"));
+    let modified = std::time::SystemTime::now() - std::time::Duration::from_secs(3600);
+    set_modified(&file, modified);
+    store.list().unwrap();
+
     // Garbage of the same length with the same time: the file still matches
     // its row, so a list that opened it would skip it as unreadable.
-    let file = chats_dir(dir.path()).join(format!("{ID_A}.json"));
-    let modified = fs::metadata(&file).unwrap().modified().unwrap();
     let length = fs::metadata(&file).unwrap().len() as usize;
     fs::write(&file, vec![b'#'; length]).unwrap();
-    fs::File::options()
-        .write(true)
-        .open(&file)
-        .unwrap()
-        .set_modified(modified)
-        .unwrap();
+    set_modified(&file, modified);
 
     let listed = store.list().unwrap();
     assert_eq!(listed.len(), 2);
     assert_eq!(listed[0].id, ID_A);
     assert_eq!(listed[0].title, "Launch plan");
+}
+
+fn set_modified(file: &Path, modified: std::time::SystemTime) {
+    fs::File::options()
+        .write(true)
+        .open(file)
+        .unwrap()
+        .set_modified(modified)
+        .unwrap();
+}
+
+#[test]
+fn a_same_size_write_inside_the_time_granularity_is_read_again() {
+    let dir = TempDir::new().unwrap();
+    let store = ChatStore::new(dir.path());
+    let mut held = conversation(ID_A, "2026-09-15T10:00:00+00:00");
+    held.title = "Plan one".to_string();
+    store.save(&held).unwrap();
+
+    // Another program's write of the same length, which a filesystem keeping
+    // whole seconds stamps with the time the save had.
+    let file = chats_dir(dir.path()).join(format!("{ID_A}.json"));
+    let modified = fs::metadata(&file).unwrap().modified().unwrap();
+    held.title = "Plan two".to_string();
+    let bytes = serde_json::to_vec_pretty(&held).unwrap();
+    assert_eq!(bytes.len() as u64, fs::metadata(&file).unwrap().len());
+    fs::write(&file, bytes).unwrap();
+    set_modified(&file, modified);
+
+    assert_eq!(store.list().unwrap()[0].title, "Plan two");
+}
+
+#[test]
+fn a_row_written_by_an_earlier_build_is_read_again_once() {
+    let dir = TempDir::new().unwrap();
+    let store = ChatStore::new(dir.path());
+    store
+        .save(&conversation(ID_A, "2026-09-15T10:00:00+00:00"))
+        .unwrap();
+    let file = chats_dir(dir.path()).join(format!("{ID_A}.json"));
+    set_modified(
+        &file,
+        std::time::SystemTime::now() - std::time::Duration::from_secs(3600),
+    );
+    store.list().unwrap();
+
+    let index_file = chats_dir(dir.path()).join("index.json");
+    let mut index: Value = serde_json::from_slice(&fs::read(&index_file).unwrap()).unwrap();
+    let row = index["rows"][ID_A].as_object_mut().unwrap();
+    assert!(row.remove("verified").is_some());
+    fs::write(&index_file, serde_json::to_vec(&index).unwrap()).unwrap();
+
+    assert_eq!(store.list().unwrap().len(), 1);
+    let index: Value = serde_json::from_slice(&fs::read(&index_file).unwrap()).unwrap();
+    assert!(index["rows"][ID_A]["verified"].as_u64().unwrap() > 0);
 }
 
 #[test]
@@ -479,6 +536,8 @@ fn the_file_holds_no_note_text_and_no_key() {
                 before_hash: "abcd".to_string(),
                 new_content: "Shorter.".to_string(),
                 status: ProposalStatus::Applied,
+                applied_hash: None,
+                undone: false,
             }],
             ..AssistantReply::default()
         },

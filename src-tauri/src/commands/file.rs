@@ -266,9 +266,7 @@ fn open_authorized_path(state: &AppState, canonical: &str) -> Result<FileOpenRes
 /// change.
 fn shown_tab_answer(state: &AppState, canonical: &str) -> Result<Option<FileOpenResult>, String> {
     let existing = state
-        .store
-        .lock()
-        .map_err(|e| e.to_string())?
+        .lock_store()
         .find_active_by_source_path(canonical)
         .map_err(|e| e.to_string())?;
     let Some(existing) = existing else {
@@ -296,7 +294,7 @@ fn shown_tab_answer(state: &AppState, canonical: &str) -> Result<Option<FileOpen
 /// Jotra has not read answers through its own open, which measures the file
 /// and asks first (ADR-019).
 fn open_tab_answer(state: &AppState, canonical: &str) -> Result<Option<FileOpenResult>, String> {
-    let store = state.store.lock().map_err(|e| e.to_string())?;
+    let store = state.lock_store();
     let Some(existing) = store
         .find_active_by_source_path(canonical)
         .map_err(|e| e.to_string())?
@@ -414,7 +412,7 @@ fn open_file_classified_inner(
         (text, line_ending, Some(encoding))
     };
 
-    let store = state.store.lock().map_err(|e| e.to_string())?;
+    let store = state.lock_store();
     // Another open of this file may have made its tab while this one read it.
     // A file is one open tab, so this open answers with that one.
     if let Some(opened) = store
@@ -674,7 +672,7 @@ pub fn suggest_note_save_path(
     let notes_root = state.notes_root();
     // Read before the store lock: the config lock is never taken under it.
     let extension = state.default_extension();
-    let store = state.store.lock().map_err(|e| e.to_string())?;
+    let store = state.lock_store();
     let doc = store.get(id).map_err(|e| e.to_string())?;
     let suggested =
         crate::notes::mint_note_path(&notes_root, &doc.title, chrono::Utc::now(), extension);
@@ -768,7 +766,7 @@ fn resync_open_buffer(state: &AppState, turn: &Turn, doc: &BufferDocument) {
         .disk_state(&doc.id)
         .is_some_and(|known| known.hash != jotra_core::hash::sha256_bytes(&source));
     {
-        let store = recover_poison(state.store.lock(), "commands::file::resync_open_buffer");
+        let store = state.lock_store();
         if let Some(text) = text.as_deref() {
             let ending = LineEnding::detect(text);
             if ending != doc.line_ending {
@@ -853,9 +851,7 @@ pub fn open_generated_document(
     let size_bytes = content.len() as u64;
 
     let existing = state
-        .store
-        .lock()
-        .map_err(|e| e.to_string())?
+        .lock_store()
         .find_active_by_source_path(&canonical)
         .map_err(|e| e.to_string())?;
     if let Some(existing) = existing {
@@ -871,7 +867,7 @@ pub fn open_generated_document(
         });
     }
 
-    let store = state.store.lock().map_err(|e| e.to_string())?;
+    let store = state.lock_store();
 
     if let Some(closed) = store
         .find_history_by_source_path(&canonical)

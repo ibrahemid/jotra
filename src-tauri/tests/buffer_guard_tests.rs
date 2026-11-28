@@ -140,6 +140,9 @@ fn make_state(dir: &TempDir) -> AppState {
         preview_registry: Arc::new(RwLock::new(ContentRendererRegistry::new())),
         preview_render_cache: Arc::new(RenderCache::new()),
         layout_state: LayoutStateStore::new(open_database(&db_path).expect("layout db")),
+        tab_rows: jotra_storage::tab_rows::TabRowStore::new(
+            open_database(&db_path).expect("tab rows db"),
+        ),
         command_usage: jotra_storage::command_usage::CommandUsageStore::new(
             open_database(&db_path).expect("usage db"),
         ),
@@ -576,6 +579,22 @@ fn a_same_size_change_is_told_by_its_modification_time() {
 
     std::fs::write(&path, "wxyz\n").unwrap();
     set_modified(&path, read_at + std::time::Duration::from_secs(2));
+
+    assert!(!note_file_unchanged_inner(&state, &id));
+}
+
+#[test]
+fn a_same_size_change_inside_one_coarse_tick_is_a_changed_file() {
+    let dir = TempDir::new().unwrap();
+    let state = make_state(&dir);
+    let (id, path) = open_note(&state, &dir, "stick.md", "abcd\n");
+    let tick = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000);
+    set_modified(&path, tick);
+    read_buffer_content_inner(&state, &id).expect("the open reads");
+    assert_eq!(state.disk_state(&id).and_then(|s| s.mtime), Some(tick));
+
+    std::fs::write(&path, "wxyz\n").unwrap();
+    set_modified(&path, tick);
 
     assert!(!note_file_unchanged_inner(&state, &id));
 }

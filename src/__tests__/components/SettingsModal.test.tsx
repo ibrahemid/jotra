@@ -2329,6 +2329,27 @@ describe("AI section", () => {
     expect(text).not.toContain("API key");
   });
 
+  it("names the key in the consent for an https address on the local network that takes it", async () => {
+    mocks.aiEndpointState.mockResolvedValue(
+      hostedEndpoint({
+        host: "192.168.1.20",
+        host_port: "192.168.1.20",
+        is_private_network: true,
+        provider: "custom",
+        key_state: { is_set: true, memory_only: false },
+        sends_key: true,
+      }),
+    );
+    const { container } = await openAiSection({
+      provider: "custom",
+      base_url: "https://192.168.1.20/v1",
+    });
+    await waitFor(() => expect(container.querySelector(".settings-ai-consent")).not.toBeNull());
+    expect(collapse(container.querySelector(".settings-ai-consent-text")!.textContent)).toBe(
+      "The files you attach and the text you rewrite are sent to 192.168.1.20 on your local network with your API key. Jotra also sends the key on its own to check the address is reachable. The check sends no text.",
+    );
+  });
+
   it("shows the on-device row with no model to choose and says chat needs another provider", async () => {
     mocks.aiEndpointState.mockResolvedValue(
       hostedEndpoint({

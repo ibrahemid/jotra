@@ -55,8 +55,10 @@ where
 /// ([`AppState::buffer_writes`]).
 ///
 /// The ticket is taken by the caller before the work is handed to the pool,
-/// so commands on one note keep the order they began in even when the pool
-/// starts their work in another.
+/// so commands on one note keep the order they took their tickets in even when
+/// the pool starts their work in another. An `async` command's body, and the
+/// ticket with it, runs on its task's first poll, so two commands dispatched
+/// back to back can take their tickets in either order.
 pub async fn run_in_turn<R, T, F>(
     app: AppHandle<R>,
     ticket: Ticket,

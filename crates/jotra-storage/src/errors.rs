@@ -141,6 +141,12 @@ pub enum StorageError {
         path: String,
     },
 
+    /// A thread panicked while it held the store, so nothing that lets the
+    /// preview run scripts or read files is granted until the app restarts
+    /// (ADR-045).
+    #[error("after an internal error, the preview runs no scripts and shows no embedded files until Jotra restarts")]
+    HeldThroughAPanic,
+
     /// A buffer was named that the store does not hold, so nothing was
     /// recorded for it.
     #[error("no file in the store has the id {id}")]

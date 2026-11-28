@@ -78,6 +78,7 @@ export default function ChatPane() {
   let loaded = false;
   createEffect(() => {
     if (!isOpen()) {
+      if (loaded) untrack(() => chatStore.closePane());
       loaded = false;
       setListing(false);
       setRenamingTitle(false);

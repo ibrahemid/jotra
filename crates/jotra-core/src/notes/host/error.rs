@@ -135,6 +135,16 @@ pub enum HostError {
         /// The characters it cannot hold, as `U+…` code points.
         characters: String,
     },
+    /// The file is in an encoding with bytes that are not text in it, so an
+    /// edit of its text would write a replacement character over them.
+    /// Nothing was written (ADR-049).
+    #[error("{path} has bytes that are not {encoding} text")]
+    NotInEncoding {
+        /// The path as the caller wrote it.
+        path: String,
+        /// The encoding's name.
+        encoding: String,
+    },
     /// The write waited for the person, who discarded it in Jotra. Nothing was
     /// written (ADR-053).
     #[error("the change to {path} was discarded in Jotra")]
